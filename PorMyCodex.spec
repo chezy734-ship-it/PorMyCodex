@@ -19,6 +19,7 @@ hiddenimports = [
     'ai_providers',
     'translator_engine',
     'script_engine',
+    'audio_exporter',
     'dialogs',
 ]
 

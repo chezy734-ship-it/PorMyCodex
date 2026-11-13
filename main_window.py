@@ -8,6 +8,7 @@
 - בחירת ספקי AI מרובים (Google / OpenAI / Claude / OpenRouter / Groq / שרת מותאם) וגילוי מודלים
 """
 
+import os
 import html
 import json
 from typing import List, Dict, Any, Optional, Callable
@@ -27,7 +28,43 @@ from settings_manager import load_settings, get_active_provider_config
 from ai_providers import get_provider_label
 from translator_engine import translate_text
 from script_engine import generate_narration_script, format_script_as_text
+from audio_exporter import export_audiobook_file
 from dialogs import SettingsDialog, TranslateDialog, ScriptStudioDialog
+
+
+class AudioExportThread(QThread):
+    progress = pyqtSignal(str)
+    finished_path = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        sentences: List[str],
+        output_path: str,
+        default_voice: str,
+        speed: float,
+        voice_overrides: Optional[List[str]] = None,
+    ):
+        super().__init__()
+        self.sentences = list(sentences)
+        self.output_path = output_path
+        self.default_voice = default_voice
+        self.speed = speed
+        self.voice_overrides = list(voice_overrides) if voice_overrides else None
+
+    def run(self):
+        try:
+            saved = export_audiobook_file(
+                sentences=self.sentences,
+                output_path=self.output_path,
+                default_voice=self.default_voice,
+                speed=self.speed,
+                voice_overrides=self.voice_overrides,
+                progress_cb=lambda msg: self.progress.emit(msg),
+            )
+            self.finished_path.emit(saved)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class FileLoadThread(QThread):
@@ -84,6 +121,7 @@ class MainWindow(QMainWindow):
 
         self._file_thread: Optional[FileLoadThread] = None
         self._task_thread: Optional[TaskWorkerThread] = None
+        self._export_thread: Optional[AudioExportThread] = None
 
         # Audio Engine
         self.audio = AudioEngine()
@@ -133,6 +171,10 @@ class MainWindow(QMainWindow):
         translate_action = QAction("🌐 תרגום (AI / חינמי)", self)
         translate_action.triggered.connect(self.open_translate_dialog)
         toolbar.addAction(translate_action)
+
+        export_audio_action = QAction("🎧 ייצא שמע (MP3/WAV)", self)
+        export_audio_action.triggered.connect(self.export_audio_dialog)
+        toolbar.addAction(export_audio_action)
 
         toolbar.addSeparator()
 
@@ -753,6 +795,67 @@ class MainWindow(QMainWindow):
             self.comp_text.setMarkdown("\n\n".join(md_blocks))
             self.statusBar.showMessage(f"התרגום הושלם ({engine_label}).", 5000)
 
+    # --- Portable Audiobook Export (MP3 / WAV) ---
+    def export_audio_dialog(self):
+        if not self.sentences:
+            QMessageBox.information(self, "אין טקסט", "אין תוכן בפרק הנוכחי לייצוא שמע.")
+            return
+
+        if self._export_thread and self._export_thread.isRunning():
+            QMessageBox.information(self, "ייצוא בתהליך", "ייצוא שמע קודם עדיין רץ ברקע, אנא המתן לסיומו.")
+            return
+
+        book = self.books[self.current_book_index]
+        safe_title = "".join(c for c in book["title"] if c.isalnum() or c in (" ", "-", "_")).strip() or "audiobook"
+        default_name = f"{safe_title}_part{self.current_chapter_index + 1}.mp3"
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "ייצא קובץ שמע נייד לשיתוף (MP3 / WAV)",
+            default_name,
+            "קובץ שמע MP3 באיכות אולפן (*.mp3);;קובץ שמע WAV אופליין (*.wav)",
+        )
+        if not file_path:
+            return
+
+        if "WAV" in selected_filter and not file_path.lower().endswith(".wav"):
+            file_path = f"{os.path.splitext(file_path)[0]}.wav"
+        elif "MP3" in selected_filter and not file_path.lower().endswith(".mp3"):
+            file_path = f"{os.path.splitext(file_path)[0]}.mp3"
+
+        self.statusBar.showMessage("מתחיל ייצוא קובץ שמע נייד ברקע...")
+        self._export_thread = AudioExportThread(
+            sentences=self.sentences,
+            output_path=file_path,
+            default_voice=self.combo_voice.currentData() or "edge_avri",
+            speed=self.audio.speed,
+            voice_overrides=self._get_voice_overrides(),
+        )
+        self._export_thread.progress.connect(lambda msg: self.statusBar.showMessage(msg))
+        self._export_thread.finished_path.connect(self._on_audio_exported)
+        self._export_thread.failed.connect(self._on_audio_export_failed)
+        self._export_thread.start()
+
+    def _on_audio_exported(self, saved_path: str):
+        self.statusBar.showMessage(f"קובץ השמע נשמר בהצלחה: {saved_path}", 7000)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("🎧 קובץ השמע מוכן להעברה!")
+        msg.setText(f"קובץ השמע נוצר בהצלחה ומוכן לשיתוף או העברה:\n\n{saved_path}")
+        btn_open_folder = msg.addButton("📂 פתח תיקייה", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton("אישור", QMessageBox.ButtonRole.AcceptRole)
+        msg.exec()
+        if msg.clickedButton() == btn_open_folder:
+            folder = os.path.dirname(os.path.abspath(saved_path))
+            try:
+                if os.name == "nt":
+                    os.startfile(folder)
+            except Exception:
+                pass
+
+    def _on_audio_export_failed(self, err: str):
+        self.statusBar.showMessage("ייצוא השמע נכשל.", 5000)
+        QMessageBox.critical(self, "שגיאה בייצוא קובץ שמע", err)
+
     def closeEvent(self, event):
         try:
             self.audio.stop()
@@ -760,6 +863,8 @@ class MainWindow(QMainWindow):
                 self._file_thread.wait(800)
             if self._task_thread and self._task_thread.isRunning():
                 self._task_thread.wait(800)
+            if self._export_thread and self._export_thread.isRunning():
+                self._export_thread.wait(1200)
         except Exception:
             pass
         super().closeEvent(event)

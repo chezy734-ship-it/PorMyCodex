@@ -34,7 +34,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "providers": {
         "gemini": {
             "api_key": "",
-            "model": "gemini-2.5-flash",
+            "model": "gemini-3.8-flash",
             "base_url": "https://generativelanguage.googleapis.com/v1beta",
             "discovered_models": [],
         },
@@ -113,6 +113,11 @@ def load_settings() -> Dict[str, Any]:
         except Exception:
             loaded = {}
     merged = _deep_merge(DEFAULT_SETTINGS, loaded)
+
+    # עדכון מודל ברירת מחדל ישן של Gemini שהוסר ע"י גוגל למשתמשים חדשים
+    gem_conf = merged["providers"].get("gemini", {})
+    if gem_conf.get("model") in ("", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"):
+        gem_conf["model"] = "gemini-3.8-flash"
 
     # מילוי מפתחות ממשתני סביבה רק אם לא הוזן מפתח בהגדרות
     for pid, env_name in ENV_KEY_MAP.items():

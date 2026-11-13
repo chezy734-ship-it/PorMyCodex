@@ -20,11 +20,9 @@ PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
         "requires_key": True,
         "preset_models": [
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
             "gemini-3.8-flash",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
+            "gemini-3.8-pro",
+            "gemini-2.5-pro",
         ],
         "help_url": "https://aistudio.google.com/apikey",
     },
@@ -101,6 +99,25 @@ def get_preset_models(provider_id: str) -> List[str]:
     return list(PROVIDER_CATALOG.get(provider_id, {}).get("preset_models", []))
 
 
+def _rank_gemini_model(mid: str) -> tuple:
+    low = mid.lower()
+    if low == "gemini-3.8-flash":
+        return (0, low)
+    if "gemini-3.8" in low:
+        return (1, low)
+    if "gemini-3" in low:
+        return (2, low)
+    if "gemini-2.5-pro" in low:
+        return (3, low)
+    if "gemini-2.5" in low:
+        return (4, low)
+    if "gemini-2" in low:
+        return (5, low)
+    if "gemini-" in low:
+        return (6, low)
+    return (7, low)
+
+
 def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout: int = 20) -> List[str]:
     """
     מבצע בדיקת חיבור אמיתית מול הספק ומחזיר את רשימת המודלים הזמינים בחשבון.
@@ -131,9 +148,11 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
                     mid = m.get("name", "")
                     if mid.startswith("models/"):
                         mid = mid[len("models/"):]
-                    if mid:
+                    low = mid.lower()
+                    if mid and not any(skip in low for skip in ("embedding", "aqa", "imagen", "veo", "tts", "audio", "robotics", "computer-use")):
                         models.append(mid)
-            return sorted(set(models)) or get_preset_models("gemini")
+            unique = sorted(set(models), key=_rank_gemini_model)
+            return unique or get_preset_models("gemini")
 
         elif provider_id == "anthropic":
             resp = requests.get(
@@ -148,7 +167,7 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
             _raise_for_api_error("Anthropic", resp)
             data = resp.json()
             models = [m.get("id") for m in data.get("data", []) if m.get("id")]
-            return sorted(set(models)) or get_preset_models("anthropic")
+            return sorted(set(models), reverse=True) or get_preset_models("anthropic")
 
         else:
             # OpenAI / OpenRouter / Groq / Custom OpenAI-compatible
@@ -161,7 +180,6 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
             raw_list = data.get("data", []) if isinstance(data, dict) else []
             models = [m.get("id") for m in raw_list if isinstance(m, dict) and m.get("id")]
             if provider_id == "openai":
-                # סינון מודלי שיחה/טקסט רלוונטיים ב-OpenAI
                 filtered = [
                     m for m in models
                     if any(pref in m for pref in ("gpt-", "o1", "o3", "o4", "chatgpt"))
@@ -221,6 +239,19 @@ def chat_completion(
             json=payload,
             timeout=timeout,
         )
+        # אם מודל ספציפי הוצא משימוש (404), מנסים אוטומטית את המודל המומלץ או gemini-3.8-flash
+        if resp.status_code == 404:
+            import re
+            body_txt = resp.text or ""
+            m_rec = re.search(r"use\s+models/([a-zA-Z0-9._-]+)", body_txt, flags=re.IGNORECASE)
+            fallback_model = m_rec.group(1) if m_rec else "gemini-3.8-flash"
+            if fallback_model and fallback_model != selected_model:
+                resp = requests.post(
+                    f"{url_base}/models/{fallback_model}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=timeout,
+                )
         _raise_for_api_error("Google Gemini", resp)
         data = resp.json()
         candidates = data.get("candidates", [])

@@ -8,7 +8,7 @@
 
 from copy import deepcopy
 from typing import Dict, Any, Optional
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QComboBox, QTabWidget,
@@ -21,8 +21,8 @@ from translator_engine import TRANSLATION_ENGINES, LANGUAGE_OPTIONS
 
 
 class ModelDiscoveryThread(QThread):
-    finished_ok = pyqtSignal(list)
-    failed = pyqtSignal(str)
+    finished_ok = pyqtSignal(str, list)
+    failed = pyqtSignal(str, str)
 
     def __init__(self, provider_id: str, api_key: str, base_url: str):
         super().__init__()
@@ -33,9 +33,9 @@ class ModelDiscoveryThread(QThread):
     def run(self):
         try:
             models = discover_models(self.provider_id, self.api_key, self.base_url)
-            self.finished_ok.emit(models)
+            self.finished_ok.emit(self.provider_id, models)
         except Exception as e:
-            self.failed.emit(str(e))
+            self.failed.emit(self.provider_id, str(e))
 
 
 class SettingsDialog(QDialog):
@@ -43,13 +43,20 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("⚙️ הגדרות AI, מודלים, תרגום וקולות")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(620, 540)
+        self.resize(650, 560)
         self.settings = deepcopy(current_settings or load_settings())
         self._current_provider = self.settings.get("active_provider", "gemini")
         self._discovery_thread: Optional[ModelDiscoveryThread] = None
+        self._loading_fields = False
+
+        # טיימר לשאיבה אוטומטית של מודלים זמינים 650ms אחרי הזנת/הדבקת API Key
+        self._auto_discover_timer = QTimer(self)
+        self._auto_discover_timer.setSingleShot(True)
+        self._auto_discover_timer.setInterval(650)
+        self._auto_discover_timer.timeout.connect(lambda: self._run_model_discovery(silent_if_empty=True))
 
         self._build_ui()
-        self._load_provider_fields(self._current_provider)
+        self._load_provider_fields(self._current_provider, auto_fetch=True)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -79,8 +86,9 @@ class SettingsDialog(QDialog):
         key_row = QHBoxLayout()
         self.txt_api_key = QLineEdit()
         self.txt_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_api_key.setPlaceholderText("הדבק כאן מפתח API של הספק שנבחר...")
+        self.txt_api_key.setPlaceholderText("הדבק כאן מפתח API — המודלים הזמינים יישאבו אוטומטית...")
         self.txt_api_key.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.txt_api_key.textChanged.connect(self._on_api_key_edited)
         key_row.addWidget(self.txt_api_key, 1)
 
         self.btn_toggle_key = QPushButton("👁 הצג")
@@ -100,16 +108,19 @@ class SettingsDialog(QDialog):
         model_row = QHBoxLayout()
         self.combo_model = QComboBox()
         self.combo_model.setEditable(True)
+        self.combo_model.setMaxVisibleItems(18)
+        self.combo_model.setMinimumWidth(260)
+        self.combo_model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.combo_model.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         model_row.addWidget(self.combo_model, 1)
 
-        self.btn_discover = QPushButton("🔍 בדוק חיבור וגלה מודלים")
+        self.btn_discover = QPushButton("🔄 שאב מודלים זמינים")
         self.btn_discover.setObjectName("accentBtn")
-        self.btn_discover.clicked.connect(self._run_model_discovery)
+        self.btn_discover.clicked.connect(lambda: self._run_model_discovery(silent_if_empty=False))
         model_row.addWidget(self.btn_discover)
         form_p.addRow("מודל פעיל:", model_row)
 
-        self.lbl_discovery_status = QLabel("ניתן לבחור מודל מהרשימה, להקליד שם מודל ידנית, או ללחוץ 'גלה מודלים' לשליפה חיה מהספק.")
+        self.lbl_discovery_status = QLabel("הזן מפתח API כדי לשאוב אוטומטית את כל המודלים הזמינים בחשבון שלך.")
         self.lbl_discovery_status.setWordWrap(True)
         self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
         form_p.addRow("", self.lbl_discovery_status)
@@ -120,7 +131,7 @@ class SettingsDialog(QDialog):
         info_lay = QVBoxLayout(grp_info)
         lbl_sec = QLabel(
             "• כל מפתחות ה-API נשמרים מקומית אצלך במחשב בלבד (קובץ settings.json בתיקיית AppData).\n"
-            "• ניתן להחליף בכל רגע בין Google Gemini, ChatGPT/OpenAI, Claude, OpenRouter, Groq או Ollama מקומי."
+            "• מיד לאחר הדבקת מפתח, התוכנה שואבת אוטומטית את רשימת המודלים העדכנית שזמינה למפתח שלך."
         )
         lbl_sec.setWordWrap(True)
         lbl_sec.setStyleSheet("color: #cbd5e1; font-size: 12px;")
@@ -208,73 +219,113 @@ class SettingsDialog(QDialog):
         pdict["base_url"] = self.txt_base_url.text().strip()
         pdict["model"] = self.combo_model.currentText().strip()
 
-    def _load_provider_fields(self, pid: str):
-        pdict = self.settings["providers"].get(pid, {})
-        meta = PROVIDER_CATALOG.get(pid, {})
-        self.txt_api_key.setText(pdict.get("api_key", ""))
-        self.txt_base_url.setText(pdict.get("base_url") or meta.get("default_base_url", ""))
+    def _on_api_key_edited(self, text: str):
+        if self._loading_fields:
+            return
+        clean = (text or "").strip()
+        if len(clean) >= 15:
+            self.lbl_discovery_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+            self.lbl_discovery_status.setText("מזהה מפתח חדש — שואב מודלים זמינים בעוד רגע...")
+            self._auto_discover_timer.start()
 
-        self.combo_model.blockSignals(True)
-        self.combo_model.clear()
-        discovered = pdict.get("discovered_models") or []
-        presets = get_preset_models(pid)
-        combined = []
-        for m in list(discovered) + list(presets):
-            if m and m not in combined:
-                combined.append(m)
-        for m in combined:
-            self.combo_model.addItem(m)
+    def _load_provider_fields(self, pid: str, auto_fetch: bool = False):
+        self._loading_fields = True
+        try:
+            pdict = self.settings["providers"].get(pid, {})
+            meta = PROVIDER_CATALOG.get(pid, {})
+            key = pdict.get("api_key", "")
+            self.txt_api_key.setText(key)
+            self.txt_base_url.setText(pdict.get("base_url") or meta.get("default_base_url", ""))
 
-        saved_model = pdict.get("model") or (combined[0] if combined else "")
-        self.combo_model.setEditText(saved_model)
-        self.combo_model.blockSignals(False)
+            self.combo_model.blockSignals(True)
+            self.combo_model.clear()
+            discovered = pdict.get("discovered_models") or []
+            items_to_show = list(discovered) if discovered else get_preset_models(pid)
+            for m in items_to_show:
+                self.combo_model.addItem(m)
 
-        self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
-        if discovered:
-            self.lbl_discovery_status.setText(f"נטענו {len(discovered)} מודלים מאומתים עבור {meta.get('label', pid)}.")
-        else:
-            self.lbl_discovery_status.setText("ניתן לבחור מודל מהרשימה, להקליד שם מודל ידנית, או ללחוץ 'בדוק חיבור וגלה מודלים'.")
+            saved_model = pdict.get("model") or (items_to_show[0] if items_to_show else "")
+            if saved_model and saved_model in items_to_show:
+                self.combo_model.setCurrentText(saved_model)
+            elif items_to_show:
+                self.combo_model.setCurrentIndex(0)
+            else:
+                self.combo_model.setEditText(saved_model)
+            self.combo_model.blockSignals(False)
+
+            self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
+            if discovered:
+                self.lbl_discovery_status.setText(f"נטענו {len(discovered)} מודלים שנשאבו עבור {meta.get('label', pid)}.")
+            else:
+                self.lbl_discovery_status.setText("הזן מפתח API כדי לשאוב אוטומטית את רשימת המודלים הזמינים מהחברה.")
+        finally:
+            self._loading_fields = False
+
+        if auto_fetch and (key or not meta.get("requires_key", True)):
+            self._run_model_discovery(silent_if_empty=True)
 
     def _on_provider_changed(self):
+        self._auto_discover_timer.stop()
         self._save_current_provider_to_dict()
         new_pid = self.combo_provider.currentData()
         self._current_provider = new_pid
         self.settings["active_provider"] = new_pid
-        self._load_provider_fields(new_pid)
+        self._load_provider_fields(new_pid, auto_fetch=True)
 
-    def _run_model_discovery(self):
+    def _run_model_discovery(self, silent_if_empty: bool = False):
         self._save_current_provider_to_dict()
         pid = self._current_provider
         key = self.txt_api_key.text().strip()
         base_url = self.txt_base_url.text().strip()
+        meta = PROVIDER_CATALOG.get(pid, {})
+
+        if meta.get("requires_key", True) and not key:
+            if not silent_if_empty:
+                self.lbl_discovery_status.setStyleSheet("color: #f87171; font-size: 12px;")
+                self.lbl_discovery_status.setText("❌ הזן מפתח API לפני בדיקת החיבור ושאיבת המודלים.")
+            return
+
+        if self._discovery_thread and self._discovery_thread.isRunning():
+            return
 
         self.btn_discover.setEnabled(False)
         self.lbl_discovery_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
-        self.lbl_discovery_status.setText(f"בודק חיבור מול {get_provider_label(pid)} ושולף מודלים...")
+        self.lbl_discovery_status.setText(f"שואב רשימת מודלים זמינים מול {get_provider_label(pid)}...")
 
         self._discovery_thread = ModelDiscoveryThread(pid, key, base_url)
         self._discovery_thread.finished_ok.connect(self._on_discovery_ok)
         self._discovery_thread.failed.connect(self._on_discovery_failed)
         self._discovery_thread.start()
 
-    def _on_discovery_ok(self, models: list):
+    def _on_discovery_ok(self, pid: str, models: list):
         self.btn_discover.setEnabled(True)
-        pid = self._current_provider
         self.settings["providers"][pid]["discovered_models"] = models
+        if pid != self._current_provider:
+            return
+
         current_text = self.combo_model.currentText().strip()
+        self.combo_model.blockSignals(True)
         self.combo_model.clear()
         for m in models:
             self.combo_model.addItem(m)
-        if current_text and current_text in models:
+
+        # אם המודל הקודם כבר לא נתמך או ריק, עוברים אוטומטית למודל הראשון/המומלץ ברשימה החיה
+        if pid == "gemini" and current_text == "gemini-2.5-flash" and "gemini-3.8-flash" in models:
+            self.combo_model.setCurrentText("gemini-3.8-flash")
+        elif current_text and current_text in models:
             self.combo_model.setCurrentText(current_text)
         elif models:
             self.combo_model.setCurrentIndex(0)
+        self.combo_model.blockSignals(False)
 
+        self.settings["providers"][pid]["model"] = self.combo_model.currentText().strip()
         self.lbl_discovery_status.setStyleSheet("color: #34d399; font-size: 12px; font-weight: bold;")
-        self.lbl_discovery_status.setText(f"✅ החיבור הצליח! התגלו {len(models)} מודלים זמינים.")
+        self.lbl_discovery_status.setText(f"✅ נשאבו {len(models)} מודלים זמינים! בחר מהרשימה למעלה ולחץ 'שמור הגדרות'.")
 
-    def _on_discovery_failed(self, err: str):
+    def _on_discovery_failed(self, pid: str, err: str):
         self.btn_discover.setEnabled(True)
+        if pid != self._current_provider:
+            return
         self.lbl_discovery_status.setStyleSheet("color: #f87171; font-size: 12px;")
         self.lbl_discovery_status.setText(f"❌ {err}")
 
