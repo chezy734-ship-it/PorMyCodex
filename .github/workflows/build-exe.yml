@@ -1,0 +1,65 @@
+name: Build PorMyCodex Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    name: Build Windows Executable (PorMyCodex.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies & PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Verify Python syntax
+        run: |
+          python -m py_compile main.py main_window.py audio_engine.py ai_linguist.py book_loader.py style.py
+
+      - name: Build PorMyCodex.exe
+        run: |
+          pyinstaller PorMyCodex.spec --clean --noconfirm
+
+      - name: Verify EXE output
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\PorMyCodex.exe")) {
+            Write-Error "dist\PorMyCodex.exe was not created!"
+            exit 1
+          }
+          Get-Item "dist\PorMyCodex.exe" | Select-Object Name, Length
+
+      - name: Upload PorMyCodex.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PorMyCodex-Windows-EXE
+          path: dist/PorMyCodex.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: PorMyCodex v1.0.${{ github.run_number }} (Windows EXE)
+          body: |
+            גרסת Windows עצמאית של תוכנת **PorMyCodex - מקריא ספרים חכם בעברית מבוסס AI**.
+            הורד את הקובץ `PorMyCodex.exe` למטה והפעל ישירות (ללא צורך בהתקנת Python).
+          files: dist/PorMyCodex.exe
+          make_latest: true
