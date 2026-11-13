@@ -29,7 +29,8 @@ from ai_providers import get_provider_label
 from translator_engine import translate_text
 from script_engine import generate_narration_script, format_script_as_text
 from audio_exporter import export_audiobook_file
-from dialogs import SettingsDialog, TranslateDialog, ScriptStudioDialog
+from wiki_engine import enrich_with_wikipedia_and_ai, fetch_wikipedia_context_for_terms
+from dialogs import SettingsDialog, TranslateDialog, ScriptStudioDialog, WikiSearchDialog
 
 
 class AudioExportThread(QThread):
@@ -198,6 +199,11 @@ class MainWindow(QMainWindow):
         quiz_action.triggered.connect(lambda: self.trigger_companion("quiz"))
         toolbar.addAction(quiz_action)
 
+        wiki_action = QAction("📚 ויקיפדיה", self)
+        wiki_action.setToolTip("חפש מושגים ספציפיים בוויקיפדיה להרחבת ידע של מודל ה-AI")
+        wiki_action.triggered.connect(self.open_wikipedia_dialog)
+        toolbar.addAction(wiki_action)
+
         # Splitter Layout
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter, 1)
@@ -292,6 +298,7 @@ class MainWindow(QMainWindow):
         comp_layout.addLayout(comp_header)
 
         self.comp_text = QTextBrowser()
+        self.comp_text.setOpenExternalLinks(True)
         self.comp_text.setFont(QFont("Arial", 12))
         comp_layout.addWidget(self.comp_text)
 
@@ -675,6 +682,81 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    # --- Wikipedia Search & AI Knowledge Grounding ---
+    def open_wikipedia_dialog(self):
+        if not self.books:
+            return
+        book = self.books[self.current_book_index]
+        active_sentence = ""
+        if self.sentences and 0 <= self.active_sentence_index < len(self.sentences):
+            active_sentence = self.sentences[self.active_sentence_index]
+        chapter_context = active_sentence or "\n".join(self.sentences[:60]) or book["chapters"][self.current_chapter_index]["text"][:2500]
+
+        dlg = WikiSearchDialog(self, self.settings)
+        if not dlg.exec():
+            return
+        opts = dlg.get_options()
+        cfg = self.settings
+
+        self.lbl_comp_title.setText("📚 מחקר מושגים — ויקיפדיה + AI")
+        self.companion_widget.setVisible(True)
+        self.comp_text.setHtml("<div dir='rtl'><i>מחפש ערכים בוויקיפדיה ומרחיב את הידע ברקע...</i></div>")
+
+        def _worker():
+            if opts["use_ai"]:
+                res = enrich_with_wikipedia_and_ai(
+                    query_terms=opts["terms"],
+                    book_context=chapter_context,
+                    book_title=book["title"],
+                    settings=cfg,
+                    lang=opts["lang"],
+                )
+                res["mode"] = "ai"
+                return res
+            else:
+                res = fetch_wikipedia_context_for_terms(
+                    terms_input=opts["terms"],
+                    fallback_text=chapter_context,
+                    settings=cfg,
+                    lang=opts["lang"],
+                )
+                if not res.get("articles"):
+                    raise RuntimeError(
+                        f"לא נמצאו ערכים מתאימים בוויקיפדיה עבור: {', '.join(res.get('terms', [])) or opts['terms']}"
+                    )
+                res["mode"] = "wiki_only"
+                return res
+
+        self._run_background_task(
+            "מחפש מושגים בוויקיפדיה ומעשיר ידע...",
+            _worker,
+            self._on_wikipedia_done,
+        )
+
+    def _on_wikipedia_done(self, res: dict):
+        terms = res.get("terms") or []
+        articles = res.get("articles") or []
+        ai_expansion = res.get("ai_expansion", "")
+
+        md_parts = [f"### 📚 מושגים שנחקרו: {', '.join(terms) if terms else 'חיפוש חופשי'}\n"]
+        if ai_expansion:
+            md_parts.append(f"## 🤖 הרחבה וביאור של מודל ה-AI\n\n{ai_expansion}\n\n---")
+
+        md_parts.append("## 🌐 ערכי ויקיפדיה שנשלפו")
+        for art in articles:
+            title = art.get("title", "")
+            lang = art.get("lang", "")
+            extract = art.get("extract", "")
+            url = art.get("url", "")
+            md_parts.append(
+                f"### [{title} ({lang})]({url})\n\n{extract}\n\n[פתח ערך מלא בוויקיפדיה ↗]({url})\n"
+            )
+
+        self.lbl_comp_title.setText("📚 ויקיפדיה והרחבת ידע")
+        self.companion_widget.setVisible(True)
+        self.comp_text.setMarkdown("\n\n".join(md_parts))
+        self.statusBar.showMessage(f"נמצאו {len(articles)} ערכי ויקיפדיה והתוכן הורחב בהצלחה!", 5000)
+
     # --- AI Script Studio ---
     def open_script_studio(self):
         dlg = ScriptStudioDialog(self, self.settings)
@@ -685,14 +767,21 @@ class MainWindow(QMainWindow):
         source_text = "\n".join(self.sentences) if self.sentences else book["chapters"][self.current_chapter_index]["text"]
         cfg = self.settings
 
+        status_msg = (
+            "מחפש מידע בוויקיפדיה ויוצר תסריט AI מועשר..."
+            if opts.get("use_wikipedia")
+            else "יוצר תסריט AI אינטראקטיבי ברקע (ייתכן שייקח מספר שניות)..."
+        )
         self._run_background_task(
-            "יוצר תסריט AI אינטראקטיבי ברקע (ייתכן שייקח מספר שניות)...",
+            status_msg,
             lambda: generate_narration_script(
                 source_text,
                 mode=opts["mode"],
                 custom_instruction=opts["instruction"],
                 book_title=book["title"],
                 settings=cfg,
+                use_wikipedia=opts.get("use_wikipedia", False),
+                wiki_terms=opts.get("wiki_terms", ""),
             ),
             self._on_script_generated,
         )

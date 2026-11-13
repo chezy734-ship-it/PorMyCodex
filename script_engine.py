@@ -26,9 +26,12 @@ def generate_narration_script(
     custom_instruction: str = "",
     book_title: str = "",
     settings: Dict[str, Any] = None,
+    use_wikipedia: bool = False,
+    wiki_terms: str = "",
 ) -> Dict[str, Any]:
     """
     יוצר תסריט מובנה (רשימת שורות עם דובר, טקסט, סגנון והערת בדיקה) מהטקסט הנוכחי.
+    אופציונלי: שולף מידע מאומת מוויקיפדיה כדי שהמורה/מספר יעשיר את ההסברים בידע אנציקלופדי.
     """
     clean_text = (text or "").strip()
     if not clean_text:
@@ -39,6 +42,32 @@ def generate_narration_script(
     pid = pconf["provider_id"]
     model = pconf.get("model", "")
     api_key = pconf.get("api_key", "")
+
+    # בדיקה מוקדמת אם יש מפתח (פרט לשרת מקומי כמו Ollama)
+    if not api_key and pid != "custom":
+        raise ValueError(
+            f"לא הוגדר מפתח API עבור {get_provider_label(pid)}.\n"
+            "לחץ בסרגל הכלים על '⚙️ הגדרות AI ומודלים' כדי להכניס מפתח API של גוגל, OpenAI, Claude או OpenRouter."
+        )
+
+    wiki_articles: List[Dict[str, str]] = []
+    wiki_section = ""
+    if use_wikipedia:
+        try:
+            from wiki_engine import fetch_wikipedia_context_for_terms
+            wiki_data = fetch_wikipedia_context_for_terms(
+                terms_input=wiki_terms,
+                fallback_text=clean_text[:2500],
+                settings=cfg,
+            )
+            wiki_articles = wiki_data.get("articles", [])
+            if wiki_data.get("context_text"):
+                wiki_section = (
+                    "\n\n--- רקע אנציקלופדי מאומת מוויקיפדיה להעשרת ההסברים (שלב עובדות רלוונטיות בלבד) ---\n"
+                    + wiki_data["context_text"][:4000]
+                )
+        except Exception:
+            wiki_articles = []
 
     sentences = split_into_sentences(clean_text)
     units = [{"unitId": f"u{i+1}", "text": s} for i, s in enumerate(sentences[:80])]
@@ -53,8 +82,8 @@ def generate_narration_script(
     else:
         style_guide = (
             "צור תסריט לימודי מרתק בעברית בצורת דיאלוג בין מורה ('teacher') לתלמיד ('student'). "
-            "התלמיד שואל שאלות סקרנות טבעיות על הכתוב, והמורה מסביר ומדייק בבהירות אך ורק לפי המקור שסופק. "
-            "אל תמציא עובדות, חישובים או ציטוטים שאינם במקור. אם קטע אינו ברור דיו, סמן needsReview=true."
+            "התלמיד שואל שאלות סקרנות טבעיות על הכתוב, והמורה מסביר ומדייק בבהירות לפי המקור (ואם סופק מידע מוויקיפדיה — שלב אותו בהסבר המורה). "
+            "אל תמציא עובדות, חישובים או ציטוטים שלא סופקו. אם קטע אינו ברור דיו, סמן needsReview=true."
         )
 
     extra = f"\nהנחיה נוספת מהמשתמש: {custom_instruction.strip()}" if custom_instruction.strip() else ""
@@ -72,14 +101,8 @@ def generate_narration_script(
         f"מצב תסריט: {'לימודי (מורה ותלמיד)' if mode == 'educational' else 'דרמטי (קריינות)'}\n"
         "יחידות המקור:\n"
         + "\n".join(f"[{u['unitId']}] {u['text']}" for u in units)
+        + wiki_section
     )
-
-    # בדיקה אם יש מפתח (פרט לשרת מקומי כמו Ollama)
-    if not api_key and pid != "custom":
-        raise ValueError(
-            f"לא הוגדר מפתח API עבור {get_provider_label(pid)}.\n"
-            "לחץ בסרגל הכלים על '⚙️ הגדרות AI ומודלים' כדי להכניס מפתח API של גוגל, OpenAI, Claude או OpenRouter."
-        )
 
     raw_response = chat_completion(
         provider_id=pid,
@@ -124,6 +147,7 @@ def generate_narration_script(
         "mode": mode,
         "provider_label": f"{get_provider_label(pid)} ({model})",
         "lines": normalized_lines,
+        "wiki_articles": wiki_articles,
     }
 
 
@@ -134,4 +158,9 @@ def format_script_as_text(script_data: Dict[str, Any]) -> str:
         style = f" [{line['style']}]" if line.get("style") else ""
         flag = " ⚠️ (דרוש עיון)" if line.get("needsReview") else ""
         body.append(f"{line.get('speakerLabel', '🎙️ מספר')}{style}: {line.get('text', '')}{flag}")
+    wiki_articles = script_data.get("wiki_articles") or []
+    if wiki_articles:
+        body.append("\n--- מקורות ויקיפדיה ששולבו בתסריט ---")
+        for art in wiki_articles:
+            body.append(f"• {art.get('title', '')} ({art.get('lang', '')}): {art.get('url', '')}")
     return header + "\n\n".join(body)

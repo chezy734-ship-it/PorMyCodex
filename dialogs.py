@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QComboBox, QTabWidget,
-    QWidget, QRadioButton, QTextEdit, QMessageBox
+    QWidget, QRadioButton, QTextEdit, QMessageBox, QCheckBox
 )
 
 from settings_manager import load_settings, save_settings
@@ -414,7 +414,7 @@ class ScriptStudioDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("🎬 יצירת תסריט AI (קורא ספרים חכם)")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(520, 360)
+        self.resize(540, 440)
         self.settings = settings or load_settings()
 
         layout = QVBoxLayout(self)
@@ -435,10 +435,22 @@ class ScriptStudioDialog(QDialog):
         mode_lay.addWidget(self.radio_dramatic)
         layout.addWidget(grp_mode)
 
+        grp_wiki = QGroupBox("📚 הרחבת ידע מוויקיפדיה (Knowledge Grounding)")
+        wiki_lay = QVBoxLayout(grp_wiki)
+        self.chk_wikipedia = QCheckBox("🌐 חפש מושגים בוויקיפדיה והעשר את התסריט של המודל במידע אנציקלופדי")
+        wiki_lay.addWidget(self.chk_wikipedia)
+
+        self.txt_wiki_terms = QLineEdit()
+        self.txt_wiki_terms.setPlaceholderText("מושגים ספציפיים לחיפוש מופרדים בפסיק (השאר ריק לזיהוי אוטומטי מהפרק)")
+        self.txt_wiki_terms.setEnabled(False)
+        self.chk_wikipedia.toggled.connect(self.txt_wiki_terms.setEnabled)
+        wiki_lay.addWidget(self.txt_wiki_terms)
+        layout.addWidget(grp_wiki)
+
         lbl_extra = QLabel("הנחיה נוספת (אופציונלי):")
         layout.addWidget(lbl_extra)
         self.txt_instruction = QTextEdit()
-        self.txt_instruction.setMaximumHeight(90)
+        self.txt_instruction.setMaximumHeight(85)
         self.txt_instruction.setPlaceholderText("לדוגמה: הרחב על המושגים ההלכתיים, או הוסף סיכום קצר בסוף הדיאלוג...")
         layout.addWidget(self.txt_instruction)
 
@@ -454,8 +466,78 @@ class ScriptStudioDialog(QDialog):
         btn_row.addWidget(btn_gen)
         layout.addLayout(btn_row)
 
-    def get_options(self) -> Dict[str, str]:
+    def get_options(self) -> Dict[str, Any]:
         return {
             "mode": "educational" if self.radio_edu.isChecked() else "dramatic",
             "instruction": self.txt_instruction.toPlainText().strip(),
+            "use_wikipedia": self.chk_wikipedia.isChecked(),
+            "wiki_terms": self.txt_wiki_terms.text().strip(),
+        }
+
+
+class WikiSearchDialog(QDialog):
+    def __init__(self, parent=None, settings: Optional[Dict[str, Any]] = None, initial_hint: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("📚 חיפוש בוויקיפדיה והרחבת ידע עם AI")
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.resize(540, 360)
+        self.settings = settings or load_settings()
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        pid = self.settings.get("active_provider", "gemini")
+        model = self.settings.get("providers", {}).get(pid, {}).get("model", "")
+        lbl_active = QLabel(
+            f"מחקר מושגים מבוסס ויקיפדיה + <b>{get_provider_label(pid)}</b> (<code>{model}</code>)"
+        )
+        lbl_active.setStyleSheet("background-color: #1e293b; padding: 8px 12px; border-radius: 8px; color: #38bdf8;")
+        layout.addWidget(lbl_active)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        self.txt_terms = QLineEdit(initial_hint)
+        self.txt_terms.setPlaceholderText("הקלד מושגים (למשל: רמב\"ם, פילוסופיה יוונית) — או השאר ריק לזיהוי אוטומטי מהפרק")
+        form.addRow("מושגים לחיפוש:", self.txt_terms)
+
+        self.combo_lang = QComboBox()
+        self.combo_lang.addItem("אוטומטי (עברית + אנגלית לפי המושג)", "auto")
+        self.combo_lang.addItem("עברית בלבד (he.wikipedia.org)", "he")
+        self.combo_lang.addItem("אנגלית בלבד (en.wikipedia.org)", "en")
+        form.addRow("שפת ויקיפדיה:", self.combo_lang)
+
+        layout.addLayout(form)
+
+        grp_mode = QGroupBox("אופן הצגת המידע")
+        mode_lay = QVBoxLayout(grp_mode)
+        self.radio_ai_enrich = QRadioButton("🤖 חפש בוויקיפדיה + הרחב ובאר עם מודל ה-AI הפעיל (מומלץ)")
+        self.radio_ai_enrich.setChecked(True)
+        self.radio_wiki_only = QRadioButton("📖 הצג תקצירים וקישורים ישירים מוויקיפדיה בלבד (ללא קריאת AI)")
+        mode_lay.addWidget(self.radio_ai_enrich)
+        mode_lay.addWidget(self.radio_wiki_only)
+        layout.addWidget(grp_mode)
+
+        lbl_tip = QLabel("טיפ: תוכל להשאיר את שדה המושגים ריק והתוכנה תחלץ אוטומטית את 3 המושגים המרכזיים מהמשפט/פרק הנוכחי.")
+        lbl_tip.setWordWrap(True)
+        lbl_tip.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        layout.addWidget(lbl_tip)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("ביטול")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_search = QPushButton("🔍 חפש והרחב ידע")
+        btn_search.setObjectName("primaryBtn")
+        btn_search.clicked.connect(self.accept)
+        btn_row.addWidget(btn_search)
+        layout.addLayout(btn_row)
+
+    def get_options(self) -> Dict[str, Any]:
+        return {
+            "terms": self.txt_terms.text().strip(),
+            "lang": self.combo_lang.currentData(),
+            "use_ai": self.radio_ai_enrich.isChecked(),
         }

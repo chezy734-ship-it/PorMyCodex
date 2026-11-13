@@ -30,7 +30,7 @@ jobs:
 
       - name: Verify Python syntax
         run: |
-          python -m py_compile main.py main_window.py audio_engine.py ai_linguist.py book_loader.py style.py settings_manager.py ai_providers.py translator_engine.py script_engine.py audio_exporter.py dialogs.py
+          python -m py_compile main.py main_window.py audio_engine.py ai_linguist.py book_loader.py style.py settings_manager.py ai_providers.py translator_engine.py script_engine.py audio_exporter.py wiki_engine.py dialogs.py
 
       - name: Build PorMyCodex.exe
         run: |
