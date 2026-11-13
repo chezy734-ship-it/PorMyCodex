@@ -2,75 +2,71 @@
 """
 מודול בלשנות ובינה מלאכותית (AI Linguist) לסיוע בהקראה,
 ניקוד מדויק, פתיחת ראשי תיבות, ביאור מילים וסיכום פרקים בעברית.
+עובד מול כל ספק ומודל שהוגדר ב-settings_manager (Gemini, OpenAI, Claude, OpenRouter, Groq, שרת מותאם).
 """
 
-import os
-import json
-from typing import Dict, Any, List
+from typing import Dict, Any
+from settings_manager import load_settings, get_active_provider_config
+from ai_providers import chat_completion, extract_json_object, get_provider_label
 
-def get_api_key() -> str:
-    return os.environ.get("GEMINI_API_KEY", "")
 
-def vocalize_and_expand_hebrew(text: str, api_key: str = "") -> Dict[str, Any]:
+def vocalize_and_expand_hebrew(text: str, api_key: str = "", settings: Dict[str, Any] = None) -> Dict[str, Any]:
     """
-    מנקד טקסט עברי במדויק ופותח ראשי תיבות באמצעות Gemini 3.8 Flash.
+    מנקד טקסט עברי במדויק ופותח ראשי תיבות באמצעות הספק והמודל שנבחרו בהגדרות.
     אם אין מפתח API - מבצע חלוקה מקומית למשפטים כגיבוי ללא תלות ברשת.
     """
-    key = api_key or get_api_key()
-    if not key:
+    cfg = settings or load_settings()
+    pconf = get_active_provider_config(cfg)
+    pid = pconf["provider_id"]
+    key = api_key or pconf.get("api_key", "")
+    model = pconf.get("model", "")
+    base_url = pconf.get("base_url", "")
+
+    if not key and pid != "custom":
         from book_loader import split_into_sentences
         sents = split_into_sentences(text)
         return {
             "vocalized_text": text,
             "sentences": sents,
             "glossary": [],
-            "source": "offline-fallback"
+            "source": "offline-fallback",
+            "note": f"לא הוגדר מפתח API עבור {get_provider_label(pid)} — בוצעה חלוקה מקומית ללא ניקוד AI.",
         }
 
     try:
-        from google import genai
-        client = genai.Client(api_key=key)
-        
-        prompt = f"""
-אתה מומחה בלשנות עברית, פונטיקה והכנת טקסטים לקריאה קולית רציפה (TTS).
-עבור הטקסט הבא, בצע הכנה מושלמת לקריאה שוטפת ומדויקת:
-1. הוסף ניקוד מלא ומדויק לכל המילים (כולל דגשים, תנועות והבחנה בין שׁ ימנית לשׂ שמאלית), כדי שמנוע דיבור יקריא ללא שיבושים.
-2. פתח ראשי תיבות וקיצורים בעברית למילים מלאות ומנוקדות (למשל: רמב"ם -> רַבֵּינוּ מֹשֶׁה בֶּן מַיְמוֹן, עכ"פ -> עַל כָּל פָּנִים, אחה"צ -> אַחַר הַצָּהֳרַיִם, וכד' -> וְכַדּוֹמֶה, ביהמ"ש -> בֵּית הַמִּשְׁפָּט, זצ"ל -> זֵכֶר צַדִּיק לִבְרָכָה).
-3. נקה סימוני שוליים מפריעים כגון מספרי הערות שוליים ([1], (א)).
-4. חלק את הטקסט למשפטים ברורים המותאמים לקצב נשימה.
-
-טקסט המקור:
-\"\"\"
-{text[:7000]}
-\"\"\"
-
-החזר אך ורק JSON במבנה:
-{{
-  "vocalized_text": "הטקסט המלא מנוקד",
-  "sentences": ["משפט ראשון מנוקד", "משפט שני מנוקד"],
-  "glossary": [
-    {{"term": "מילה קשה", "meaning": "הסבר קצר"}}
-  ]
-}}
-"""
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config={"response_mime_type": "application/json"}
+        system_prompt = (
+            "אתה מומחה בלשנות עברית, פונטיקה והכנת טקסטים לקריאה קולית רציפה (TTS). "
+            "עבור הטקסט הבא:\n"
+            "1. הוסף ניקוד מלא ומדויק לכל המילים (כולל דגשים, תנועות והבחנה בין שׁ ימנית לשׂ שמאלית).\n"
+            "2. פתח ראשי תיבות וקיצורים בעברית למילים מלאות ומנוקדות (כגון רמב\"ם -> רַבֵּינוּ מֹשֶׁה בֶּן מַיְמוֹן, עכ\"פ -> עַל כָּל פָּנִים, וכד' -> וְכַדּוֹמֶה).\n"
+            "3. נקה סימוני שוליים מפריעים כמו מספרי הערות שוליים ([1], (א)).\n"
+            "4. חלק את הטקסט למשפטים ברורים המותאמים לקצב נשימה.\n"
+            'החזר אך ורק JSON במבנה: {"vocalized_text": "...", "sentences": ["...", "..."], "glossary": [{"term": "...", "meaning": "..."}]}'
         )
-        
-        parsed = json.loads(response.text or "{}")
+
+        raw = chat_completion(
+            provider_id=pid,
+            api_key=key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=text[:7000],
+            base_url=base_url,
+            json_mode=True,
+            temperature=0.15,
+        )
+
+        parsed = extract_json_object(raw)
         vocalized = parsed.get("vocalized_text", text)
         sentences = parsed.get("sentences", [])
         if not sentences:
             from book_loader import split_into_sentences
             sentences = split_into_sentences(vocalized)
-            
+
         return {
             "vocalized_text": vocalized,
             "sentences": sentences,
             "glossary": parsed.get("glossary", []),
-            "source": "gemini-3.8-flash"
+            "source": f"{get_provider_label(pid)} ({model})",
         }
     except Exception as e:
         from book_loader import split_into_sentences
@@ -79,44 +75,56 @@ def vocalize_and_expand_hebrew(text: str, api_key: str = "") -> Dict[str, Any]:
             "vocalized_text": text,
             "sentences": sents,
             "glossary": [],
-            "source": f"error-fallback: {e}"
+            "source": f"error-fallback: {e}",
+            "note": str(e),
         }
 
-def ask_companion(text: str, mode: str = "explain", book_title: str = "", api_key: str = "") -> str:
-    """ביאור פסקה, סיכום פרק או שאלות הבנה באמצעות AI."""
-    key = api_key or get_api_key()
-    if not key:
-        return "כדי להשתמש בעוזר הספרותי, הגדר מפתח Gemini API בהגדרות או במשתני הסביבה."
+
+def ask_companion(text: str, mode: str = "explain", book_title: str = "", api_key: str = "", settings: Dict[str, Any] = None) -> str:
+    """ביאור פסקה, סיכום פרק או שאלות הבנה באמצעות הספק והמודל שנבחרו בהגדרות."""
+    cfg = settings or load_settings()
+    pconf = get_active_provider_config(cfg)
+    pid = pconf["provider_id"]
+    key = api_key or pconf.get("api_key", "")
+    model = pconf.get("model", "")
+    base_url = pconf.get("base_url", "")
+
+    if not key and pid != "custom":
+        return (
+            f"כדי להשתמש בעוזר הספרותי עם **{get_provider_label(pid)}**, "
+            "לחץ בסרגל הכלים על **⚙️ הגדרות AI ומודלים** והזן מפתח API (גוגל, OpenAI, Claude, OpenRouter או Groq)."
+        )
 
     try:
-        from google import genai
-        client = genai.Client(api_key=key)
-
         mode_instructions = {
             "explain": "באר את הטקסט בעברית בהירה, הסבר מילים קשות, הקשר היסטורי ורעיונות מרכזיים.",
             "summary": "כתוב סיכום מתומצת ומאיר עיניים של הקטע בנקודות (Bullet points), עם מסקנות ורעיונות מרכזיים.",
             "quiz": "חבר 3 שאלות הבנה מעניינות עם תשובות קצרות לבדיקת הבנת הנקרא.",
-            "simplify": "נסח מחדש בשפה עברית מודרנית ובהירה, פשוטה לקריאה."
+            "simplify": "נסח מחדש בשפה עברית מודרנית ובהירה, פשוטה לקריאה.",
         }
 
         instruction = mode_instructions.get(mode, mode_instructions["explain"])
-        prompt = f"""
-אתה עוזר ספרותי אישי ומקצועי למקריא הספרים PorMyCodex.
-{f'שם הספר: "{book_title}"' if book_title else ''}
-
-משימה: {instruction}
-
-טקסט:
-\"\"\"
-{text[:5000]}
-\"\"\"
-
-ענה בעברית עשירה ובהירה.
-"""
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt
+        system_prompt = (
+            "אתה עוזר ספרותי אישי ומקצועי בתוכנת PorMyCodex. "
+            "ענה בעברית עשירה, מדויקת ובהירה."
         )
-        return response.text or "לא התקבלה תשובה מהמודל."
+        title_line = f'שם הספר: "{book_title}"\n' if book_title else ""
+        user_prompt = (
+            f"{title_line}"
+            f"משימה: {instruction}\n\n"
+            f'טקסט:\n"""\n{text[:6000]}\n"""'
+        )
+
+        reply = chat_completion(
+            provider_id=pid,
+            api_key=key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            base_url=base_url,
+            json_mode=False,
+            temperature=0.3,
+        )
+        return reply or "לא התקבלה תשובה מהמודל."
     except Exception as e:
-        return f"שגיאה בהפעלת העוזר: {e}"
+        return f"שגיאה בהפעלת העוזר ({get_provider_label(pid)} / {model}): {e}"

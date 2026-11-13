@@ -3,16 +3,15 @@
 מנוע אודיו והקראה קולית שולחני (Audio Engine) עבור PorMyCodex.
 תומך ב-Edge-TTS (קולות נוירליים עבריים באיכות אולפן: Avri ו-Hila)
 וב-pyttsx3 (SAPI5 מקומי ב-Windows Offline מלא).
+כולל תמיכה בהקראת תסריט רב-קולי (מורה בקול אברי, תלמיד בקול הילה).
 """
 
 import os
-import sys
 import tempfile
 import asyncio
 from typing import List, Optional
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-# מנסה לטעון pygame להשמעה חלקה; אם לא מותקן, משתמש ב-QMediaPlayer או os.system
 PYGAME_AVAILABLE = False
 try:
     import pygame
@@ -27,12 +26,20 @@ class PlaybackWorker(QThread):
     playback_finished = pyqtSignal()
     playback_error = pyqtSignal(str)
 
-    def __init__(self, sentences: List[str], start_index: int = 0, voice_type: str = "edge_avri", speed: float = 1.0):
+    def __init__(
+        self,
+        sentences: List[str],
+        start_index: int = 0,
+        voice_type: str = "edge_avri",
+        speed: float = 1.0,
+        voice_overrides: Optional[List[str]] = None,
+    ):
         super().__init__()
         self.sentences = sentences
         self.current_index = start_index
         self.voice_type = voice_type
         self.speed = speed
+        self.voice_overrides = voice_overrides or []
         self._is_running = True
         self._is_paused = False
 
@@ -49,8 +56,11 @@ class PlaybackWorker(QThread):
 
             self.sentence_started.emit(self.current_index)
 
-            # יצירת אודיו והשמעתו
-            success = self._play_sentence(text)
+            active_voice = self.voice_type
+            if 0 <= self.current_index < len(self.voice_overrides) and self.voice_overrides[self.current_index]:
+                active_voice = self.voice_overrides[self.current_index]
+
+            success = self._play_sentence(text, active_voice)
             if not success and not self._is_running:
                 break
 
@@ -58,15 +68,15 @@ class PlaybackWorker(QThread):
 
         self.playback_finished.emit()
 
-    def _play_sentence(self, text: str) -> bool:
-        if "edge" in self.voice_type:
-            return self._play_with_edge_tts(text)
+    def _play_sentence(self, text: str, voice_type: str) -> bool:
+        if "edge" in voice_type:
+            return self._play_with_edge_tts(text, voice_type)
         else:
             return self._play_with_pyttsx3(text)
 
-    def _play_with_edge_tts(self, text: str) -> bool:
+    def _play_with_edge_tts(self, text: str, voice_type: str) -> bool:
         """משתמש ב-Edge-TTS להשמעת קול נוירלי עברי באיכות גבוהה."""
-        voice_name = "he-IL-AvriNeural" if "avri" in self.voice_type else "he-IL-HilaNeural"
+        voice_name = "he-IL-AvriNeural" if "avri" in voice_type else "he-IL-HilaNeural"
         rate_str = f"{int((self.speed - 1.0) * 100):+d}%"
 
         temp_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -96,12 +106,10 @@ class PlaybackWorker(QThread):
                 except Exception:
                     pass
             else:
-                # גיבוי להפעלה ב-Windows
                 self._play_with_pyttsx3(text)
 
             return True
         except Exception:
-            # אם edge-tts נכשל (למשל אין חיבור אינטרנט), עובר ל-pyttsx3 מקומי
             return self._play_with_pyttsx3(text)
         finally:
             try:
@@ -120,11 +128,9 @@ class PlaybackWorker(QThread):
         try:
             import pyttsx3
             engine = pyttsx3.init()
-            # קביעת מהירות
             base_rate = engine.getProperty('rate')
             engine.setProperty('rate', int(base_rate * self.speed))
 
-            # חיפוש קול עברי
             voices = engine.getProperty('voices')
             for v in voices:
                 if 'hebrew' in v.name.lower() or 'he-il' in str(v.languages).lower() or 'asaf' in v.name.lower() or 'hila' in v.name.lower():
@@ -174,7 +180,7 @@ class AudioEngine(QObject):
         self.voice_type = "edge_avri"
         self.speed = 1.0
 
-    def play(self, sentences: List[str], start_index: int = 0):
+    def play(self, sentences: List[str], start_index: int = 0, voice_overrides: Optional[List[str]] = None):
         self.stop()
         if not sentences:
             return
@@ -183,7 +189,8 @@ class AudioEngine(QObject):
             sentences=sentences,
             start_index=start_index,
             voice_type=self.voice_type,
-            speed=self.speed
+            speed=self.speed,
+            voice_overrides=voice_overrides,
         )
         self.worker.sentence_started.connect(self.sentence_changed.emit)
         self.worker.playback_finished.connect(lambda: self.state_changed.emit(False))

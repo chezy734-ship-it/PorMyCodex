@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 עיצוב ערכת נושא כהה ומודרנית (QSS) עבור PorMyCodex.
-מותאם לכיווניות עברית (RTL) עם גווני Slate ו-Amber.
+מותאם לכיווניות עברית (RTL) עם גווני Slate ו-Amber, כולל חלונות הגדרות, תרגום ותסריט.
 """
 
 def get_stylesheet() -> str:
@@ -16,17 +16,16 @@ def get_stylesheet() -> str:
         selection-color: #0f172a;
     }
 
-    /* Main Window */
-    QMainWindow {
+    QMainWindow, QDialog {
         background-color: #0b1120;
     }
 
-    /* Menu & ToolBar */
+    /* ToolBar */
     QToolBar {
         background-color: #1e293b;
         border-bottom: 1px solid #334155;
         padding: 6px;
-        spacing: 8px;
+        spacing: 6px;
     }
 
     QToolButton {
@@ -34,8 +33,9 @@ def get_stylesheet() -> str:
         color: #f8fafc;
         border: 1px solid #475569;
         border-radius: 8px;
-        padding: 6px 12px;
+        padding: 6px 11px;
         font-weight: 600;
+        font-size: 12px;
     }
 
     QToolButton:hover {
@@ -55,7 +55,7 @@ def get_stylesheet() -> str:
         color: #f1f5f9;
         border: 1px solid #334155;
         border-radius: 8px;
-        padding: 8px 16px;
+        padding: 7px 14px;
         font-size: 13px;
         font-weight: 600;
     }
@@ -81,6 +81,17 @@ def get_stylesheet() -> str:
         border-color: #f59e0b;
     }
 
+    QPushButton#accentBtn {
+        background-color: #4f46e5;
+        color: #ffffff;
+        border: 1px solid #6366f1;
+        font-weight: bold;
+    }
+
+    QPushButton#accentBtn:hover {
+        background-color: #6366f1;
+    }
+
     QPushButton#playBtn {
         background-color: #f59e0b;
         color: #0f172a;
@@ -94,6 +105,56 @@ def get_stylesheet() -> str:
 
     QPushButton#playBtn:hover {
         background-color: #fbbf24;
+    }
+
+    /* Inputs & GroupBoxes */
+    QLineEdit, QPlainTextEdit {
+        background-color: #020617;
+        color: #f1f5f9;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 7px 10px;
+    }
+
+    QLineEdit:focus, QPlainTextEdit:focus {
+        border-color: #f59e0b;
+    }
+
+    QGroupBox {
+        border: 1px solid #334155;
+        border-radius: 10px;
+        margin-top: 12px;
+        padding: 14px 10px 10px 10px;
+        font-weight: bold;
+        color: #fbbf24;
+    }
+
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        subcontrol-position: top right;
+        padding: 0 8px;
+        background-color: #0b1120;
+    }
+
+    QTabWidget::pane {
+        border: 1px solid #334155;
+        border-radius: 8px;
+        background-color: #0f172a;
+    }
+
+    QTabBar::tab {
+        background-color: #1e293b;
+        color: #94a3b8;
+        padding: 8px 16px;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        margin-left: 4px;
+        font-weight: 600;
+    }
+
+    QTabBar::tab:selected {
+        background-color: #f59e0b;
+        color: #0f172a;
     }
 
     /* Lists and Trees */

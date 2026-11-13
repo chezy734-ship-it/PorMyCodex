@@ -14,9 +14,15 @@ hiddenimports = [
     'docx',
     'aiohttp',
     'certifi',
+    'requests',
+    'settings_manager',
+    'ai_providers',
+    'translator_engine',
+    'script_engine',
+    'dialogs',
 ]
 
-for pkg in ['google.genai', 'edge_tts', 'pyttsx3', 'docx']:
+for pkg in ['google.genai', 'edge_tts', 'pyttsx3', 'docx', 'requests', 'certifi', 'PyPDF2']:
     try:
         tmp_ret = collect_all(pkg)
         datas += tmp_ret[0]

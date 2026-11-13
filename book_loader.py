@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-מודול לטעינה, חילוץ וחלוקת ספרים וטקסטים עבריים לפרקים ומשפטים.
-תומך בקבצי TXT, MD, PDF, DOCX וספרי מופת מובנים.
+מודול לטעינה, חילוץ וחלוקת ספרים וטקסטים גדולים (PDF / DOCX / TXT / MD) לפרקים ומשפטים.
+כולל מנגנון עמיד לספרים בני מאות ואלפי עמודים:
+- קריאה בטוחה עמוד-אחר-עמוד עם דיווח התקדמות והגנה מרקורסיה/עמודים פגומים
+- חלוקה אוטומטית לחלקים/פרקים נוחים (~12 עמודים או ~10,000 תווים לפרק) כדי למנוע עומס זיכרון או קריסה
 """
 
 import os
 import re
-from typing import List, Dict, Any
+import sys
+from typing import List, Dict, Any, Callable, Optional
+
+MAX_CHAPTER_CHARS = 12000
+PAGES_PER_CHUNK = 12
 
 SAMPLE_BOOKS: List[Dict[str, Any]] = [
     {
@@ -21,7 +27,7 @@ SAMPLE_BOOKS: List[Dict[str, Any]] = [
 יֵשׁ אָדָם שֶׁהוּא בַּעַל חֵמָה כּוֹעֵס תָּמִיד, וְיֵשׁ אָדָם שֶׁדַּעְתּוֹ מְיוּשֶׁבֶת עָלָיו וְאֵינוֹ כּוֹעֵס כְּלָל.
 וְיֵשׁ אָדָם שֶׁהוּא גְּבַהּ לֵב בְּיוֹתֵר, וְיֵשׁ שֶׁהוּא שְׁפַל רוּחַ עַד מְאֹד.
 וּשְׁתֵּי קְצָווֹת הָרְחוֹקוֹת זוֹ מִזּוֹ בְּכָל דֵּעָה וְדֵעָה אֵינָן דֶּרֶךְ טוֹבָה, וְאֵין רָאוּי לָאָדָם לָלֶכֶת בָּהֶן.
-הַדֶּרֶךְ הַיְשָׁרָה הִיא מִדָּה בֵּינוֹנִית שֶׁבְּכָל דֵּעָה וְדֵעָה מִכָּל הַדֵּעוֹת שֶׁיֵּשׁ לָאָדָם; וְהִיא הַדֵּעָה שֶׁהִיא רְחוֹקָה מִשְּׁתֵּי הַקְּצָווֹת רִחוּק שָׁוֶה.
+הַדֶּרֶךְ הַיְשָׁרָה הִיא מִדָּה בֵּינוֹנִית שֶׁבְּכָל דֵּעָה וְדֵעָה מִכָּל הַדֶּעוֹת שֶׁיֵּשׁ לָאָדָם; וְהִיא הַדֶּעָה שֶׁהִיא רְחוֹקָה מִשְּׁתֵּי הַקְּצָווֹת רִחוּק שָׁוֶה.
 לְפִיכָךְ צִוּוּ חֲכָמִים הָרִאשׁוֹנִים שֶׁיְּהֵא אָדָם שָׁם דֵּעוֹתָיו תָּמִיד וּמְשַׁעֵר אוֹתָן וּמְכַוֵּן אוֹתָן בַּדֶּרֶךְ הָאֶמְצָעִית."""
             },
             {
@@ -57,26 +63,195 @@ SAMPLE_BOOKS: List[Dict[str, Any]] = [
 
 
 def split_into_sentences(text: str) -> List[str]:
-    """מחלק טקסט עברי למשפטים לפי נקודות, סימני שאלה, קריאה וירידות שורה."""
+    """מחלק טקסט למשפטים נוחים להקראה בלי ליצור משפטים ארוכים מדי."""
     if not text:
         return []
-    
-    # חלוקה לפי סימני סיום משפט
+
     raw_parts = re.split(r'(?<=[.?!;:\n])\s+', text.strip())
-    sentences = [p.strip() for p in raw_parts if p.strip()]
+    sentences: List[str] = []
+    for part in raw_parts:
+        clean = re.sub(r'\s+', ' ', part).strip()
+        if not clean:
+            continue
+        # חלוקת משפט ארוך במיוחד (> 350 תווים) כדי למנוע עומס על TTS ורינדור
+        if len(clean) > 350:
+            words = clean.split(' ')
+            buf = ""
+            for w in words:
+                if len(buf) + len(w) + 1 <= 280:
+                    buf = f"{buf} {w}".strip()
+                else:
+                    if buf:
+                        sentences.append(buf)
+                    buf = w
+            if buf:
+                sentences.append(buf)
+        else:
+            sentences.append(clean)
+
     return sentences if sentences else [text.strip()]
 
 
-def load_file_content(file_path: str) -> Dict[str, Any]:
-    """טוען קובץ טקסט, PDF או Word ומחזיר מבנה ספר עם פרקים."""
+def _split_large_chapter(title: str, text: str, max_chars: int = MAX_CHAPTER_CHARS) -> List[Dict[str, str]]:
+    """מפצל פרק ענק לתתי-חלקים נוחים כדי לשמור על זיכרון נמוך ומהירות תצוגה."""
+    clean = text.strip()
+    if len(clean) <= max_chars:
+        return [{"title": title[:70], "text": clean}]
+
+    parts: List[Dict[str, str]] = []
+    paragraphs = [p.strip() for p in clean.split("\n") if p.strip()]
+    buf: List[str] = []
+    buf_len = 0
+    part_idx = 1
+
+    for para in paragraphs:
+        if buf_len + len(para) + 1 > max_chars and buf:
+            parts.append({
+                "title": f"{title[:45]} (חלק {part_idx})",
+                "text": "\n".join(buf),
+            })
+            part_idx += 1
+            buf = [para]
+            buf_len = len(para)
+        else:
+            buf.append(para)
+            buf_len += len(para) + 1
+
+    if buf:
+        parts.append({
+            "title": f"{title[:45]} (חלק {part_idx})" if part_idx > 1 else title[:70],
+            "text": "\n".join(buf),
+        })
+
+    return parts
+
+
+def _chapters_from_full_text(full_text: str) -> List[Dict[str, str]]:
+    """מזהה פרקים בטקסט ומפצל פרקים ארוכים מדי אוטומטית."""
+    clean = (full_text or "").strip()
+    if not clean:
+        return [{"title": "פרק א׳ (ריק)", "text": "לא נמצא טקסט לקריאה בקובץ."}]
+
+    chapter_splits = re.split(
+        r'\n(?=(?:פרק\s+[א-ת0-9"\'׳״]+|חלק\s+[א-ת0-9]+|Chapter\s+\d+|PART\s+\d+))',
+        clean,
+        flags=re.IGNORECASE,
+    )
+
+    chapters: List[Dict[str, str]] = []
+    if len(chapter_splits) > 1:
+        for idx, ch_text in enumerate(chapter_splits, 1):
+            chunk = ch_text.strip()
+            if not chunk:
+                continue
+            lines = [l.strip() for l in chunk.split('\n') if l.strip()]
+            title = lines[0][:65] if lines else f"פרק {idx}"
+            chapters.extend(_split_large_chapter(title, chunk))
+    else:
+        chapters.extend(_split_large_chapter("פרק א׳", clean))
+
+    return chapters or [{"title": "פרק א׳", "text": clean}]
+
+
+def _load_pdf_safe(
+    file_path: str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> List[Dict[str, str]]:
+    """
+    קורא קובץ PDF בצורה עמידה לספרים גדולים:
+    - מגדיל גבול רקורסיה עבור PDF עמוקים
+    - מטפל בשגיאה בעמוד בודד מבלי להפיל את כל הספר
+    - מחלק לקבוצות עמודים/פרקים נוחות אוטומטית
+    """
+    import PyPDF2
+
+    old_limit = sys.getrecursionlimit()
+    if old_limit < 5000:
+        sys.setrecursionlimit(5000)
+
+    chapters: List[Dict[str, str]] = []
+    try:
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f, strict=False)
+            if reader.is_encrypted:
+                try:
+                    reader.decrypt("")
+                except Exception:
+                    raise RuntimeError("קובץ ה-PDF מוגן בסיסמה ואינו ניתן לקריאה.")
+
+            total_pages = len(reader.pages)
+            if total_pages == 0:
+                raise RuntimeError("קובץ ה-PDF אינו מכיל עמודים.")
+
+            chunk_pages_text: List[str] = []
+            chunk_start_page = 1
+            non_empty_pages = 0
+
+            for idx in range(total_pages):
+                page_num = idx + 1
+                if progress_cb and (page_num == 1 or page_num % 10 == 0 or page_num == total_pages):
+                    progress_cb(f"טוען PDF: עמוד {page_num} מתוך {total_pages}...")
+
+                page_txt = ""
+                try:
+                    page_txt = reader.pages[idx].extract_text() or ""
+                except Exception:
+                    page_txt = ""
+
+                page_txt = page_txt.strip()
+                if page_txt:
+                    non_empty_pages += 1
+                    chunk_pages_text.append(page_txt)
+
+                current_chars = sum(len(t) for t in chunk_pages_text)
+                reached_chunk = (
+                    (page_num - chunk_start_page + 1 >= PAGES_PER_CHUNK)
+                    or current_chars >= MAX_CHAPTER_CHARS
+                    or page_num == total_pages
+                )
+
+                if reached_chunk and chunk_pages_text:
+                    combined = "\n\n".join(chunk_pages_text)
+                    title = f"עמודים {chunk_start_page}–{page_num}"
+                    chapters.extend(_split_large_chapter(title, combined))
+                    chunk_pages_text = []
+                    chunk_start_page = page_num + 1
+                elif reached_chunk and not chunk_pages_text:
+                    chunk_start_page = page_num + 1
+
+            if non_empty_pages == 0:
+                chapters = [{
+                    "title": "ספר סרוק / ללא שכבת טקסט",
+                    "text": (
+                        "לא נמצא טקסט ניתן לחילוץ בקובץ ה-PDF הזה.\n"
+                        "ייתכן שמדובר בקובץ PDF סרוק (תמונות בלבד ללא שכבת OCR)."
+                    ),
+                }]
+
+        return chapters
+    finally:
+        try:
+            sys.setrecursionlimit(old_limit)
+        except Exception:
+            pass
+
+
+def load_file_content(
+    file_path: str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """טוען קובץ טקסט, PDF או Word בצורה בטוחה (כולל ספרים גדולים) ומחזיר מבנה ספר עם פרקים."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"הקובץ אינו קיים: {file_path}")
 
     ext = os.path.splitext(file_path)[1].lower()
     base_name = os.path.splitext(os.path.basename(file_path))[0]
-    full_text = ""
+    chapters: List[Dict[str, str]] = []
 
     if ext in [".txt", ".md"]:
+        if progress_cb:
+            progress_cb("טוען קובץ טקסט...")
+        full_text = ""
         for enc in ["utf-8", "utf-8-sig", "windows-1255", "iso-8859-8"]:
             try:
                 with open(file_path, "r", encoding=enc) as f:
@@ -84,50 +259,29 @@ def load_file_content(file_path: str) -> Dict[str, Any]:
                 break
             except UnicodeDecodeError:
                 continue
+        if not full_text:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                full_text = f.read()
+        chapters = _chapters_from_full_text(full_text)
 
     elif ext == ".pdf":
-        try:
-            import PyPDF2
-            with open(file_path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                pages = [page.extract_text() or "" for page in reader.pages]
-                full_text = "\n\n".join(pages)
-        except Exception as e:
-            full_text = f"שגיאה בקריאת PDF: {e}"
+        chapters = _load_pdf_safe(file_path, progress_cb=progress_cb)
 
     elif ext == ".docx":
-        try:
-            import docx
-            doc = docx.Document(file_path)
-            full_text = "\n".join([p.text for p in doc.paragraphs if p.text])
-        except Exception as e:
-            full_text = f"שגיאה בקריאת DOCX: {e}"
+        if progress_cb:
+            progress_cb("טוען מסמך Word...")
+        import docx
+        doc = docx.Document(file_path)
+        full_text = "\n".join([p.text for p in doc.paragraphs if p.text])
+        chapters = _chapters_from_full_text(full_text)
 
     else:
         raise ValueError(f"סוג קובץ אינו נתמך: {ext}")
-
-    # חלוקה ראשונית לפרקים אם קיימים סמני פרק (למשל 'פרק א', 'פרק 1', 'Chapter')
-    chapter_splits = re.split(r'\n(?=(?:פרק\s+[א-ת0-9]+|פרק\s+|Chapter\s+\d+))', full_text, flags=re.IGNORECASE)
-
-    chapters = []
-    if len(chapter_splits) > 1:
-        for idx, ch_text in enumerate(chapter_splits, 1):
-            lines = [l.strip() for l in ch_text.strip().split('\n') if l.strip()]
-            title = lines[0] if lines else f"פרק {idx}"
-            chapters.append({
-                "title": title[:60],
-                "text": ch_text.strip()
-            })
-    else:
-        chapters.append({
-            "title": "פרק א׳ (תוכן הקובץ)",
-            "text": full_text.strip()
-        })
 
     return {
         "id": f"imported_{os.path.basename(file_path)}",
         "title": base_name,
         "author": "מסמך שהועלה",
-        "description": f"קובץ: {file_path}",
-        "chapters": chapters
+        "description": f"קובץ: {file_path} ({len(chapters)} חלקים/פרקים)",
+        "chapters": chapters,
     }
