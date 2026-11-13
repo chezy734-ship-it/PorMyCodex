@@ -63,15 +63,22 @@ SAMPLE_BOOKS: List[Dict[str, Any]] = [
 
 
 def split_into_sentences(text: str) -> List[str]:
-    """מחלק טקסט למשפטים נוחים להקראה בלי ליצור משפטים ארוכים מדי."""
+    """מחלק טקסט למשפטים נוחים להקראה, מסנן שורות נקודות/קווים ריקות מתוכן ומונע משפטים ארוכים מדי."""
     if not text:
         return []
 
-    raw_parts = re.split(r'(?<=[.?!;:\n])\s+', text.strip())
+    # ניקוי שרשראות נקודות/קווים מתוכן עניינים ב-PDF (כגון "פרק א ........ 12")
+    cleaned = re.sub(r'\.{3,}', ' — ', text.strip())
+    cleaned = re.sub(r'[-_•·]{4,}', ' ', cleaned)
+    # איחוד שורות שבורות באמצע משפט ב-PDF, תוך שמירה על סוף משפט אמיתי
+    cleaned = re.sub(r'(?<![.?!:\n])\n(?!\n)', ' ', cleaned)
+
+    raw_parts = re.split(r'(?<=[.?!;:\n])\s+', cleaned)
     sentences: List[str] = []
     for part in raw_parts:
         clean = re.sub(r'\s+', ' ', part).strip()
-        if not clean:
+        # דילוג על מקטעים שאין בהם אף אות או ספרה (מונע שורות "." ריקות ב-PDF)
+        if not clean or not re.search(r'[0-9A-Za-z\u0590-\u05FF\u0600-\u06FF]', clean):
             continue
         # חלוקת משפט ארוך במיוחד (> 350 תווים) כדי למנוע עומס על TTS ורינדור
         if len(clean) > 350:
@@ -89,7 +96,7 @@ def split_into_sentences(text: str) -> List[str]:
         else:
             sentences.append(clean)
 
-    return sentences if sentences else [text.strip()]
+    return sentences if sentences else ["אין טקסט קריא במקטע זה."]
 
 
 def _split_large_chapter(title: str, text: str, max_chars: int = MAX_CHAPTER_CHARS) -> List[Dict[str, str]]:

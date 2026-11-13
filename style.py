@@ -92,15 +92,38 @@ def get_stylesheet() -> str:
         background-color: #6366f1;
     }
 
+    QPushButton#settingsBadgeBtn {
+        background-color: #1e293b;
+        color: #38bdf8;
+        border: 1px solid #38bdf8;
+        border-radius: 8px;
+        padding: 5px 12px;
+        font-size: 12px;
+        font-weight: bold;
+    }
+
+    QPushButton#settingsBadgeBtn:hover {
+        background-color: #0284c7;
+        color: #ffffff;
+    }
+
+    QFrame#playerBar {
+        background-color: #1e293b;
+        border-top: 1px solid #334155;
+    }
+
     QPushButton#playBtn {
         background-color: #f59e0b;
         color: #0f172a;
-        border: none;
+        border: 2px solid #fbbf24;
         border-radius: 25px;
+        padding: 0px;
         font-size: 20px;
         font-weight: bold;
         min-width: 50px;
         min-height: 50px;
+        max-width: 50px;
+        max-height: 50px;
     }
 
     QPushButton#playBtn:hover {

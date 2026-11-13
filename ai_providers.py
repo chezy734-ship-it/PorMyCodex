@@ -221,6 +221,9 @@ def chat_completion(
     url_base = (base_url or meta["default_base_url"]).strip().rstrip("/")
 
     if provider_id == "gemini":
+        import re
+        import time
+
         gen_cfg: Dict[str, Any] = {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
@@ -233,25 +236,47 @@ def chat_completion(
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": gen_cfg,
         }
-        resp = requests.post(
-            f"{url_base}/models/{selected_model}:generateContent",
-            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-            json=payload,
-            timeout=timeout,
-        )
-        # אם מודל ספציפי הוצא משימוש (404), מנסים אוטומטית את המודל המומלץ או gemini-3.8-flash
-        if resp.status_code == 404:
-            import re
+
+        def _post_gemini(target_model: str) -> requests.Response:
+            return requests.post(
+                f"{url_base}/models/{target_model}:generateContent",
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+
+        resp = _post_gemini(selected_model)
+
+        # אם יש עומס זמני (503/429/500), ממתינים 1.5 שניות ומנסים שוב, ואם עדיין נכשל עוברים למודל חלופי חי בחשבון
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(1.5)
+            resp = _post_gemini(selected_model)
+
+        if resp.status_code == 404 or resp.status_code in (500, 502, 503, 504):
             body_txt = resp.text or ""
             m_rec = re.search(r"use\s+models/([a-zA-Z0-9._-]+)", body_txt, flags=re.IGNORECASE)
-            fallback_model = m_rec.group(1) if m_rec else "gemini-3.8-flash"
-            if fallback_model and fallback_model != selected_model:
-                resp = requests.post(
-                    f"{url_base}/models/{fallback_model}:generateContent",
-                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=timeout,
-                )
+            candidates_try = []
+            if m_rec and m_rec.group(1) != selected_model:
+                candidates_try.append(m_rec.group(1))
+            for preset in ("gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-3.8-pro"):
+                if preset != selected_model and preset not in candidates_try:
+                    candidates_try.append(preset)
+
+            # אם עדיין 503/404, ננסה גם לשלוף רשימה חיה מהחשבון
+            try:
+                live_models = discover_models("gemini", key, url_base, timeout=10)
+                for lm in live_models[:5]:
+                    if lm != selected_model and lm not in candidates_try:
+                        candidates_try.append(lm)
+            except Exception:
+                pass
+
+            for cand in candidates_try[:4]:
+                alt_resp = _post_gemini(cand)
+                if alt_resp.ok:
+                    resp = alt_resp
+                    break
+
         _raise_for_api_error("Google Gemini", resp)
         data = resp.json()
         candidates = data.get("candidates", [])

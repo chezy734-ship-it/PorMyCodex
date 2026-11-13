@@ -145,18 +145,25 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Top Toolbar
+        # Top Toolbar (compact labels so all buttons stay visible without horizontal clipping)
         toolbar = QToolBar("פעולות ספרייה ו-AI")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        open_action = QAction("📂 פתח ספר (PDF/Word/TXT)", self)
+        open_action = QAction("📂 פתח ספר", self)
+        open_action.setToolTip("פתח ספר או מסמך (PDF / Word / TXT)")
         open_action.triggered.connect(self.open_file_dialog)
         toolbar.addAction(open_action)
 
-        paste_action = QAction("📋 הדבק טקסט", self)
+        paste_action = QAction("📋 הדבק", self)
+        paste_action.setToolTip("הדבק טקסט חופשי לקריאה")
         paste_action.triggered.connect(self.paste_custom_text)
         toolbar.addAction(paste_action)
+
+        settings_action = QAction("⚙️ הגדרות AI ומודלים", self)
+        settings_action.setToolTip("בחר חברת AI, הזן מפתח API ושאב מודלים זמינים")
+        settings_action.triggered.connect(self.open_settings_dialog)
+        toolbar.addAction(settings_action)
 
         toolbar.addSeparator()
 
@@ -164,37 +171,32 @@ class MainWindow(QMainWindow):
         vocalize_action.triggered.connect(self.vocalize_current_chapter)
         toolbar.addAction(vocalize_action)
 
-        script_action = QAction("🎬 צור תסריט AI", self)
+        script_action = QAction("🎬 תסריט AI", self)
         script_action.triggered.connect(self.open_script_studio)
         toolbar.addAction(script_action)
 
-        translate_action = QAction("🌐 תרגום (AI / חינמי)", self)
+        translate_action = QAction("🌐 תרגום", self)
         translate_action.triggered.connect(self.open_translate_dialog)
         toolbar.addAction(translate_action)
 
-        export_audio_action = QAction("🎧 ייצא שמע (MP3/WAV)", self)
+        export_audio_action = QAction("🎧 ייצא MP3", self)
+        export_audio_action.setToolTip("ייצא קובץ שמע MP3 / WAV נייד להעברה")
         export_audio_action.triggered.connect(self.export_audio_dialog)
         toolbar.addAction(export_audio_action)
 
         toolbar.addSeparator()
 
-        explain_action = QAction("💡 באר פסקה", self)
+        explain_action = QAction("💡 באר", self)
         explain_action.triggered.connect(lambda: self.trigger_companion("explain"))
         toolbar.addAction(explain_action)
 
-        summary_action = QAction("📝 סכם פרק", self)
+        summary_action = QAction("📝 סכם", self)
         summary_action.triggered.connect(lambda: self.trigger_companion("summary"))
         toolbar.addAction(summary_action)
 
-        quiz_action = QAction("❓ שאלות הבנה", self)
+        quiz_action = QAction("❓ שאלות", self)
         quiz_action.triggered.connect(lambda: self.trigger_companion("quiz"))
         toolbar.addAction(quiz_action)
-
-        toolbar.addSeparator()
-
-        settings_action = QAction("⚙️ הגדרות AI ומודלים", self)
-        settings_action.triggered.connect(self.open_settings_dialog)
-        toolbar.addAction(settings_action)
 
         # Splitter Layout
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -237,12 +239,11 @@ class MainWindow(QMainWindow):
 
         header_row.addStretch()
 
-        self.lbl_ai_badge = QLabel("")
-        self.lbl_ai_badge.setStyleSheet(
-            "background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; "
-            "border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: bold;"
-        )
-        header_row.addWidget(self.lbl_ai_badge)
+        self.btn_ai_badge = QPushButton("")
+        self.btn_ai_badge.setObjectName("settingsBadgeBtn")
+        self.btn_ai_badge.setToolTip("לחץ לפתיחת הגדרות AI, הזנת API ובחירת מודל")
+        self.btn_ai_badge.clicked.connect(self.open_settings_dialog)
+        header_row.addWidget(self.btn_ai_badge)
 
         self.btn_restore_original = QPushButton("↩ חזור למקור")
         self.btn_restore_original.setVisible(False)
@@ -301,7 +302,7 @@ class MainWindow(QMainWindow):
 
         # --- Bottom Player Bar ---
         player_bar = QFrame()
-        player_bar.setStyleSheet("background-color: #1e293b; border-top: 1px solid #334155; padding: 6px;")
+        player_bar.setObjectName("playerBar")
         player_layout = QHBoxLayout(player_bar)
         player_layout.setContentsMargins(16, 8, 16, 8)
         player_layout.setSpacing(14)
@@ -363,7 +364,7 @@ class MainWindow(QMainWindow):
         model = pconf.get("model") or "לא נבחר"
         has_key = bool(pconf.get("api_key")) or pid == "custom"
         icon = "🟢" if has_key else "🟡"
-        self.lbl_ai_badge.setText(f"{icon} {get_provider_label(pid)} | {model}")
+        self.btn_ai_badge.setText(f"⚙️ {icon} {get_provider_label(pid)} | {model} (שינוי)")
 
     def load_book_to_ui(self, book_idx: int):
         self.book_list.clear()
