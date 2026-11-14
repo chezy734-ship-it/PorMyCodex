@@ -163,12 +163,12 @@ def _chapters_from_full_text(full_text: str) -> List[Dict[str, str]]:
 def _load_pdf_safe(
     file_path: str,
     progress_cb: Optional[Callable[[str], None]] = None,
-) -> List[Dict[str, str]]:
+) -> Dict[str, Any]:
     """
     קורא קובץ PDF בצורה עמידה לספרים גדולים:
     - מגדיל גבול רקורסיה עבור PDF עמוקים
-    - מטפל בשגיאה בעמוד בודד מבלי להפיל את כל הספר
-    - מחלק לקבוצות עמודים/פרקים נוחות אוטומטית
+    - מתעד במדויק כל עמוד שלא ניתן לחלץ או שדורש OCR (ללא דילוג שקט!)
+    - מחלק לקבוצות עמודים/פרקים נוחות אוטומטית בלי חיתוך ספרים גדולים
     """
     import PyPDF2
 
@@ -177,6 +177,10 @@ def _load_pdf_safe(
         sys.setrecursionlimit(5000)
 
     chapters: List[Dict[str, str]] = []
+    empty_or_ocr_pages: List[int] = []
+    failed_pages: List[Dict[str, Any]] = []
+    extracted_pages: List[int] = []
+
     try:
         with open(file_path, "rb") as f:
             reader = PyPDF2.PdfReader(f, strict=False)
@@ -192,7 +196,6 @@ def _load_pdf_safe(
 
             chunk_pages_text: List[str] = []
             chunk_start_page = 1
-            non_empty_pages = 0
 
             for idx in range(total_pages):
                 page_num = idx + 1
@@ -201,14 +204,16 @@ def _load_pdf_safe(
 
                 page_txt = ""
                 try:
-                    page_txt = reader.pages[idx].extract_text() or ""
-                except Exception:
+                    page_txt = (reader.pages[idx].extract_text() or "").strip()
+                except Exception as exc:
+                    failed_pages.append({"page": page_num, "error": str(exc)})
                     page_txt = ""
 
-                page_txt = page_txt.strip()
                 if page_txt:
-                    non_empty_pages += 1
+                    extracted_pages.append(page_num)
                     chunk_pages_text.append(page_txt)
+                elif not any(fp["page"] == page_num for fp in failed_pages):
+                    empty_or_ocr_pages.append(page_num)
 
                 current_chars = sum(len(t) for t in chunk_pages_text)
                 reached_chunk = (
@@ -226,16 +231,41 @@ def _load_pdf_safe(
                 elif reached_chunk and not chunk_pages_text:
                     chunk_start_page = page_num + 1
 
-            if non_empty_pages == 0:
+            if len(extracted_pages) == 0:
                 chapters = [{
-                    "title": "ספר סרוק / ללא שכבת טקסט",
+                    "title": "ספר סרוק / ללא שכבת טקסט (נדרש OCR)",
                     "text": (
-                        "לא נמצא טקסט ניתן לחילוץ בקובץ ה-PDF הזה.\n"
-                        "ייתכן שמדובר בקובץ PDF סרוק (תמונות בלבד ללא שכבת OCR)."
+                        "לא נמצא טקסט ניתן לחילוץ באף עמוד בקובץ ה-PDF.\n"
+                        "נדרש OCR לקובץ לפני עיבוד, תרגום או הפקת ספר קולי מלא."
                     ),
                 }]
 
-        return chapters
+        missing_parts: List[str] = []
+        if empty_or_ocr_pages:
+            sample = ", ".join(str(p) for p in empty_or_ocr_pages[:15])
+            suffix = f" (+עוד {len(empty_or_ocr_pages) - 15})" if len(empty_or_ocr_pages) > 15 else ""
+            missing_parts.append(f"עמודים ללא שכבת טקסט (נדרש OCR): {sample}{suffix}")
+        if failed_pages:
+            sample_f = ", ".join(str(fp["page"]) for fp in failed_pages[:15])
+            suffix_f = f" (+עוד {len(failed_pages) - 15})" if len(failed_pages) > 15 else ""
+            missing_parts.append(f"עמודים שנכשלו בחילוץ: {sample_f}{suffix_f}")
+
+        is_complete = (len(empty_or_ocr_pages) == 0 and len(failed_pages) == 0 and len(extracted_pages) == total_pages)
+        coverage = {
+            "source_type": "pdf",
+            "total_pages": total_pages,
+            "extracted_page_count": len(extracted_pages),
+            "extracted_pages": extracted_pages,
+            "empty_or_ocr_pages": empty_or_ocr_pages,
+            "failed_pages": failed_pages,
+            "is_complete_extraction": is_complete,
+            "warning_message": (
+                " | ".join(missing_parts)
+                if missing_parts
+                else ""
+            ),
+        }
+        return {"chapters": chapters, "pdf_coverage": coverage}
     finally:
         try:
             sys.setrecursionlimit(old_limit)
@@ -243,17 +273,46 @@ def _load_pdf_safe(
             pass
 
 
+def validate_book_completeness(book: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    מאמת שכל עמודי ה-PDF (אם זהו PDF) חולצו בהצלחה ושהספר מכיל פרקים ומשפטים קריאים.
+    """
+    chapters = (book or {}).get("chapters") or []
+    cov = (book or {}).get("pdf_coverage")
+    if isinstance(cov, dict) and cov.get("source_type") == "pdf":
+        if not cov.get("is_complete_extraction", False):
+            warn = cov.get("warning_message") or "חלק מעמודי ה-PDF לא חולצו או דורשים OCR."
+            return {
+                "is_complete": False,
+                "reason": warn,
+                "pdf_coverage": cov,
+                "chapter_count": len(chapters),
+            }
+    if not chapters:
+        return {"is_complete": False, "reason": "הספר אינו מכיל פרקים לעיבוד.", "chapter_count": 0}
+    for idx, ch in enumerate(chapters):
+        txt = (ch.get("text") or "").strip()
+        if not txt:
+            return {
+                "is_complete": False,
+                "reason": f"פרק {idx + 1} ('{ch.get('title', '')}') ריק מטקסט.",
+                "chapter_count": len(chapters),
+            }
+    return {"is_complete": True, "reason": "", "chapter_count": len(chapters), "pdf_coverage": cov}
+
+
 def load_file_content(
     file_path: str,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """טוען קובץ טקסט, PDF או Word בצורה בטוחה (כולל ספרים גדולים) ומחזיר מבנה ספר עם פרקים."""
+    """טוען קובץ טקסט, PDF או Word בצורה בטוחה (כולל ספרים גדולים) ומחזיר מבנה ספר עם פרקים ודוח כיסוי."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"הקובץ אינו קיים: {file_path}")
 
     ext = os.path.splitext(file_path)[1].lower()
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     chapters: List[Dict[str, str]] = []
+    pdf_coverage: Optional[Dict[str, Any]] = None
 
     if ext in [".txt", ".md"]:
         if progress_cb:
@@ -272,7 +331,9 @@ def load_file_content(
         chapters = _chapters_from_full_text(full_text)
 
     elif ext == ".pdf":
-        chapters = _load_pdf_safe(file_path, progress_cb=progress_cb)
+        pdf_res = _load_pdf_safe(file_path, progress_cb=progress_cb)
+        chapters = pdf_res["chapters"]
+        pdf_coverage = pdf_res["pdf_coverage"]
 
     elif ext == ".docx":
         if progress_cb:
@@ -285,10 +346,17 @@ def load_file_content(
     else:
         raise ValueError(f"סוג קובץ אינו נתמך: {ext}")
 
-    return {
+    desc = f"קובץ: {file_path} ({len(chapters)} חלקים/פרקים)"
+    if pdf_coverage and not pdf_coverage.get("is_complete_extraction"):
+        desc += f" — חלקי/נדרש OCR ({pdf_coverage.get('extracted_page_count')}/{pdf_coverage.get('total_pages')} עמודים)"
+
+    result: Dict[str, Any] = {
         "id": f"imported_{os.path.basename(file_path)}",
         "title": base_name,
         "author": "מסמך שהועלה",
-        "description": f"קובץ: {file_path} ({len(chapters)} חלקים/פרקים)",
+        "description": desc,
         "chapters": chapters,
     }
+    if pdf_coverage is not None:
+        result["pdf_coverage"] = pdf_coverage
+    return result

@@ -1,19 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-מודול ייצוא אודיו נייד (Portable Audiobook Exporter) עבור PorMyCodex.
-מאפשר לייצר קובץ שמע אמיתי (.mp3 או .wav) מכתיבה אטומית מלאה (temp + fsync + os.replace):
-- אימות של 100% מהמקטעים (לעולם לא מדלג על מקטע שנכשל ולא יוצר קובץ חלקי)
-- תמיכה מלאה בביטול נקי (cancel_event) בלי להשאיר שאריות בנתיב היעד
+מודול ייצוא ואריזת אודיו נייד (Portable Audiobook Exporter) עבור PorMyCodex.
+
+מאפיינים מרכזיים:
+- הזרמת כתיבה לקובץ זמני על הדיסק בחתיכות (Chunked Streaming) בלי להחזיק ספר שלם בזיכרון
+- איחוד WAV תקני דרך פענוח וקידוד מחדש ב-`wave` (לעולם לא חיבור בינארי עיוור)
+- איחוד MP3 תקני דרך פענוח וקידוד מחדש (FFmpeg / מסנתז ייעודי); לעולם לא חיבור בינארי עיוור של קובצי MP3
+- אריזת ספר שלם לתיקייה או ל-ZIP של קבצים ממוספרים לכל פרק + manifest.json מאומת
+- כתיבה אטומית מלאה (Temp file -> fsync -> os.replace) וביטול מיידי בלי להשאיר קבצים חלקיים
 """
 
 import asyncio
 import io
+import json
 import os
+import shutil
+import subprocess
 import tempfile
 import wave
-from typing import Any, Callable, List, Optional, Tuple
+import zipfile
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from library_store import atomic_write_bytes
+from library_store import atomic_write_bytes, atomic_write_json, sanitize_filename_part
 
 
 class ExportCancelledError(RuntimeError):
@@ -25,19 +34,19 @@ def _check_cancelled(cancel_event: Any = None) -> None:
         raise ExportCancelledError("ייצוא השמע בוטל על ידי המשתמש.")
 
 
-def _strip_id3v2_header(mp3_bytes: bytes) -> bytes:
-    """מסיר תגית ID3v2 בתחילת מקטע MP3 משני כדי לאחד מספר מקטעי Edge-TTS לקובץ MP3 תקין אחד."""
-    if len(mp3_bytes) >= 10 and mp3_bytes[:3] == b"ID3":
-        size = (
-            ((mp3_bytes[6] & 0x7F) << 21)
-            | ((mp3_bytes[7] & 0x7F) << 14)
-            | ((mp3_bytes[8] & 0x7F) << 7)
-            | (mp3_bytes[9] & 0x7F)
-        )
-        offset = 10 + size
-        if offset < len(mp3_bytes):
-            return mp3_bytes[offset:]
-    return mp3_bytes
+def find_ffmpeg_executable() -> Optional[str]:
+    """מאתר ffmpeg זמין במערכת או דרך imageio_ffmpeg (ללא תלות חובה)."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        cand = imageio_ffmpeg.get_ffmpeg_exe()
+        if cand and os.path.exists(cand):
+            return cand
+    except Exception:
+        pass
+    return None
 
 
 def _group_segments(
@@ -46,10 +55,7 @@ def _group_segments(
     voice_overrides: Optional[List[str]] = None,
     max_chars_per_batch: int = 1600,
 ) -> List[Tuple[str, str]]:
-    """
-    מאחד משפטים רצופים של אותו דובר למקטעי הקראה אופטימליים.
-    בתסריט מורה-תלמיד כל החלפת דובר פותחת מקטע עם הקול המתאים.
-    """
+    """מאחד משפטים רצופים של אותו דובר למקטעי הקראה מוגדרים."""
     segments: List[Tuple[str, str]] = []
     cur_voice = ""
     cur_buf: List[str] = []
@@ -85,6 +91,199 @@ def _voice_id_to_edge_name(voice_id: str) -> str:
     return "he-IL-AvriNeural"
 
 
+def merge_wav_files_streaming(
+    wav_paths: List[str],
+    output_path: str,
+    *,
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> str:
+    """
+    מאחד רשימת קובצי WAV מסודרת לקובץ WAV תקין אחד באמצעות פענוח וכתיבה בהזרמה על הדיסק.
+    מחזיק בזיכרון בלוק יחיד (64K פריימים) בכל רגע — מתאים לספרים ארוכים מאוד.
+    """
+    _check_cancelled(cancel_event)
+    if not wav_paths:
+        raise ValueError("אין קובצי WAV לאיחוד.")
+
+    abs_target = os.path.abspath(output_path)
+    parent = os.path.dirname(abs_target)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_out = tempfile.mkstemp(dir=parent, prefix=f".tmp_{os.path.basename(abs_target)}_", suffix=".wav.part")
+    os.close(fd)
+
+    expected_spec = None
+    total = len(wav_paths)
+
+    try:
+        with wave.open(tmp_out, "wb") as out_w:
+            for idx, wp in enumerate(wav_paths, 1):
+                _check_cancelled(cancel_event)
+                if not wp or not os.path.exists(wp) or os.path.getsize(wp) <= 44:
+                    raise RuntimeError(f"איחוד WAV נכשל: קובץ פרק {idx} חסר או ריק ({wp}).")
+                if progress_cb:
+                    progress_cb(f"מאחד שמע WAV תקני: קובץ {idx} מתוך {total}...")
+
+                with wave.open(wp, "rb") as in_w:
+                    spec = (in_w.getnchannels(), in_w.getsampwidth(), in_w.getframerate())
+                    if expected_spec is None:
+                        expected_spec = spec
+                        out_w.setnchannels(spec[0])
+                        out_w.setsampwidth(spec[1])
+                        out_w.setframerate(spec[2])
+                    elif spec != expected_spec:
+                        raise RuntimeError(
+                            f"פורמט השמע בקובץ {idx} ({spec}) אינו תואם לפורמט הקודם ({expected_spec})."
+                        )
+
+                    nframes = in_w.getnframes()
+                    if nframes <= 0:
+                        raise RuntimeError(f"קובץ WAV {idx} אינו מכיל פריימים של שמע.")
+                    while True:
+                        _check_cancelled(cancel_event)
+                        chunk = in_w.readframes(16384)
+                        if not chunk:
+                            break
+                        out_w.writeframes(chunk)
+
+        _check_cancelled(cancel_event)
+        with open(tmp_out, "rb+") as f_sync:
+            f_sync.flush()
+            os.fsync(f_sync.fileno())
+        os.replace(tmp_out, abs_target)
+        return abs_target
+    except Exception:
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
+        raise
+
+
+def merge_mp3_files_decoded(
+    mp3_paths: List[str],
+    output_path: str,
+    *,
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    mp3_merge_fn: Optional[Callable[[List[str], str], str]] = None,
+) -> str:
+    """
+    מאחד קובצי MP3 רק באמצעות פענוח וקידוד מחדש אמיתיים (FFmpeg או פונקציית מיזוג ייעודית).
+    אוסר חיבור בינארי ישיר של קבצים!
+    """
+    _check_cancelled(cancel_event)
+    if not mp3_paths:
+        raise ValueError("אין קובצי MP3 לאיחוד.")
+
+    for idx, p in enumerate(mp3_paths, 1):
+        if not p or not os.path.exists(p) or os.path.getsize(p) <= 0:
+            raise RuntimeError(f"איחוד MP3 נכשל: קובץ {idx} חסר או ריק.")
+
+    abs_target = os.path.abspath(output_path)
+    parent = os.path.dirname(abs_target)
+    os.makedirs(parent, exist_ok=True)
+
+    if len(mp3_paths) == 1:
+        fd, tmp_out = tempfile.mkstemp(dir=parent, prefix=f".tmp_{os.path.basename(abs_target)}_", suffix=".mp3.part")
+        os.close(fd)
+        try:
+            with open(mp3_paths[0], "rb") as src_f, open(tmp_out, "wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f, length=65536)
+                dst_f.flush()
+                os.fsync(dst_f.fileno())
+            _check_cancelled(cancel_event)
+            os.replace(tmp_out, abs_target)
+            return abs_target
+        except Exception:
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except Exception:
+                    pass
+            raise
+
+    if mp3_merge_fn is not None:
+        fd, tmp_out = tempfile.mkstemp(dir=parent, prefix=f".tmp_{os.path.basename(abs_target)}_", suffix=".mp3")
+        os.close(fd)
+        try:
+            if progress_cb:
+                progress_cb(f"מפענח ומאחד {len(mp3_paths)} קובצי MP3...")
+            produced = mp3_merge_fn(list(mp3_paths), tmp_out)
+            _check_cancelled(cancel_event)
+            if not produced or not os.path.exists(produced) or os.path.getsize(produced) <= 0:
+                raise RuntimeError("מנוע איחוד ה-MP3 יצר קובץ ריק.")
+            os.replace(produced, abs_target)
+            return abs_target
+        finally:
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except Exception:
+                    pass
+
+    ffmpeg_exe = find_ffmpeg_executable()
+    if not ffmpeg_exe:
+        raise RuntimeError(
+            "איחוד מספר קובצי MP3 לקובץ יחיד דורש פענוח וקידוד מחדש עם FFmpeg (איננו מבצעים חיבור בינארי לא תקני).\n"
+            "בחר באחת האפשרויות הבאות: 1) ייצוא 'ZIP / תיקייה של קובצי MP3 לכל פרק + manifest', 2) 'קובץ WAV מאוחד לכל הספר', או התקן FFmpeg."
+        )
+
+    fd_list, concat_list_path = tempfile.mkstemp(dir=parent, prefix=".tmp_ffconcat_", suffix=".txt")
+    os.close(fd_list)
+    fd_out, tmp_out = tempfile.mkstemp(dir=parent, prefix=f".tmp_{os.path.basename(abs_target)}_", suffix=".mp3")
+    os.close(fd_out)
+
+    try:
+        with open(concat_list_path, "w", encoding="utf-8") as cf:
+            for p in mp3_paths:
+                escaped = os.path.abspath(p).replace("'", "'\\''")
+                cf.write(f"file '{escaped}'\n")
+
+        if progress_cb:
+            progress_cb(f"מפענח ומקודד מחדש {len(mp3_paths)} מקטעי MP3 באמצעות FFmpeg...")
+
+        proc = subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list_path,
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                tmp_out,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _check_cancelled(cancel_event)
+        if proc.returncode != 0 or not os.path.exists(tmp_out) or os.path.getsize(tmp_out) <= 0:
+            err_tail = (proc.stderr or proc.stdout or "")[-400:]
+            raise RuntimeError(f"FFmpeg נכשל באיחוד ה-MP3 (קוד {proc.returncode}): {err_tail}")
+
+        with open(tmp_out, "rb+") as f_sync:
+            f_sync.flush()
+            os.fsync(f_sync.fileno())
+        os.replace(tmp_out, abs_target)
+        return abs_target
+    finally:
+        for tmp in (concat_list_path, tmp_out):
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+
 def export_to_mp3(
     sentences: List[str],
     output_path: str,
@@ -94,8 +293,12 @@ def export_to_mp3(
     progress_cb: Optional[Callable[[str], None]] = None,
     cancel_event: Any = None,
     mp3_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
+    mp3_merge_fn: Optional[Callable[[List[str], str], str]] = None,
 ) -> str:
-    """מייצא קובץ MP3 איכותי באמצעות Edge-TTS (או מסנתז מוזרק לבדיקות) בכתיבה אטומית מלאה."""
+    """
+    מייצא קובץ MP3 איכותי באמצעות Edge-TTS (או מסנתז מוזרק לבדיקות):
+    כל מקטע נשמר זמנית בדיסק ומאוחד בפענוח/קידוד תקני כשיש יותר ממקטע אחד.
+    """
     _check_cancelled(cancel_event)
 
     segments = _group_segments(sentences, default_voice, voice_overrides)
@@ -104,61 +307,64 @@ def export_to_mp3(
 
     rate_str = f"{int((speed - 1.0) * 100):+d}%"
     total = len(segments)
-    combined = bytearray()
+    temp_dir = tempfile.mkdtemp(prefix="pormycodex_mp3_parts_")
+    part_paths: List[str] = []
 
-    if mp3_synth_fn is not None:
-        for i, (v_id, text_chunk) in enumerate(segments, 1):
-            _check_cancelled(cancel_event)
-            if progress_cb:
-                progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
-            voice_name = _voice_id_to_edge_name(v_id)
-            part_bytes = mp3_synth_fn(text_chunk, voice_name, speed)
-            if not part_bytes:
-                raise RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
-            if i == 1:
-                combined.extend(part_bytes)
-            else:
-                combined.extend(_strip_id3v2_header(part_bytes))
-    else:
-        import edge_tts
-
-        async def synthesize_all() -> bytes:
-            out_buf = bytearray()
+    try:
+        if mp3_synth_fn is not None:
             for i, (v_id, text_chunk) in enumerate(segments, 1):
                 _check_cancelled(cancel_event)
                 if progress_cb:
                     progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
                 voice_name = _voice_id_to_edge_name(v_id)
-                fd, tmp_part = tempfile.mkstemp(suffix=".mp3")
-                os.close(fd)
-                try:
-                    communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
-                    await communicate.save(tmp_part)
+                part_bytes = mp3_synth_fn(text_chunk, voice_name, speed)
+                if not part_bytes:
+                    raise RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
+                part_file = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
+                atomic_write_bytes(part_file, part_bytes)
+                part_paths.append(part_file)
+        else:
+            import edge_tts
+
+            async def synthesize_all() -> None:
+                for i, (v_id, text_chunk) in enumerate(segments, 1):
                     _check_cancelled(cancel_event)
-                    with open(tmp_part, "rb") as f:
-                        part_bytes = f.read()
-                    if not part_bytes:
+                    if progress_cb:
+                        progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
+                    voice_name = _voice_id_to_edge_name(v_id)
+                    part_file = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
+                    communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
+                    await communicate.save(part_file)
+                    _check_cancelled(cancel_event)
+                    if not os.path.exists(part_file) or os.path.getsize(part_file) <= 0:
                         raise RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
-                    if i == 1:
-                        out_buf.extend(part_bytes)
-                    else:
-                        out_buf.extend(_strip_id3v2_header(part_bytes))
-                finally:
-                    try:
-                        if os.path.exists(tmp_part):
-                            os.remove(tmp_part)
-                    except Exception:
-                        pass
-            return bytes(out_buf)
+                    part_paths.append(part_file)
 
-        combined.extend(asyncio.run(synthesize_all()))
+            asyncio.run(synthesize_all())
 
-    _check_cancelled(cancel_event)
-    mp3_data = bytes(combined)
-    if not mp3_data:
-        raise RuntimeError("יצירת קובץ ה-MP3 נכשלה (תוכן ריק).")
+        _check_cancelled(cancel_event)
+        if len(part_paths) != total:
+            raise RuntimeError("ייצוא ה-MP3 נכשל: חסרים מקטעים.")
 
-    return atomic_write_bytes(output_path, mp3_data)
+        if mp3_synth_fn is not None and mp3_merge_fn is None and len(part_paths) > 1 and find_ffmpeg_executable() is None:
+            # במבחנים מוזרקים ללא ffmpeg, נבדוק שיש מפענח חוקי או נזרוק אם מצפים לאריזת WAV/ZIP
+            return merge_mp3_files_decoded(
+                part_paths,
+                output_path,
+                cancel_event=cancel_event,
+                progress_cb=progress_cb,
+                mp3_merge_fn=mp3_merge_fn,
+            )
+
+        return merge_mp3_files_decoded(
+            part_paths,
+            output_path,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+            mp3_merge_fn=mp3_merge_fn,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def export_to_wav_offline(
@@ -171,7 +377,7 @@ def export_to_wav_offline(
     default_voice: str = "sapi5",
     voice_overrides: Optional[List[str]] = None,
 ) -> str:
-    """מייצא קובץ WAV אופליין מלא בכתיבה אטומית, בלי לדלג על מקטעים שכשלו."""
+    """מייצא קובץ WAV אופליין מלא בהזרמה דרך הדיסק וכתיבה אטומית (זיכרון קבוע ומוגבל)."""
     _check_cancelled(cancel_event)
 
     segments = _group_segments(sentences, default_voice, voice_overrides, max_chars_per_batch=3000)
@@ -179,29 +385,27 @@ def export_to_wav_offline(
         raise ValueError("אין טקסט לייצוא.")
 
     total = len(segments)
-    params = None
-    frames_all: List[bytes] = []
+    temp_dir = tempfile.mkdtemp(prefix="pormycodex_wav_parts_")
+    part_paths: List[str] = []
 
-    if wav_synth_fn is not None:
-        for i, (v_id, text_chunk) in enumerate(segments, 1):
-            _check_cancelled(cancel_event)
-            if progress_cb:
-                progress_cb(f"מייצר אודיו WAV: חלק {i} מתוך {total}...")
-            wav_bytes = wav_synth_fn(text_chunk, v_id, speed)
-            if not wav_bytes or len(wav_bytes) <= 44:
-                raise RuntimeError(f"התקבל מקטע WAV ריק/לא תקין בחלק {i} מתוך {total}.")
-            with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-                if params is None:
-                    params = w.getparams()
-                chunk_frames = w.readframes(w.getnframes())
-                if not chunk_frames:
-                    raise RuntimeError(f"לא התקבלו פריימים של שמע בחלק {i} מתוך {total}.")
-                frames_all.append(chunk_frames)
-    else:
-        import pyttsx3
+    try:
+        if wav_synth_fn is not None:
+            for i, (v_id, text_chunk) in enumerate(segments, 1):
+                _check_cancelled(cancel_event)
+                if progress_cb:
+                    progress_cb(f"מייצר אודיו WAV: חלק {i} מתוך {total}...")
+                wav_bytes = wav_synth_fn(text_chunk, v_id, speed)
+                if not wav_bytes or len(wav_bytes) <= 44:
+                    raise RuntimeError(f"התקבל מקטע WAV ריק/לא תקין בחלק {i} מתוך {total}.")
+                with wave.open(io.BytesIO(wav_bytes), "rb") as w_chk:
+                    if w_chk.getnframes() <= 0:
+                        raise RuntimeError(f"לא התקבלו פריימים של שמע בחלק {i} מתוך {total}.")
+                part_file = os.path.join(temp_dir, f"seg_{i:04d}.wav")
+                atomic_write_bytes(part_file, wav_bytes)
+                part_paths.append(part_file)
+        else:
+            import pyttsx3
 
-        temp_wavs: List[str] = []
-        try:
             engine = pyttsx3.init()
             base_rate = engine.getProperty("rate")
             engine.setProperty("rate", int(base_rate * speed))
@@ -215,42 +419,27 @@ def export_to_wav_offline(
                 _check_cancelled(cancel_event)
                 if progress_cb:
                     progress_cb(f"מייצר אודיו WAV אופליין: חלק {i} מתוך {total}...")
-                fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
-                os.close(fd)
-                temp_wavs.append(tmp_wav)
-                engine.save_to_file(text_chunk, tmp_wav)
+                part_file = os.path.join(temp_dir, f"seg_{i:04d}.wav")
+                part_paths.append(part_file)
+                engine.save_to_file(text_chunk, part_file)
             engine.runAndWait()
             _check_cancelled(cancel_event)
 
-            for i, tw in enumerate(temp_wavs, 1):
-                if not os.path.exists(tw) or os.path.getsize(tw) <= 44:
+            for i, pw in enumerate(part_paths, 1):
+                if not os.path.exists(pw) or os.path.getsize(pw) <= 44:
                     raise RuntimeError(f"מנוע SAPI5 נכשל ביצירת חלק {i} מתוך {total}.")
-                with wave.open(tw, "rb") as w:
-                    if params is None:
-                        params = w.getparams()
-                    chunk_frames = w.readframes(w.getnframes())
-                    if not chunk_frames:
-                        raise RuntimeError(f"מנוע SAPI5 הפיק שמע ריק בחלק {i} מתוך {total}.")
-                    frames_all.append(chunk_frames)
-        finally:
-            for tw in temp_wavs:
-                try:
-                    if os.path.exists(tw):
-                        os.remove(tw)
-                except Exception:
-                    pass
 
-    _check_cancelled(cancel_event)
-    if not params or len(frames_all) != total:
-        raise RuntimeError("ייצוא ה-WAV נכשל: חסרים מקטעי שמע.")
+        if len(part_paths) != total:
+            raise RuntimeError("ייצוא ה-WAV נכשל: חסרים מקטעי שמע.")
 
-    out_buf = io.BytesIO()
-    with wave.open(out_buf, "wb") as out_w:
-        out_w.setparams(params)
-        for fr in frames_all:
-            out_w.writeframes(fr)
-
-    return atomic_write_bytes(output_path, out_buf.getvalue())
+        return merge_wav_files_streaming(
+            part_paths,
+            output_path,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def export_audiobook_file(
@@ -264,10 +453,10 @@ def export_audiobook_file(
     allow_fallback: bool = False,
     mp3_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
     wav_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
+    mp3_merge_fn: Optional[Callable[[List[str], str], str]] = None,
 ) -> str:
     """
-    מייצא קובץ שמע נייד (.mp3 או .wav) באופן אטומי.
-    כברירת מחדל (allow_fallback=False) אינו מסתיר כשל ב-MP3 מאחורי פורמט חלופי.
+    מייצא קובץ שמע יחיד (.mp3 או .wav) באופן אטומי לפרק בודד.
     """
     _check_cancelled(cancel_event)
 
@@ -298,6 +487,7 @@ def export_audiobook_file(
             progress_cb=progress_cb,
             cancel_event=cancel_event,
             mp3_synth_fn=mp3_synth_fn,
+            mp3_merge_fn=mp3_merge_fn,
         )
     except ExportCancelledError:
         raise
@@ -317,3 +507,155 @@ def export_audiobook_file(
             default_voice=default_voice,
             voice_overrides=voice_overrides,
         )
+
+
+def package_book_audio(
+    *,
+    book_id: str,
+    book_title: str,
+    chapter_entries: List[Dict[str, Any]],
+    output_path: str,
+    package_mode: str = "zip",
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    mp3_merge_fn: Optional[Callable[[List[str], str], str]] = None,
+) -> Dict[str, Any]:
+    """
+    אורז תוצר שמע שלם לספר מלא לפי הסדר:
+    - 'unified_wav': איחוד כל פרקי ה-WAV לקובץ WAV תקין אחד בהזרמה
+    - 'unified_mp3': איחוד כל פרקי ה-MP3 בפענוח/קידוד מחדש (FFmpeg / mp3_merge_fn)
+    - 'zip': ארכיון ZIP אטומי עם קבצים ממוספרים לכל פרק + manifest.json
+    - 'folder': תיקייה מסודרת עם קבצים ממוספרים לכל פרק + manifest.json
+    """
+    _check_cancelled(cancel_event)
+    if not chapter_entries:
+        raise ValueError("אין פרקים לאריזת שמע.")
+
+    ordered = sorted(chapter_entries, key=lambda c: int(c["chapter_index"]))
+    audio_paths = [c["audio_path"] for c in ordered]
+    for c in ordered:
+        p = c["audio_path"]
+        if not p or not os.path.exists(p) or os.path.getsize(p) <= 0:
+            raise RuntimeError(f"חסר קובץ שמע עבור פרק {int(c['chapter_index']) + 1} ('{c.get('chapter_title', '')}').")
+
+    manifest_items = []
+    for pos, ch in enumerate(ordered, 1):
+        ext = os.path.splitext(ch["audio_path"])[1].lower() or ".wav"
+        safe_ch = sanitize_filename_part(ch.get("chapter_title", ""), f"chapter_{pos}")
+        numbered_name = f"{pos:03d}_{safe_ch}{ext}"
+        manifest_items.append({
+            "order": pos,
+            "chapter_index": int(ch["chapter_index"]),
+            "chapter_title": ch.get("chapter_title", f"פרק {pos}"),
+            "filename": numbered_name,
+            "size_bytes": os.path.getsize(ch["audio_path"]),
+            "line_count": int(ch.get("line_count", 0)),
+        })
+
+    manifest = {
+        "scope": "book",
+        "book_id": book_id,
+        "book_title": book_title,
+        "package_mode": package_mode,
+        "chapter_count": len(ordered),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "chapters": manifest_items,
+    }
+
+    if package_mode == "unified_wav":
+        target = output_path if output_path.lower().endswith(".wav") else f"{os.path.splitext(output_path)[0]}.wav"
+        saved = merge_wav_files_streaming(
+            audio_paths,
+            target,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+        )
+        return {
+            "output_path": saved,
+            "package_mode": "unified_wav",
+            "chapter_count": len(ordered),
+            "manifest": manifest,
+        }
+
+    if package_mode == "unified_mp3":
+        target = output_path if output_path.lower().endswith(".mp3") else f"{os.path.splitext(output_path)[0]}.mp3"
+        saved = merge_mp3_files_decoded(
+            audio_paths,
+            target,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+            mp3_merge_fn=mp3_merge_fn,
+        )
+        return {
+            "output_path": saved,
+            "package_mode": "unified_mp3",
+            "chapter_count": len(ordered),
+            "manifest": manifest,
+        }
+
+    if package_mode == "folder":
+        target_dir = os.path.abspath(output_path)
+        os.makedirs(target_dir, exist_ok=True)
+        for ch, m_item in zip(ordered, manifest_items):
+            _check_cancelled(cancel_event)
+            if progress_cb:
+                progress_cb(f"מעתיק קובץ פרק {m_item['order']}/{len(ordered)} לתיקייה...")
+            dest_file = os.path.join(target_dir, m_item["filename"])
+            fd, tmp_f = tempfile.mkstemp(dir=target_dir, prefix=f".tmp_{m_item['filename']}_", suffix=".part")
+            os.close(fd)
+            try:
+                with open(ch["audio_path"], "rb") as src_f, open(tmp_f, "wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f, length=65536)
+                    dst_f.flush()
+                    os.fsync(dst_f.fileno())
+                os.replace(tmp_f, dest_file)
+            except Exception:
+                if os.path.exists(tmp_f):
+                    try:
+                        os.remove(tmp_f)
+                    except Exception:
+                        pass
+                raise
+        manifest_path = os.path.join(target_dir, "manifest.json")
+        atomic_write_json(manifest_path, manifest)
+        return {
+            "output_path": target_dir,
+            "manifest_path": manifest_path,
+            "package_mode": "folder",
+            "chapter_count": len(ordered),
+            "manifest": manifest,
+        }
+
+    # Default: atomic ZIP archive of numbered chapter audio files + manifest.json
+    target_zip = output_path if output_path.lower().endswith(".zip") else f"{os.path.splitext(output_path)[0]}.zip"
+    abs_zip = os.path.abspath(target_zip)
+    parent = os.path.dirname(abs_zip)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_zip = tempfile.mkstemp(dir=parent, prefix=f".tmp_{os.path.basename(abs_zip)}_", suffix=".zip.part")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_STORED) as zf:
+            for ch, m_item in zip(ordered, manifest_items):
+                _check_cancelled(cancel_event)
+                if progress_cb:
+                    progress_cb(f"אורז פרק {m_item['order']}/{len(ordered)} לארכיון ZIP...")
+                zf.write(ch["audio_path"], arcname=m_item["filename"])
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+        _check_cancelled(cancel_event)
+        with open(tmp_zip, "rb+") as f_sync:
+            f_sync.flush()
+            os.fsync(f_sync.fileno())
+        os.replace(tmp_zip, abs_zip)
+        return {
+            "output_path": abs_zip,
+            "package_mode": "zip",
+            "chapter_count": len(ordered),
+            "manifest": manifest,
+        }
+    except Exception:
+        if os.path.exists(tmp_zip):
+            try:
+                os.remove(tmp_zip)
+            except Exception:
+                pass
+        raise

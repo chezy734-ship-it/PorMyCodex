@@ -58,6 +58,14 @@ def _make_mock_mp3_bytes(tag: str = "CHUNK") -> bytes:
     return b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xff\xfb\x90\x00" + tag.encode("utf-8") * 8
 
 
+def _mock_mp3_merge(part_paths, out_path):
+    with open(out_path, "wb") as dst:
+        for p in part_paths:
+            with open(p, "rb") as src:
+                dst.write(src.read())
+    return out_path
+
+
 def _make_mock_script_chat(speaker_prefix: str = "שיעור"):
     call_log = []
 
@@ -131,7 +139,7 @@ class TestPersistenceAndEnforcedPipeline(unittest.TestCase):
         # שלב א: תהליך ראשון מתוך cwd_a שומר ספר מיובא, הגדרות, תרגום, תסריט והתקדמות קריאה
         settings = deepcopy(DEFAULT_SETTINGS)
         settings["active_provider"] = "gemini"
-        settings["providers"]["gemini"]["model"] = "gemini-3.8-flash"
+        settings["providers"]["gemini"]["model"] = "gemini-2.5-flash"
         save_settings(settings)
 
         custom_book = {
@@ -180,8 +188,9 @@ class TestPersistenceAndEnforcedPipeline(unittest.TestCase):
             single_translate_fn=lambda s, e, sl, tl: f"[עברית] {s}",
             chat_fn=chat_fn,
             mp3_synth_fn=lambda txt, v, spd: _make_mock_mp3_bytes("OK"),
+            mp3_merge_fn=_mock_mp3_merge,
         )
-        self.assertTrue(res["success"])
+        self.assertTrue(res["success"], res.get("error"))
         self.assertTrue(os.path.exists(out_mp3))
 
         # שלב ב: הפעלה בתהליך Python חדש לגמרי מתיקיית עבודה אחרת (cwd_b) עם דימוי sys.frozen/_MEIPASS
@@ -319,8 +328,9 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             single_translate_fn=_t_fn,
             chat_fn=chat_fn,
             mp3_synth_fn=_mp3_fn,
+            mp3_merge_fn=_mock_mp3_merge,
         )
-        self.assertTrue(res1["success"])
+        self.assertTrue(res1["success"], res1.get("error"))
         self.assertEqual(len(trans_calls), 2)
         self.assertEqual(len(script_calls), 1)
         first_tts_count = len(tts_calls)
@@ -337,6 +347,7 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
                 settings=settings,
                 store=self.store,
                 mp3_synth_fn=_mp3_fn,
+                mp3_merge_fn=_mock_mp3_merge,
             )
 
         # הרצת הצינור המלא עבור src_v2 מחדשת תרגום + תסריט
@@ -350,14 +361,15 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             single_translate_fn=_t_fn,
             chat_fn=chat_fn,
             mp3_synth_fn=_mp3_fn,
+            mp3_merge_fn=_mock_mp3_merge,
         )
-        self.assertTrue(res2["success"])
+        self.assertTrue(res2["success"], res2.get("error"))
         self.assertEqual(len(trans_calls), 4)
         self.assertEqual(len(script_calls), 2)
 
         # שינוי ב: הגדרות ספק/מודל AI לתסריט השתנו -> התסריט הישן נפסל!
         settings_mod = deepcopy(settings)
-        settings_mod["providers"]["gemini"]["model"] = "gemini-3.8-pro"
+        settings_mod["providers"]["gemini"]["model"] = "gemini-2.5-pro"
         with self.assertRaises(StaleArtifactError):
             run_tts_and_export_strict(
                 book_id="b_stale",
@@ -367,6 +379,7 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
                 settings=settings_mod,
                 store=self.store,
                 mp3_synth_fn=_mp3_fn,
+                mp3_merge_fn=_mock_mp3_merge,
             )
 
         # בהרצה מחודשת, התרגום נשאר תקף (לא נקרא שוב) ורק התסריט+TTS רצים!
@@ -380,8 +393,9 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             single_translate_fn=_t_fn,
             chat_fn=chat_fn,
             mp3_synth_fn=_mp3_fn,
+            mp3_merge_fn=_mock_mp3_merge,
         )
-        self.assertTrue(res3["success"])
+        self.assertTrue(res3["success"], res3.get("error"))
         self.assertEqual(len(trans_calls), 4)   # התרגום לא דרש הרצה מיותרת
         self.assertEqual(len(script_calls), 3)  # התסריט נוצר מחדש למודל החדש
 
@@ -397,8 +411,9 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             single_translate_fn=_t_fn,
             chat_fn=chat_fn,
             mp3_synth_fn=_mp3_fn,
+            mp3_merge_fn=_mock_mp3_merge,
         )
-        self.assertTrue(res4["success"])
+        self.assertTrue(res4["success"], res4.get("error"))
         self.assertEqual(len(trans_calls), 6)
         self.assertEqual(len(script_calls), 4)
 

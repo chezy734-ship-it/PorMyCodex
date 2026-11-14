@@ -58,6 +58,24 @@ def get_library_state_path() -> str:
     return os.path.join(get_user_data_dir(), "library_state.json")
 
 
+def get_audio_cache_dir() -> str:
+    path = os.path.join(get_user_data_dir(), "audio_cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def sanitize_filename_part(name: str, fallback: str = "item") -> str:
+    safe = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in (name or "").strip())
+    safe = "_".join(part for part in safe.split("_") if part)
+    return (safe or fallback)[:48]
+
+
+def get_chapter_audio_cache_path(book_id: str, chapter_index: int, ext: str = "wav") -> str:
+    clean_ext = (ext or "wav").lower().lstrip(".")
+    safe_bid = sanitize_filename_part(book_id, "book")
+    return os.path.join(get_audio_cache_dir(), f"{safe_bid}__ch{int(chapter_index):04d}.{clean_ext}")
+
+
 def atomic_write_bytes(target_path: str, data: bytes) -> str:
     """כותב בייטים בצורה אטומית (Temp file באותה תיקייה + fsync + os.replace)."""
     abs_target = os.path.abspath(target_path)
@@ -184,7 +202,7 @@ DEFAULT_PROGRESS: Dict[str, Any] = {
 
 class LibraryStore:
     """
-    מנהל התמדה מלא לספרים, טקסטים, תרגומים, תסריטים והתקדמות קריאה.
+    מנהל התמדה מלא לספרים, טקסטים, תרגומים, תסריטים, מטמון שמע לפרקים והתקדמות קריאה.
     """
 
     def __init__(self, state_path: Optional[str] = None):
@@ -201,6 +219,7 @@ class LibraryStore:
             "books": [],
             "reading_progress": deepcopy(DEFAULT_PROGRESS),
             "chapter_artifacts": {},
+            "whole_book_jobs": {},
         }
 
     def load_raw_state(self) -> Dict[str, Any]:
@@ -226,6 +245,8 @@ class LibraryStore:
             state["reading_progress"] = merged_prog
         if isinstance(data.get("chapter_artifacts"), dict):
             state["chapter_artifacts"] = data["chapter_artifacts"]
+        if isinstance(data.get("whole_book_jobs"), dict):
+            state["whole_book_jobs"] = data["whole_book_jobs"]
         return state
 
     def _save_raw_state(self, state: Dict[str, Any]) -> None:
@@ -429,3 +450,57 @@ class LibraryStore:
         if expected_units > 0 and len(set(covered_units)) < expected_units:
             return False
         return True
+
+    def save_chapter_tts_cache(
+        self,
+        book_id: str,
+        chapter_index: int,
+        tts_record: Dict[str, Any],
+    ) -> None:
+        if not tts_record.get("is_complete") or not tts_record.get("audio_path"):
+            raise ValueError("אסור לשמור מטמון TTS חלקי או ללא נתיב קובץ.")
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+        rec = deepcopy(tts_record)
+        rec["saved_at"] = _now_iso()
+        art["tts_cache"] = rec
+        self._save_raw_state(state)
+
+    @staticmethod
+    def is_chapter_tts_fresh(
+        tts_record: Optional[Dict[str, Any]],
+        expected_source_hash: str,
+        expected_translation_hash: str,
+        expected_script_config_hash: str,
+        expected_tts_config_hash: str,
+    ) -> bool:
+        if not tts_record or not isinstance(tts_record, dict):
+            return False
+        if not tts_record.get("is_complete"):
+            return False
+        if tts_record.get("source_hash") != expected_source_hash:
+            return False
+        if tts_record.get("translation_hash") != expected_translation_hash:
+            return False
+        if tts_record.get("script_config_hash") != expected_script_config_hash:
+            return False
+        if tts_record.get("tts_config_hash") != expected_tts_config_hash:
+            return False
+        ap = tts_record.get("audio_path") or ""
+        if not ap or not os.path.exists(ap) or os.path.getsize(ap) <= 0:
+            return False
+        return True
+
+    def save_whole_book_job(self, book_id: str, job_data: Dict[str, Any]) -> None:
+        state = self.load_raw_state()
+        jobs = state.setdefault("whole_book_jobs", {})
+        rec = deepcopy(job_data)
+        rec["updated_at"] = _now_iso()
+        jobs[book_id] = rec
+        self._save_raw_state(state)
+
+    def get_whole_book_job(self, book_id: str) -> Optional[Dict[str, Any]]:
+        state = self.load_raw_state()
+        rec = (state.get("whole_book_jobs") or {}).get(book_id)
+        return deepcopy(rec) if isinstance(rec, dict) else None

@@ -219,25 +219,43 @@ def get_stylesheet() -> str:
     /* Combo Box */
     QComboBox {
         background-color: #1e293b;
-        border: 1px solid #334155;
+        border: 1px solid #475569;
         border-radius: 6px;
         padding: 6px 10px;
         color: #f1f5f9;
         font-weight: 500;
         min-width: 140px;
+        min-height: 24px;
+    }
+
+    QComboBox:hover {
+        border-color: #f59e0b;
+    }
+
+    QComboBox:disabled {
+        background-color: #0f172a;
+        color: #64748b;
+        border-color: #1e293b;
     }
 
     QComboBox::drop-down {
-        border: none;
-        width: 24px;
+        subcontrol-origin: padding;
+        subcontrol-position: center right;
+        width: 26px;
+        border-left: 1px solid #334155;
+        background-color: #334155;
+        border-top-right-radius: 5px;
+        border-bottom-right-radius: 5px;
     }
 
     QComboBox QAbstractItemView {
         background-color: #1e293b;
+        color: #f1f5f9;
         border: 1px solid #475569;
         selection-background-color: #f59e0b;
         selection-color: #0f172a;
         padding: 4px;
+        outline: 0;
     }
 
     /* Sliders */

@@ -8,6 +8,7 @@
 - בחירת ספקי AI מרובים (Google / OpenAI / Claude / OpenRouter / Groq / שרת מותאם) וגילוי מודלים
 """
 
+from copy import deepcopy
 import os
 import html
 import json
@@ -23,19 +24,28 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut
 
-from book_loader import SAMPLE_BOOKS, load_file_content, split_into_sentences
+from book_loader import (
+    SAMPLE_BOOKS,
+    load_file_content,
+    split_into_sentences,
+    validate_book_completeness,
+)
 from audio_engine import AudioEngine
+from audio_exporter import find_ffmpeg_executable
 from ai_linguist import vocalize_and_expand_hebrew, ask_companion
 from settings_manager import load_settings, get_active_provider_config
-from ai_providers import get_provider_label
+from ai_providers import AICancelledError, get_provider_label
 from script_engine import format_script_as_text
 from wiki_engine import enrich_with_wikipedia_and_ai, fetch_wikipedia_context_for_terms
-from library_store import LibraryStore
+from library_store import LibraryStore, sanitize_filename_part
 from export_pipeline import (
+    PipelineCancelledError,
     assess_chapter_pipeline,
     ensure_translation_for_chapter,
     ensure_script_for_chapter,
     run_enforced_export_pipeline,
+    run_whole_book_script_pipeline,
+    run_whole_book_export_pipeline,
 )
 from dialogs import (
     SettingsDialog,
@@ -50,6 +60,29 @@ class PipelineExportThread(QThread):
     progress = pyqtSignal(str)
     finished_result = pyqtSignal(dict)
 
+    def __init__(self, pipeline_kwargs: Dict[str, Any], scope: str = "chapter"):
+        super().__init__()
+        self.scope = scope
+        self.cancel_event = threading.Event()
+        self.pipeline_kwargs = dict(pipeline_kwargs)
+        self.pipeline_kwargs["cancel_event"] = self.cancel_event
+        self.pipeline_kwargs["progress_cb"] = lambda msg: self.progress.emit(msg)
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def run(self):
+        if self.scope == "book":
+            res = run_whole_book_export_pipeline(**self.pipeline_kwargs)
+        else:
+            res = run_enforced_export_pipeline(**self.pipeline_kwargs)
+        self.finished_result.emit(res)
+
+
+class WholeBookScriptThread(QThread):
+    progress = pyqtSignal(str)
+    finished_result = pyqtSignal(dict)
+
     def __init__(self, pipeline_kwargs: Dict[str, Any]):
         super().__init__()
         self.cancel_event = threading.Event()
@@ -61,7 +94,7 @@ class PipelineExportThread(QThread):
         self.cancel_event.set()
 
     def run(self):
-        res = run_enforced_export_pipeline(**self.pipeline_kwargs)
+        res = run_whole_book_script_pipeline(**self.pipeline_kwargs)
         self.finished_result.emit(res)
 
 
@@ -83,19 +116,33 @@ class FileLoadThread(QThread):
 
 
 class TaskWorkerThread(QThread):
+    progress = pyqtSignal(str)
     finished_ok = pyqtSignal(object)
+    cancelled = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, fn: Callable[[], Any]):
+    def __init__(self, fn: Callable[[threading.Event, Callable[[str], None]], Any]):
         super().__init__()
         self.fn = fn
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
 
     def run(self):
         try:
-            res = self.fn()
-            self.finished_ok.emit(res)
+            res = self.fn(self.cancel_event, lambda msg: self.progress.emit(msg))
+            if self.cancel_event.is_set():
+                self.cancelled.emit("הפעולה בוטלה לבקשת המשתמש.")
+            else:
+                self.finished_ok.emit(res)
+        except (AICancelledError, PipelineCancelledError) as e:
+            self.cancelled.emit(str(e))
         except Exception as e:
-            self.failed.emit(str(e))
+            if self.cancel_event.is_set():
+                self.cancelled.emit("הפעולה בוטלה לבקשת המשתמש.")
+            else:
+                self.failed.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -124,6 +171,9 @@ class MainWindow(QMainWindow):
 
         self._file_thread: Optional[FileLoadThread] = None
         self._task_thread: Optional[TaskWorkerThread] = None
+        self._task_progress_dlg: Optional[QProgressDialog] = None
+        self._whole_book_script_thread: Optional[WholeBookScriptThread] = None
+        self._whole_book_script_progress_dlg: Optional[QProgressDialog] = None
         self._export_thread: Optional[PipelineExportThread] = None
         self._export_progress_dlg: Optional[QProgressDialog] = None
 
@@ -196,6 +246,19 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        lbl_scope = QLabel("היקף:")
+        lbl_scope.setStyleSheet("padding: 0 4px; color: #94a3b8; font-weight: bold;")
+        toolbar.addWidget(lbl_scope)
+
+        self.combo_scope = QComboBox()
+        self.combo_scope.setObjectName("scopeCombo")
+        self.combo_scope.setToolTip("בחר אם ליצור תסריט/לשמור שמע עבור הפרק הנוכחי בלבד או עבור הספר כולו לפי הסדר")
+        self.combo_scope.addItem("📖 הפרק הנוכחי", "chapter")
+        self.combo_scope.addItem("📚 הספר כולו", "book")
+        toolbar.addWidget(self.combo_scope)
+
+        toolbar.addSeparator()
+
         vocalize_action = QAction("✨ נקד AI", self)
         vocalize_action.triggered.connect(self.vocalize_current_chapter)
         toolbar.addAction(vocalize_action)
@@ -204,14 +267,24 @@ class MainWindow(QMainWindow):
         script_action.triggered.connect(self.open_script_studio)
         toolbar.addAction(script_action)
 
+        self.action_script_whole_book = QAction("📚🎬 תסריט לכל הספר", self)
+        self.action_script_whole_book.setToolTip("צור תרגום ותסריט AI מלאים לכל פרקי הספר לפי הסדר")
+        self.action_script_whole_book.triggered.connect(self.open_whole_book_script_dialog)
+        toolbar.addAction(self.action_script_whole_book)
+
         translate_action = QAction("🌐 תרגום", self)
         translate_action.triggered.connect(self.open_translate_dialog)
         toolbar.addAction(translate_action)
 
-        export_audio_action = QAction("🎧 ייצא MP3", self)
-        export_audio_action.setToolTip("ייצא קובץ שמע MP3 / WAV נייד להעברה")
-        export_audio_action.triggered.connect(self.export_audio_dialog)
+        export_audio_action = QAction("🎧 ייצא שמע", self)
+        export_audio_action.setToolTip("ייצא קובץ שמע MP3 / WAV או ספר שלם להעברה")
+        export_audio_action.triggered.connect(lambda: self.export_audio_dialog())
         toolbar.addAction(export_audio_action)
+
+        self.action_export_whole_book = QAction("📚🎧 שמע לכל הספר", self)
+        self.action_export_whole_book.setToolTip("ייצא את כל פרקי הספר לשמע (ZIP / תיקייה / WAV / MP3 מאוחד)")
+        self.action_export_whole_book.triggered.connect(self.export_whole_book_audio_dialog)
+        toolbar.addAction(self.action_export_whole_book)
 
         toolbar.addSeparator()
 
@@ -726,7 +799,13 @@ class MainWindow(QMainWindow):
         self.load_book_to_ui(len(self.books) - 1)
         self._persist_library_and_progress()
         ch_count = len(new_book.get("chapters", []))
-        self.statusBar.showMessage(f"הספר '{new_book['title']}' נשמר ונטען בהצלחה ({ch_count} פרקים/חלקים)!", 6000)
+        cov = new_book.get("pdf_coverage") or {}
+        if cov and not cov.get("is_complete_extraction", True):
+            warn = cov.get("warning_message") or "חלק מעמודי ה-PDF לא חולצו ודורשים OCR."
+            self.statusBar.showMessage(f"נטען ספר עם חילוץ PDF חלקי ({ch_count} חלקים) — בדוק אזהרת OCR.", 9000)
+            QMessageBox.warning(self, "אזהרה: חילוץ PDF חלקי / נדרש OCR", warn)
+        else:
+            self.statusBar.showMessage(f"הספר '{new_book['title']}' נשמר ונטען בהצלחה ({ch_count} פרקים/חלקים)!", 6000)
 
     def _on_file_load_failed(self, err: str):
         self.statusBar.showMessage("טעינת הקובץ נכשלה.", 4000)
@@ -776,33 +855,92 @@ class MainWindow(QMainWindow):
                     return
             self.statusBar.showMessage("הגדרות ה-AI, המודלים, התרגום והקולות נשמרו!", 4000)
 
-    # --- Background Worker Helper ---
-    def _run_background_task(self, status_msg: str, fn: Callable[[], Any], on_ok: Callable[[Any], None]):
+    # --- Background Worker Helper (עם התקדמות וביטול מיידי) ---
+    def _close_task_progress(self):
+        if self._task_progress_dlg:
+            try:
+                self._task_progress_dlg.close()
+            except Exception:
+                pass
+            self._task_progress_dlg = None
+
+    def _run_background_task(
+        self,
+        status_msg: str,
+        fn: Callable[[threading.Event, Callable[[str], None]], Any],
+        on_ok: Callable[[Any], None],
+        title: str = "מבצע משימת AI ברקע",
+    ):
         if self._task_thread and self._task_thread.isRunning():
             QMessageBox.information(self, "פעולה רצה", "משימת AI/תרגום אחרת עדיין רצה ברקע, אנא המתן לסיומה.")
             return
 
         self.statusBar.showMessage(status_msg)
-        self._task_thread = TaskWorkerThread(fn)
-        self._task_thread.finished_ok.connect(on_ok)
-        self._task_thread.failed.connect(self._on_background_task_error)
-        self._task_thread.start()
+        th = TaskWorkerThread(fn)
+        self._task_thread = th
+
+        prog_dlg = QProgressDialog(status_msg, "🛑 בטל פעולה", 0, 0, self)
+        prog_dlg.setWindowTitle(title)
+        prog_dlg.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        prog_dlg.setMinimumWidth(420)
+        prog_dlg.canceled.connect(th.cancel)
+        self._task_progress_dlg = prog_dlg
+
+        def _on_prog(msg: str):
+            self.statusBar.showMessage(msg)
+            if self._task_progress_dlg:
+                self._task_progress_dlg.setLabelText(msg)
+
+        def _on_ok_wrap(res: Any):
+            self._close_task_progress()
+            on_ok(res)
+
+        def _on_cancelled(msg: str):
+            self._close_task_progress()
+            self.statusBar.showMessage(msg, 5000)
+            QMessageBox.information(self, "הפעולה בוטלה", msg)
+
+        def _on_failed(err: str):
+            self._close_task_progress()
+            self._on_background_task_error(err)
+
+        th.progress.connect(_on_prog)
+        th.finished_ok.connect(_on_ok_wrap)
+        th.cancelled.connect(_on_cancelled)
+        th.failed.connect(_on_failed)
+        th.start()
+        prog_dlg.show()
 
     def _on_background_task_error(self, err: str):
-        self.statusBar.showMessage("הפעולה הופסקה עם שגיאה.", 5000)
-        QMessageBox.warning(self, "שגיאה", err)
+        self.statusBar.showMessage("הפעולה הופסקה עם שגיאה — לא נשמר פלט חלקי כהצלחה.", 6000)
+        QMessageBox.warning(
+            self,
+            "שגיאה בביצוע המשימה",
+            f"{err}\n\nניתן לבדוק את ההגדרות / החיבור ולנסות שוב (התקדמות שמורה תקינה תישמר).",
+        )
 
     # --- AI Vocalization & Companion ---
     def vocalize_current_chapter(self):
         if not self.books:
             return
-        chapter_text = "\n".join(self.sentences) if self.sentences else self.books[self.current_book_index]["chapters"][self.current_chapter_index]["text"]
+        chapter_text = (
+            "\n".join(self.sentences)
+            if self.sentences
+            else self.books[self.current_book_index]["chapters"][self.current_chapter_index]["text"]
+        )
         cfg = self.settings
 
         self._run_background_task(
             "מפעיל בלשן AI לניקוד ופתיחת קיצורים...",
-            lambda: vocalize_and_expand_hebrew(chapter_text, settings=cfg),
+            lambda cancel_ev, prog_cb: vocalize_and_expand_hebrew(
+                chapter_text,
+                settings=cfg,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
+            ),
             self._on_vocalize_done,
+            title="ניקוד ופתיחת קיצורים (AI)",
         )
 
     def _on_vocalize_done(self, res: dict):
@@ -822,7 +960,11 @@ class MainWindow(QMainWindow):
     def trigger_companion(self, mode: str):
         book = self.books[self.current_book_index]
         chapter = book["chapters"][self.current_chapter_index]
-        target_text = self.sentences[self.active_sentence_index] if mode == "explain" and self.sentences else "\n".join(self.sentences[:120]) or chapter["text"]
+        target_text = (
+            self.sentences[self.active_sentence_index]
+            if mode == "explain" and self.sentences
+            else "\n".join(self.sentences[:120]) or chapter["text"]
+        )
 
         titles = {
             "explain": "💡 ביאור פסקה",
@@ -836,11 +978,19 @@ class MainWindow(QMainWindow):
 
         self._run_background_task(
             "מפעיל עוזר ספרותי AI...",
-            lambda: ask_companion(target_text, mode=mode, book_title=book["title"], settings=cfg),
+            lambda cancel_ev, prog_cb: ask_companion(
+                target_text,
+                mode=mode,
+                book_title=book["title"],
+                settings=cfg,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
+            ),
             lambda reply: (
                 self.comp_text.setMarkdown(str(reply)),
                 self.statusBar.showMessage("הניתוח הסתיים.", 3500),
             ),
+            title=titles.get(mode, "עוזר ספרותי AI"),
         )
 
     # --- Wikipedia Search & AI Knowledge Grounding ---
@@ -851,7 +1001,11 @@ class MainWindow(QMainWindow):
         active_sentence = ""
         if self.sentences and 0 <= self.active_sentence_index < len(self.sentences):
             active_sentence = self.sentences[self.active_sentence_index]
-        chapter_context = active_sentence or "\n".join(self.sentences[:60]) or book["chapters"][self.current_chapter_index]["text"][:2500]
+        chapter_context = (
+            active_sentence
+            or "\n".join(self.sentences[:60])
+            or book["chapters"][self.current_chapter_index]["text"][:2500]
+        )
 
         dlg = WikiSearchDialog(self, self.settings)
         if not dlg.exec():
@@ -863,7 +1017,9 @@ class MainWindow(QMainWindow):
         self.companion_widget.setVisible(True)
         self.comp_text.setHtml("<div dir='rtl'><i>מחפש ערכים בוויקיפדיה ומרחיב את הידע ברקע...</i></div>")
 
-        def _worker():
+        def _worker(cancel_ev, prog_cb):
+            if prog_cb:
+                prog_cb("שולף ערכים מוויקיפדיה...")
             if opts["use_ai"]:
                 res = enrich_with_wikipedia_and_ai(
                     query_terms=opts["terms"],
@@ -892,6 +1048,7 @@ class MainWindow(QMainWindow):
             "מחפש מושגים בוויקיפדיה ומעשיר ידע...",
             _worker,
             self._on_wikipedia_done,
+            title="חיפוש בוויקיפדיה והרחבת AI",
         )
 
     def _on_wikipedia_done(self, res: dict):
@@ -918,26 +1075,54 @@ class MainWindow(QMainWindow):
         self.comp_text.setMarkdown("\n\n".join(md_parts))
         self.statusBar.showMessage(f"נמצאו {len(articles)} ערכי ויקיפדיה והתוכן הורחב בהצלחה!", 5000)
 
-    # --- AI Script Studio (מבטיח תרגום עדכני תחילה ושומר תוצר אטומית) ---
-    def open_script_studio(self):
-        dlg = ScriptStudioDialog(self, self.settings)
+    # --- AI Script Studio (הפרק הנוכחי או הספר כולו) ---
+    def open_whole_book_script_dialog(self):
+        idx = self.combo_scope.findData("book")
+        if idx >= 0:
+            self.combo_scope.setCurrentIndex(idx)
+        self.open_script_studio(forced_scope="book")
+
+    def open_script_studio(self, forced_scope: Optional[str] = None):
+        if not self.books:
+            return
+        book = self.books[self.current_book_index]
+        chapters = book.get("chapters") or []
+        if not chapters:
+            return
+        chapter = chapters[self.current_chapter_index]
+        default_scope = forced_scope or (self.combo_scope.currentData() or "chapter")
+
+        dlg = ScriptStudioDialog(
+            self,
+            self.settings,
+            default_scope=default_scope,
+            book_title=book.get("title", ""),
+            chapter_count=len(chapters),
+            current_chapter_title=chapter.get("title", ""),
+        )
         if not dlg.exec():
             return
         opts = dlg.get_options()
-        book = self.books[self.current_book_index]
-        chapter = book["chapters"][self.current_chapter_index]
+        scope = opts.get("scope", default_scope)
+
+        if scope == "book":
+            self._start_whole_book_script_job(book, opts)
+            return
+
         source_text = chapter["text"]
         cfg = self.settings
         book_id = book.get("id", "")
         chapter_idx = self.current_chapter_index
 
-        def _worker():
+        def _worker(cancel_ev, prog_cb):
             ensure_translation_for_chapter(
                 book_id=book_id,
                 chapter_index=chapter_idx,
                 source_text=source_text,
                 settings=cfg,
                 store=self.store,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
             )
             return ensure_script_for_chapter(
                 book_id=book_id,
@@ -947,18 +1132,104 @@ class MainWindow(QMainWindow):
                 settings=cfg,
                 script_opts=opts,
                 store=self.store,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
             )
 
         status_msg = (
-            "מאמת תרגום ומייצר תסריט AI מועשר בוויקיפדיה..."
+            "מאמת תרגום ומייצר תסריט AI מועשר בוויקיפדיה לפרק..."
             if opts.get("use_wikipedia")
-            else "מאמת תרגום ומייצר תסריט AI מלא ברקע..."
+            else "מאמת תרגום ומייצר תסריט AI מלא לפרק..."
         )
         self._run_background_task(
             status_msg,
             _worker,
             self._on_script_generated,
+            title="יצירת תסריט AI (פרק נוכחי)",
         )
+
+    def _start_whole_book_script_job(self, book: Dict[str, Any], script_opts: Dict[str, Any]):
+        if self._whole_book_script_thread and self._whole_book_script_thread.isRunning():
+            QMessageBox.information(self, "תהליך בתהליך", "יצירת תסריט לספר שלם עדיין רצה ברקע.")
+            return
+
+        cov_check = validate_book_completeness(book)
+        if not cov_check["is_complete"]:
+            QMessageBox.warning(
+                self,
+                "לא ניתן לעבד ספר חלקי כספר שלם",
+                f"{cov_check['reason']}\n\nתקן או השלם OCR עבור העמודים החסרים לפני הפעלת עיבוד לכל הספר.",
+            )
+            return
+
+        book_snapshot = deepcopy(book)
+        total = len(book_snapshot.get("chapters") or [])
+        self.statusBar.showMessage(f"מייצר תרגום ותסריט לכל הספר ({total} פרקים לפי הסדר)...")
+
+        th = WholeBookScriptThread({
+            "book": book_snapshot,
+            "settings": deepcopy(self.settings),
+            "script_opts": dict(script_opts),
+            "store": self.store,
+        })
+        self._whole_book_script_thread = th
+
+        prog_dlg = QProgressDialog(f"מייצר תסריט לכל {total} פרקי הספר...", "🛑 בטל משימה", 0, 0, self)
+        prog_dlg.setWindowTitle("📚🎬 תסריט AI לכל הספר")
+        prog_dlg.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        prog_dlg.setMinimumWidth(440)
+        prog_dlg.canceled.connect(th.cancel)
+        self._whole_book_script_progress_dlg = prog_dlg
+
+        def _on_prog(msg: str):
+            self.statusBar.showMessage(msg)
+            if self._whole_book_script_progress_dlg:
+                self._whole_book_script_progress_dlg.setLabelText(msg)
+
+        th.progress.connect(_on_prog)
+        th.finished_result.connect(self._on_whole_book_script_finished)
+        th.start()
+        prog_dlg.show()
+
+    def _on_whole_book_script_finished(self, res: dict):
+        if self._whole_book_script_progress_dlg:
+            self._whole_book_script_progress_dlg.close()
+            self._whole_book_script_progress_dlg = None
+
+        if res.get("success") and res.get("status") == "completed":
+            scripts = res.get("scripts") or []
+            if self.books and self.books[self.current_book_index].get("id") == res.get("book_id"):
+                if 0 <= self.current_chapter_index < len(scripts):
+                    self._on_script_generated(scripts[self.current_chapter_index])
+            ch_cnt = res.get("chapter_count", len(scripts))
+            self.statusBar.showMessage(
+                f"הושלמו ונשמרו אטומית התרגומים והתסריטים לכל {ch_cnt} פרקי הספר '{res.get('book_title', '')}'!",
+                8000,
+            )
+            QMessageBox.information(
+                self,
+                "📚🎬 תסריט לכל הספר הושלם",
+                f"כל {ch_cnt} פרקי הספר '{res.get('book_title', '')}' תורגמו ונוצר עבורם תסריט AI מאומת לפי הסדר.\n"
+                "ניתן כעת להפעיל '📚🎧 שמע לכל הספר' ללא יצירה חוזרת של פרקים תקינים.",
+            )
+        elif res.get("status") == "cancelled":
+            msg = res.get("error", "בוטל.")
+            self.statusBar.showMessage("יצירת התסריט לספר כולו בוטלה (פרקים שהושלמו נשמרו להמשך).", 6000)
+            QMessageBox.information(
+                self,
+                "יצירת תסריט לספר בוטלה",
+                f"התהליך בוטל ({res.get('stage', '')}, פרק {res.get('chapter_number', 0)}/{res.get('chapter_count', 0)}).\n"
+                "הפרקים שכבר הושלמו נשמרו אטומית — בהפעלה הבאה נמשיך בלי ליצור מחדש פרקים תקינים.",
+            )
+        else:
+            err = res.get("error", "שגיאה לא ידועה")
+            self.statusBar.showMessage("יצירת התסריט לספר כולו נכשלה.", 6000)
+            QMessageBox.critical(
+                self,
+                "כשל ביצירת תסריט לכל הספר",
+                f"{err}\n\nהספר לא הוכרז כהושלם; בדוק את החיבור/הגדרות ונסה שוב.",
+            )
 
     def _on_script_generated(self, script_data: dict):
         self.current_script_data = script_data
@@ -1023,15 +1294,18 @@ class MainWindow(QMainWindow):
 
         self._run_background_task(
             "מתרגם את כל משפטֵי הפרק ושומר אטומית...",
-            lambda: ensure_translation_for_chapter(
+            lambda cancel_ev, prog_cb: ensure_translation_for_chapter(
                 book_id=book_id,
                 chapter_index=chapter_idx,
                 source_text=source_text,
                 settings=cfg,
                 translation_opts=opts,
                 store=self.store,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
             ),
             lambda res: self._on_translation_done(res, replace_reader=opts["replace_reader"]),
+            title="תרגום פרק מלא",
         )
 
     def _on_translation_done(self, res: dict, replace_reader: bool):
@@ -1065,8 +1339,14 @@ class MainWindow(QMainWindow):
             self.comp_text.setMarkdown("\n\n".join(md_blocks))
             self.statusBar.showMessage(f"התרגום הושלם ונשמר ({engine_label}).", 5000)
 
-    # --- Enforced Audiobook Export Pipeline (תרגום -> תסריט -> TTS -> יצוא) ---
-    def export_audio_dialog(self):
+    # --- Enforced Audiobook Export Pipeline (פרק נוכחי / הספר כולו) ---
+    def export_whole_book_audio_dialog(self):
+        idx = self.combo_scope.findData("book")
+        if idx >= 0:
+            self.combo_scope.setCurrentIndex(idx)
+        self.export_audio_dialog(forced_scope="book")
+
+    def export_audio_dialog(self, forced_scope: Optional[str] = None):
         if not self.books:
             QMessageBox.information(self, "אין ספר", "אין ספר פעיל לייצוא שמע.")
             return
@@ -1076,10 +1356,14 @@ class MainWindow(QMainWindow):
             return
 
         book = self.books[self.current_book_index]
-        chapter = book["chapters"][self.current_chapter_index]
+        chapters = book.get("chapters") or []
+        if not chapters:
+            return
+        chapter = chapters[self.current_chapter_index]
         source_text = chapter["text"]
         book_id = book.get("id", "")
         chapter_idx = self.current_chapter_index
+        default_scope = forced_scope or (self.combo_scope.currentData() or "chapter")
 
         pipe_dlg = ExportPipelineDialog(
             self,
@@ -1090,53 +1374,139 @@ class MainWindow(QMainWindow):
             store=self.store,
             default_voice=self.combo_voice.currentData() or "edge_avri",
             default_speed=self.audio.speed,
+            book=book,
+            default_scope=default_scope,
         )
         if not pipe_dlg.exec():
             return
         opts = pipe_dlg.get_options()
+        scope = opts.get("scope", "chapter")
+        package_mode = opts.get("package_mode", "single_chapter")
         fmt = opts["tts_opts"]["output_format"]
+        safe_title = sanitize_filename_part(book.get("title", ""), "audiobook")
 
-        safe_title = "".join(c for c in book["title"] if c.isalnum() or c in (" ", "-", "_")).strip() or "audiobook"
-        default_name = f"{safe_title}_part{chapter_idx + 1}.{fmt}"
-        filter_str = (
-            "קובץ שמע MP3 באיכות אולפן (*.mp3)"
-            if fmt == "mp3"
-            else "קובץ שמע WAV אופליין (*.wav)"
-        )
+        if scope == "book":
+            cov_check = validate_book_completeness(book)
+            if not cov_check["is_complete"]:
+                QMessageBox.warning(
+                    self,
+                    "לא ניתן לייצא ספר חלקי כספר שלם",
+                    f"{cov_check['reason']}\n\nלא ניתן לסמן ספר חלקי כהושלם.",
+                )
+                return
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "בחר יעד לשמירת קובץ השמע המלא",
-            default_name,
-            filter_str,
-        )
-        if not file_path:
-            return
+            if package_mode == "unified_mp3" and not find_ffmpeg_executable():
+                QMessageBox.warning(
+                    self,
+                    "נדרש FFmpeg לאיחוד MP3",
+                    "איחוד MP3 מאוחד מחייב פענוח וקידוד מחדש עם FFmpeg (לא חיבור בינארי).\n"
+                    "כרגע FFmpeg אינו זמין בסביבה — בחר באריזת ZIP/תיקייה של קובצי MP3 או ב-WAV מאוחד.",
+                )
+                return
 
-        if fmt == "wav" and not file_path.lower().endswith(".wav"):
-            file_path = f"{os.path.splitext(file_path)[0]}.wav"
-        elif fmt == "mp3" and not file_path.lower().endswith(".mp3"):
-            file_path = f"{os.path.splitext(file_path)[0]}.mp3"
+            if package_mode == "folder":
+                chosen_dir = QFileDialog.getExistingDirectory(
+                    self,
+                    "בחר תיקייה לשמירת קובצי השמע של הספר כולו",
+                )
+                if not chosen_dir:
+                    return
+                target_path = os.path.join(chosen_dir, f"{safe_title}_full_book")
+            elif package_mode == "zip":
+                target_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "בחר יעד לשמירת ארכיון ZIP של הספר כולו",
+                    f"{safe_title}_full_book.zip",
+                    "ארכיון ZIP של פרקי השמע + manifest (*.zip)",
+                )
+                if not target_path:
+                    return
+                if not target_path.lower().endswith(".zip"):
+                    target_path = f"{os.path.splitext(target_path)[0]}.zip"
+            elif package_mode == "unified_wav":
+                target_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "בחר יעד לשמירת קובץ WAV מאוחד לכל הספר",
+                    f"{safe_title}_full_book.wav",
+                    "קובץ שמע WAV מאוחד לכל הספר (*.wav)",
+                )
+                if not target_path:
+                    return
+                if not target_path.lower().endswith(".wav"):
+                    target_path = f"{os.path.splitext(target_path)[0]}.wav"
+            else:
+                target_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "בחר יעד לשמירת קובץ MP3 מאוחד לכל הספר",
+                    f"{safe_title}_full_book.mp3",
+                    "קובץ שמע MP3 מאוחד לכל הספר (*.mp3)",
+                )
+                if not target_path:
+                    return
+                if not target_path.lower().endswith(".mp3"):
+                    target_path = f"{os.path.splitext(target_path)[0]}.mp3"
 
-        self.statusBar.showMessage("מפעיל צינור יצוא מלא (תרגום ← תסריט ← TTS ← שמירה)...")
-        self._export_thread = PipelineExportThread({
-            "book_id": book_id,
-            "chapter_index": chapter_idx,
-            "source_text": source_text,
-            "output_path": file_path,
-            "book_title": book["title"],
-            "settings": self.settings,
-            "translation_opts": opts["translation_opts"],
-            "script_opts": opts["script_opts"],
-            "tts_opts": opts["tts_opts"],
-            "store": self.store,
-        })
+            total_ch = len(chapters)
+            self.statusBar.showMessage(f"מפעיל יצוא מלא לכל הספר ({total_ch} פרקים לפי הסדר)...")
+            self._export_thread = PipelineExportThread(
+                {
+                    "book": deepcopy(book),
+                    "output_path": target_path,
+                    "package_mode": package_mode,
+                    "settings": deepcopy(self.settings),
+                    "translation_opts": opts["translation_opts"],
+                    "script_opts": opts["script_opts"],
+                    "tts_opts": opts["tts_opts"],
+                    "store": self.store,
+                },
+                scope="book",
+            )
+            dlg_title = f"📚🎧 מייצא את הספר כולו ({total_ch} פרקים)"
+            initial_lbl = f"מתחיל עיבוד הספר כולו ({total_ch} פרקים לפי הסדר)..."
+        else:
+            default_name = f"{safe_title}_chapter_{chapter_idx + 1}.{fmt}"
+            filter_str = (
+                "קובץ שמע MP3 לפרק (*.mp3)"
+                if fmt == "mp3"
+                else "קובץ שמע WAV אופליין לפרק (*.wav)"
+            )
+            target_path, _ = QFileDialog.getSaveFileName(
+                self,
+                f"בחר יעד לשמירת שמע הפרק הנוכחי בלבד (פרק {chapter_idx + 1})",
+                default_name,
+                filter_str,
+            )
+            if not target_path:
+                return
+            if fmt == "wav" and not target_path.lower().endswith(".wav"):
+                target_path = f"{os.path.splitext(target_path)[0]}.wav"
+            elif fmt == "mp3" and not target_path.lower().endswith(".mp3"):
+                target_path = f"{os.path.splitext(target_path)[0]}.mp3"
 
-        prog_dlg = QProgressDialog("מתחיל תהליך יצוא מלא...", "🛑 בטל יצוא", 0, 0, self)
-        prog_dlg.setWindowTitle("מייצא ספר קולי מלא")
+            self.statusBar.showMessage(f"מפעיל צינור יצוא מלא לפרק {chapter_idx + 1}...")
+            self._export_thread = PipelineExportThread(
+                {
+                    "book_id": book_id,
+                    "chapter_index": chapter_idx,
+                    "source_text": source_text,
+                    "output_path": target_path,
+                    "book_title": book["title"],
+                    "settings": deepcopy(self.settings),
+                    "translation_opts": opts["translation_opts"],
+                    "script_opts": opts["script_opts"],
+                    "tts_opts": opts["tts_opts"],
+                    "store": self.store,
+                },
+                scope="chapter",
+            )
+            dlg_title = f"🎧 מייצא פרק {chapter_idx + 1} בלבד"
+            initial_lbl = "מתחיל תהליך יצוא הפרק הנוכחי..."
+
+        prog_dlg = QProgressDialog(initial_lbl, "🛑 בטל יצוא", 0, 0, self)
+        prog_dlg.setWindowTitle(dlg_title)
         prog_dlg.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        prog_dlg.setMinimumWidth(420)
+        prog_dlg.setMinimumWidth(440)
         prog_dlg.canceled.connect(self._export_thread.cancel)
         self._export_progress_dlg = prog_dlg
 
@@ -1155,33 +1525,45 @@ class MainWindow(QMainWindow):
             self._export_progress_dlg.close()
             self._export_progress_dlg = None
 
+        scope = res.get("scope", "chapter")
         if res.get("success") and res.get("status") == "completed":
             saved_path = res.get("output_path", "")
-            # סנכרון תצוגת התסריט העדכני שנוצר בצינור
             script_rec = res.get("script")
             if isinstance(script_rec, dict) and script_rec.get("lines"):
                 self._on_script_generated(script_rec)
 
-            self.statusBar.showMessage(f"קובץ השמע המלא נשמר בהצלחה: {saved_path}", 7000)
+            if scope == "book":
+                ch_cnt = res.get("chapter_count", 0)
+                title_txt = "📚🎧 שמע לכל הספר מוכן להעברה!"
+                body_txt = (
+                    f"הושלמו כל השלבים (תרגום ← תסריט ← TTS ← אריזה) לכל {ch_cnt} פרקי הספר '{res.get('book_title', '')}':\n\n"
+                    f"{saved_path}"
+                )
+                self.statusBar.showMessage(f"שמע הספר כולו ({ch_cnt} פרקים) נשמר בהצלחה: {saved_path}", 8000)
+            else:
+                title_txt = "🎧 קובץ השמע של הפרק מוכן להעברה!"
+                body_txt = f"יצוא הפרק הנוכחי הושלם בהצלחה (פרק בודד, לא הספר כולו):\n\n{saved_path}"
+                self.statusBar.showMessage(f"שמע הפרק נשמר בהצלחה: {saved_path}", 7000)
+
             msg = QMessageBox(self)
-            msg.setWindowTitle("🎧 קובץ השמע המלא מוכן להעברה!")
-            msg.setText(f"כל השלבים (תרגום ← תסריט ← TTS ← יצוא) הושלמו בהצלחה:\n\n{saved_path}")
+            msg.setWindowTitle(title_txt)
+            msg.setText(body_txt)
             btn_open_folder = msg.addButton("📂 פתח תיקייה", QMessageBox.ButtonRole.ActionRole)
             msg.addButton("אישור", QMessageBox.ButtonRole.AcceptRole)
             msg.exec()
             if msg.clickedButton() == btn_open_folder and saved_path:
-                folder = os.path.dirname(os.path.abspath(saved_path))
+                folder = saved_path if os.path.isdir(saved_path) else os.path.dirname(os.path.abspath(saved_path))
                 try:
                     if os.name == "nt":
                         os.startfile(folder)
                 except Exception:
                     pass
         elif res.get("status") == "cancelled":
-            self.statusBar.showMessage("היצוא בוטל — לא נשמר קובץ חלקי.", 5000)
+            self.statusBar.showMessage("היצוא בוטל — לא נשמר תוצר סופי חלקי.", 5000)
             QMessageBox.information(
                 self,
                 "היצוא בוטל",
-                f"התהליך בוטל בשלב '{res.get('stage', '')}'. לא נוצר קובץ חלקי ביעד.",
+                f"התהליך בוטל בשלב '{res.get('stage', '')}'. לא נוצר קובץ סופי חלקי (פרקים קודמים נשמרו להמשך).",
             )
         else:
             stage = res.get("stage", "")
@@ -1189,7 +1571,7 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(f"היצוא נכשל בשלב {stage}.", 6000)
             QMessageBox.critical(
                 self,
-                "היצוא נכשל (לא נוצר קובץ)",
+                "היצוא נכשל (לא הוכרז כהושלם)",
                 f"כשל בשלב '{stage}':\n\n{err}",
             )
 
@@ -1200,7 +1582,11 @@ class MainWindow(QMainWindow):
             if self._file_thread and self._file_thread.isRunning():
                 self._file_thread.wait(800)
             if self._task_thread and self._task_thread.isRunning():
-                self._task_thread.wait(800)
+                self._task_thread.cancel()
+                self._task_thread.wait(1000)
+            if self._whole_book_script_thread and self._whole_book_script_thread.isRunning():
+                self._whole_book_script_thread.cancel()
+                self._whole_book_script_thread.wait(1200)
             if self._export_thread and self._export_thread.isRunning():
                 self._export_thread.cancel()
                 self._export_thread.wait(1200)

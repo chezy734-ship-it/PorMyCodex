@@ -30,7 +30,7 @@ jobs:
 
       - name: Verify Python syntax & run tests
         run: |
-          python -m py_compile main.py main_window.py audio_engine.py ai_linguist.py book_loader.py style.py settings_manager.py ai_providers.py translator_engine.py script_engine.py audio_exporter.py wiki_engine.py library_store.py export_pipeline.py dialogs.py tests/test_persistence_and_pipeline.py
+          python -m py_compile main.py main_window.py audio_engine.py ai_linguist.py book_loader.py style.py settings_manager.py ai_providers.py translator_engine.py script_engine.py audio_exporter.py wiki_engine.py library_store.py export_pipeline.py dialogs.py tests/test_persistence_and_pipeline.py tests/test_network_discovery_and_whole_book.py tests/test_ui_pyqt6.py
           python -m unittest discover -s tests -v
 
       - name: Build PorMyCodex.exe

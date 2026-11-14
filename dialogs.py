@@ -1,58 +1,147 @@
 # -*- coding: utf-8 -*-
 """
 חלונות דיאלוג עבור PorMyCodex:
-1. SettingsDialog - הגדרת ספקי AI (Google/OpenAI/Claude/OpenRouter/Groq/מקומי), מפתחות API, גילוי מודלים, תרגום וקולות.
+1. SettingsDialog - הגדרת ספקי AI, הזנת מפתח מוסתרת, גילוי מודלים חי ברקע עם Debounce/Pagination/סינון ומניעת דריסת תוצאה מאוחרת.
 2. TranslateDialog - בחירת מנוע תרגום (AI או חינמי) ושפות יעד/מקור.
-3. ScriptStudioDialog - יצירת תסריט AI (לימודי מורה-תלמיד / דרמטי) והנחיות מותאמות.
+3. ScriptStudioDialog - יצירת תסריט AI לפרק הנוכחי או לספר כולו.
+4. WikiSearchDialog - חיפוש מושגים בוויקיפדיה והרחבה עם AI.
+5. ExportPipelineDialog - יצוא נאכף (תרגום -> תסריט -> TTS -> יצוא) לפרק יחיד או לספר כולו.
 """
 
 from copy import deepcopy
-from typing import Dict, Any, Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional
+
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
-    QLabel, QLineEdit, QPushButton, QComboBox, QTabWidget,
-    QWidget, QRadioButton, QTextEdit, QMessageBox, QCheckBox
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QRadioButton,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
-from settings_manager import load_settings, save_settings
-from ai_providers import PROVIDER_CATALOG, discover_models, get_preset_models, get_provider_label
-from translator_engine import TRANSLATION_ENGINES, LANGUAGE_OPTIONS
+from ai_providers import (
+    AICallError,
+    PROVIDER_CATALOG,
+    _sanitize_error_text,
+    discover_models_detailed,
+    get_provider_label,
+)
+from settings_manager import (
+    compute_provider_fingerprint,
+    load_settings,
+    save_settings,
+)
+from translator_engine import LANGUAGE_OPTIONS, TRANSLATION_ENGINES
 
 
 class ModelDiscoveryThread(QThread):
-    finished_ok = pyqtSignal(str, list)
-    failed = pyqtSignal(str, str)
+    finished_ok = pyqtSignal(int, str, list, dict)
+    failed = pyqtSignal(int, str, str, str)
 
-    def __init__(self, provider_id: str, api_key: str, base_url: str):
-        super().__init__()
+    def __init__(
+        self,
+        request_id: int,
+        provider_id: str,
+        api_key: str,
+        base_url: str,
+        discovery_fn: Optional[Callable[..., Any]] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.request_id = int(request_id)
         self.provider_id = provider_id
         self.api_key = api_key
         self.base_url = base_url
+        self.discovery_fn = discovery_fn
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
 
     def run(self):
         try:
-            models = discover_models(self.provider_id, self.api_key, self.base_url)
-            self.finished_ok.emit(self.provider_id, models)
+            if self.discovery_fn is not None:
+                try:
+                    raw = self.discovery_fn(
+                        self.provider_id,
+                        self.api_key,
+                        self.base_url,
+                        capability="text",
+                        cancel_event=self.cancel_event,
+                    )
+                except TypeError:
+                    raw = self.discovery_fn(self.provider_id, self.api_key, self.base_url)
+
+                if isinstance(raw, dict):
+                    models = list(raw.get("models") or [])
+                    meta = raw
+                else:
+                    models = list(raw or [])
+                    meta = {"pages_fetched": 1, "filtered_out": 0}
+            else:
+                meta = discover_models_detailed(
+                    self.provider_id,
+                    self.api_key,
+                    self.base_url,
+                    capability="text",
+                    cancel_event=self.cancel_event,
+                )
+                models = list(meta.get("models") or [])
+
+            if self.cancel_event.is_set():
+                return
+            if not models:
+                raise AICallError(
+                    "הספק החזיר רשימת מודלים ריקה עבור מפתח זה.",
+                    stage="גילוי מודלים",
+                    category="empty",
+                )
+            self.finished_ok.emit(self.request_id, self.provider_id, models, meta)
         except Exception as e:
-            self.failed.emit(self.provider_id, str(e))
+            if self.cancel_event.is_set():
+                return
+            cat = getattr(e, "category", "error")
+            safe_msg = _sanitize_error_text(str(e), [self.api_key])
+            self.failed.emit(self.request_id, self.provider_id, str(cat), safe_msg)
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, current_settings: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        parent=None,
+        current_settings: Optional[Dict[str, Any]] = None,
+        discovery_fn: Optional[Callable[..., Any]] = None,
+        debounce_ms: int = 450,
+    ):
         super().__init__(parent)
         self.setWindowTitle("⚙️ הגדרות AI, מודלים, תרגום וקולות")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(650, 560)
+        self.resize(680, 590)
         self.settings = deepcopy(current_settings or load_settings())
+        self._discovery_fn = discovery_fn
         self._current_provider = self.settings.get("active_provider", "gemini")
         self._discovery_thread: Optional[ModelDiscoveryThread] = None
+        self._retired_threads: List[ModelDiscoveryThread] = []
+        self._request_seq = 0
+        self._active_request_id = 0
+        self._active_request_fp = ""
         self._loading_fields = False
 
-        # טיימר לשאיבה אוטומטית של מודלים זמינים 650ms אחרי הזנת/הדבקת API Key
+        # טיימר Debounce לגילוי מודלים ברקע אחרי הזנת/הדבקת API Key או כתובת שרת
         self._auto_discover_timer = QTimer(self)
         self._auto_discover_timer.setSingleShot(True)
-        self._auto_discover_timer.setInterval(650)
+        self._auto_discover_timer.setInterval(max(20, int(debounce_ms)))
         self._auto_discover_timer.timeout.connect(lambda: self._run_model_discovery(silent_if_empty=True))
 
         self._build_ui()
@@ -86,9 +175,10 @@ class SettingsDialog(QDialog):
         key_row = QHBoxLayout()
         self.txt_api_key = QLineEdit()
         self.txt_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_api_key.setPlaceholderText("הדבק כאן מפתח API — המודלים הזמינים יישאבו אוטומטית...")
+        self.txt_api_key.setPlaceholderText("הדבק כאן מפתח API — המודלים הזמינים ייטענו אוטומטית לרשימה...")
         self.txt_api_key.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.txt_api_key.textChanged.connect(self._on_api_key_edited)
+        self.txt_api_key.editingFinished.connect(self._on_api_key_editing_finished)
         key_row.addWidget(self.txt_api_key, 1)
 
         self.btn_toggle_key = QPushButton("👁 הצג")
@@ -103,35 +193,42 @@ class SettingsDialog(QDialog):
 
         self.txt_base_url = QLineEdit()
         self.txt_base_url.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.txt_base_url.textChanged.connect(self._on_base_url_edited)
         form_p.addRow("כתובת שרת (Base URL):", self.txt_base_url)
 
         model_row = QHBoxLayout()
         self.combo_model = QComboBox()
-        self.combo_model.setEditable(True)
-        self.combo_model.setMaxVisibleItems(18)
-        self.combo_model.setMinimumWidth(260)
-        self.combo_model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.combo_model.setEditable(False)
+        self.combo_model.setMaxVisibleItems(20)
+        self.combo_model.setMinimumWidth(280)
+        self.combo_model.setVisible(True)
         self.combo_model.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.combo_model.setToolTip("רשימת המודלים הזמינים שנטענו משרת הספק")
         model_row.addWidget(self.combo_model, 1)
 
-        self.btn_discover = QPushButton("🔄 שאב מודלים זמינים")
+        self.btn_discover = QPushButton("🔄 רענן / נסה שוב")
         self.btn_discover.setObjectName("accentBtn")
         self.btn_discover.clicked.connect(lambda: self._run_model_discovery(silent_if_empty=False))
         model_row.addWidget(self.btn_discover)
         form_p.addRow("מודל פעיל:", model_row)
 
-        self.lbl_discovery_status = QLabel("הזן מפתח API כדי לשאוב אוטומטית את כל המודלים הזמינים בחשבון שלך.")
+        self.chk_manual_model = QCheckBox("הזן שם מודל ידנית (אופציונלי רק לשרת מקומי/מותאם)")
+        self.chk_manual_model.setVisible(False)
+        self.chk_manual_model.toggled.connect(self._on_manual_override_toggled)
+        form_p.addRow("", self.chk_manual_model)
+
+        self.lbl_discovery_status = QLabel("הזן מפתח API כדי לשלוף אוטומטית את רשימת המודלים הזמינים מהחברה.")
         self.lbl_discovery_status.setWordWrap(True)
         self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
         form_p.addRow("", self.lbl_discovery_status)
 
         ai_layout.addWidget(grp_provider)
 
-        grp_info = QGroupBox("הערת אבטחה ופרטיות")
+        grp_info = QGroupBox("אבטחה ובחירת מודל")
         info_lay = QVBoxLayout(grp_info)
         lbl_sec = QLabel(
-            "• כל מפתחות ה-API נשמרים מקומית אצלך במחשב בלבד (קובץ settings.json בתיקיית AppData).\n"
-            "• מיד לאחר הדבקת מפתח, התוכנה שואבת אוטומטית את רשימת המודלים העדכנית שזמינה למפתח שלך."
+            "• הזנת המפתח מוסתרת ונשמרת מקומית אצלך במחשב בלבד (לעולם אינה נכללת בלוגים או בהודעות שגיאה).\n"
+            "• לאחר הדבקת מפתח או מעבר חברה, הרשימה הנפתחת מתמלאת ישירות מה-API הרשמי של הספק (ללא רשימות מומצאות)."
         )
         lbl_sec.setWordWrap(True)
         lbl_sec.setStyleSheet("color: #cbd5e1; font-size: 12px;")
@@ -164,6 +261,7 @@ class SettingsDialog(QDialog):
         form_t.addRow("כתובת LibreTranslate:", self.txt_libre_url)
 
         self.txt_libre_key = QLineEdit(t_cfg.get("libretranslate_api_key", ""))
+        self.txt_libre_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.txt_libre_key.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.txt_libre_key.setPlaceholderText("אופציונלי")
         form_t.addRow("מפתח LibreTranslate:", self.txt_libre_key)
@@ -188,7 +286,6 @@ class SettingsDialog(QDialog):
 
         tabs.addTab(trans_tab, "🌐 תרגום ודוברים")
 
-        # Bottom Buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
 
@@ -213,51 +310,135 @@ class SettingsDialog(QDialog):
             cb.setCurrentIndex(idx)
         return cb
 
+    def _on_manual_override_toggled(self, checked: bool):
+        self.combo_model.setEditable(bool(checked))
+        if checked:
+            self.combo_model.setEnabled(True)
+
+    def _cancel_inflight_discovery(self):
+        self._active_request_id += 1
+        self._request_seq = max(self._request_seq, self._active_request_id)
+        if self._discovery_thread is not None:
+            th = self._discovery_thread
+            self._discovery_thread = None
+            th.cancel()
+            if th.isRunning():
+                self._retired_threads.append(th)
+                th.finished.connect(lambda t=th: self._cleanup_retired_thread(t))
+
+    def _cleanup_retired_thread(self, th: ModelDiscoveryThread):
+        if th in self._retired_threads:
+            self._retired_threads.remove(th)
+
     def _save_current_provider_to_dict(self):
         pdict = self.settings["providers"].setdefault(self._current_provider, {})
         pdict["api_key"] = self.txt_api_key.text().strip()
         pdict["base_url"] = self.txt_base_url.text().strip()
         pdict["model"] = self.combo_model.currentText().strip()
 
+    def _set_combo_models(self, models: List[str], preferred_model: str = ""):
+        self.combo_model.blockSignals(True)
+        try:
+            self.combo_model.clear()
+            for m in models:
+                self.combo_model.addItem(m, m)
+
+            if models:
+                self.combo_model.setEnabled(True)
+                self.combo_model.setVisible(True)
+                if preferred_model and preferred_model in models:
+                    self.combo_model.setCurrentText(preferred_model)
+                else:
+                    self.combo_model.setCurrentIndex(0)
+            else:
+                self.combo_model.setEnabled(self.chk_manual_model.isChecked())
+        finally:
+            self.combo_model.blockSignals(False)
+
     def _on_api_key_edited(self, text: str):
         if self._loading_fields:
             return
+        self._auto_discover_timer.stop()
+        self._cancel_inflight_discovery()
+
+        pid = self._current_provider
+        meta = PROVIDER_CATALOG.get(pid, {})
         clean = (text or "").strip()
-        if len(clean) >= 15:
+
+        # נקה רשימה ישנה כדי שתוצאה של מפתח קודם לא תישאר מוצגת
+        self._set_combo_models([], preferred_model="")
+        pdict = self.settings["providers"].setdefault(pid, {})
+        pdict["discovered_models"] = []
+        pdict["discovered_fingerprint"] = ""
+
+        if meta.get("requires_key", True) and not clean:
+            self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
+            self.lbl_discovery_status.setText("הזן מפתח API כדי לשלוף אוטומטית את רשימת המודלים הזמינים מהחברה.")
+            return
+
+        if len(clean) >= 6 or not meta.get("requires_key", True):
             self.lbl_discovery_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
-            self.lbl_discovery_status.setText("מזהה מפתח חדש — שואב מודלים זמינים בעוד רגע...")
+            self.lbl_discovery_status.setText("⏳ מזהה מפתח — טוען מודלים זמינים מהשרת...")
+            self._auto_discover_timer.start()
+        else:
+            self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
+            self.lbl_discovery_status.setText("המשך להזין או הדבק מפתח API מלא לשאיבת המודלים.")
+
+    def _on_api_key_editing_finished(self):
+        if self._loading_fields:
+            return
+        if self._auto_discover_timer.isActive():
+            self._auto_discover_timer.stop()
+            self._run_model_discovery(silent_if_empty=True)
+
+    def _on_base_url_edited(self, _text: str):
+        if self._loading_fields:
+            return
+        self._auto_discover_timer.stop()
+        self._cancel_inflight_discovery()
+        pid = self._current_provider
+        meta = PROVIDER_CATALOG.get(pid, {})
+        key = self.txt_api_key.text().strip()
+        if key or not meta.get("requires_key", True):
+            self.lbl_discovery_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+            self.lbl_discovery_status.setText("⏳ כתובת השרת עודכנה — בודק מודלים זמינים...")
             self._auto_discover_timer.start()
 
     def _load_provider_fields(self, pid: str, auto_fetch: bool = False):
         self._loading_fields = True
         try:
-            pdict = self.settings["providers"].get(pid, {})
+            pdict = self.settings["providers"].setdefault(pid, {})
             meta = PROVIDER_CATALOG.get(pid, {})
-            key = pdict.get("api_key", "")
+            key = (pdict.get("api_key") or "").strip()
+            base_url = (pdict.get("base_url") or meta.get("default_base_url", "")).strip()
+
             self.txt_api_key.setText(key)
-            self.txt_base_url.setText(pdict.get("base_url") or meta.get("default_base_url", ""))
+            self.txt_base_url.setText(base_url)
 
-            self.combo_model.blockSignals(True)
-            self.combo_model.clear()
-            discovered = pdict.get("discovered_models") or []
-            items_to_show = list(discovered) if discovered else get_preset_models(pid)
-            for m in items_to_show:
-                self.combo_model.addItem(m)
+            is_custom = pid == "custom"
+            self.chk_manual_model.setVisible(is_custom)
+            if not is_custom:
+                self.chk_manual_model.setChecked(False)
+                self.combo_model.setEditable(False)
 
-            saved_model = pdict.get("model") or (items_to_show[0] if items_to_show else "")
-            if saved_model and saved_model in items_to_show:
-                self.combo_model.setCurrentText(saved_model)
-            elif items_to_show:
-                self.combo_model.setCurrentIndex(0)
+            cur_fp = compute_provider_fingerprint(pid, key, base_url)
+            saved_fp = pdict.get("discovered_fingerprint") or ""
+            discovered = list(pdict.get("discovered_models") or [])
+            saved_model = (pdict.get("model") or "").strip()
+
+            # הצג מודלים רק אם התגלו עבור אותו מפתח/כתובת (ללא רשימות מומצאות!)
+            valid_discovered = discovered if (discovered and (saved_fp == cur_fp or not saved_fp)) else []
+            self._set_combo_models(valid_discovered, preferred_model=saved_model)
+
+            if meta.get("requires_key", True) and not key:
+                self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
+                self.lbl_discovery_status.setText("הזן מפתח API כדי לשלוף אוטומטית את רשימת המודלים הזמינים מהחברה.")
+            elif valid_discovered:
+                self.lbl_discovery_status.setStyleSheet("color: #34d399; font-size: 12px;")
+                self.lbl_discovery_status.setText(f"✅ נטענו {len(valid_discovered)} מודלים עבור {meta.get('label', pid)}.")
             else:
-                self.combo_model.setEditText(saved_model)
-            self.combo_model.blockSignals(False)
-
-            self.lbl_discovery_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
-            if discovered:
-                self.lbl_discovery_status.setText(f"נטענו {len(discovered)} מודלים שנשאבו עבור {meta.get('label', pid)}.")
-            else:
-                self.lbl_discovery_status.setText("הזן מפתח API כדי לשאוב אוטומטית את רשימת המודלים הזמינים מהחברה.")
+                self.lbl_discovery_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+                self.lbl_discovery_status.setText(f"⏳ מתחבר אל {meta.get('label', pid)} לשליפת המודלים...")
         finally:
             self._loading_fields = False
 
@@ -266,6 +447,7 @@ class SettingsDialog(QDialog):
 
     def _on_provider_changed(self):
         self._auto_discover_timer.stop()
+        self._cancel_inflight_discovery()
         self._save_current_provider_to_dict()
         new_pid = self.combo_provider.currentData()
         self._current_provider = new_pid
@@ -273,6 +455,7 @@ class SettingsDialog(QDialog):
         self._load_provider_fields(new_pid, auto_fetch=True)
 
     def _run_model_discovery(self, silent_if_empty: bool = False):
+        self._auto_discover_timer.stop()
         self._save_current_provider_to_dict()
         pid = self._current_provider
         key = self.txt_api_key.text().strip()
@@ -280,54 +463,101 @@ class SettingsDialog(QDialog):
         meta = PROVIDER_CATALOG.get(pid, {})
 
         if meta.get("requires_key", True) and not key:
+            self._set_combo_models([], preferred_model="")
             if not silent_if_empty:
                 self.lbl_discovery_status.setStyleSheet("color: #f87171; font-size: 12px;")
                 self.lbl_discovery_status.setText("❌ הזן מפתח API לפני בדיקת החיבור ושאיבת המודלים.")
             return
 
-        if self._discovery_thread and self._discovery_thread.isRunning():
-            return
+        # מבטל כל בקשה ישנה קודמת כדי שלא תוכל לחסום או לדרוס את הבקשה החדשה!
+        self._cancel_inflight_discovery()
+        self._request_seq += 1
+        req_id = self._request_seq
+        self._active_request_id = req_id
+        self._active_request_fp = compute_provider_fingerprint(pid, key, base_url)
 
         self.btn_discover.setEnabled(False)
+        self.btn_discover.setText("⏳ טוען...")
         self.lbl_discovery_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
-        self.lbl_discovery_status.setText(f"שואב רשימת מודלים זמינים מול {get_provider_label(pid)}...")
+        self.lbl_discovery_status.setText(f"⏳ שואב מודלים זמינים מול {get_provider_label(pid)}...")
 
-        self._discovery_thread = ModelDiscoveryThread(pid, key, base_url)
-        self._discovery_thread.finished_ok.connect(self._on_discovery_ok)
-        self._discovery_thread.failed.connect(self._on_discovery_failed)
-        self._discovery_thread.start()
+        th = ModelDiscoveryThread(
+            req_id,
+            pid,
+            key,
+            base_url,
+            discovery_fn=self._discovery_fn,
+            parent=self,
+        )
+        self._discovery_thread = th
+        th.finished_ok.connect(self._on_discovery_ok)
+        th.failed.connect(self._on_discovery_failed)
+        th.start()
 
-    def _on_discovery_ok(self, pid: str, models: list):
-        self.btn_discover.setEnabled(True)
-        self.settings["providers"][pid]["discovered_models"] = models
-        if pid != self._current_provider:
+    def _on_discovery_ok(self, request_id: int, pid: str, models: list, meta_info: dict):
+        if request_id != self._active_request_id or pid != self._current_provider:
             return
 
-        current_text = self.combo_model.currentText().strip()
-        self.combo_model.blockSignals(True)
-        self.combo_model.clear()
-        for m in models:
-            self.combo_model.addItem(m)
+        self.btn_discover.setEnabled(True)
+        self.btn_discover.setText("🔄 רענן / נסה שוב")
 
-        # אם המודל הקודם כבר לא נתמך או ריק, עוברים אוטומטית למודל הראשון/המומלץ ברשימה החיה
-        if pid == "gemini" and current_text == "gemini-2.5-flash" and "gemini-3.8-flash" in models:
-            self.combo_model.setCurrentText("gemini-3.8-flash")
-        elif current_text and current_text in models:
-            self.combo_model.setCurrentText(current_text)
-        elif models:
-            self.combo_model.setCurrentIndex(0)
-        self.combo_model.blockSignals(False)
+        key_now = self.txt_api_key.text().strip()
+        url_now = self.txt_base_url.text().strip()
+        fp_now = compute_provider_fingerprint(pid, key_now, url_now)
+        if fp_now != self._active_request_fp:
+            return
 
-        self.settings["providers"][pid]["model"] = self.combo_model.currentText().strip()
+        pdict = self.settings["providers"].setdefault(pid, {})
+        pdict["discovered_models"] = list(models)
+        pdict["discovered_fingerprint"] = fp_now
+
+        current_text = self.combo_model.currentText().strip() or (pdict.get("model") or "").strip()
+        preferred = current_text if current_text in models else (models[0] if models else "")
+        self._set_combo_models(models, preferred_model=preferred)
+
+        pdict["model"] = self.combo_model.currentText().strip()
+        pages_n = int((meta_info or {}).get("pages_fetched", 1) or 1)
+        pages_note = f" ({pages_n} עמודים)" if pages_n > 1 else ""
         self.lbl_discovery_status.setStyleSheet("color: #34d399; font-size: 12px; font-weight: bold;")
-        self.lbl_discovery_status.setText(f"✅ נשאבו {len(models)} מודלים זמינים! בחר מהרשימה למעלה ולחץ 'שמור הגדרות'.")
+        self.lbl_discovery_status.setText(
+            f"✅ נשאבו {len(models)} מודלים זמינים{pages_note}! בחר מהרשימה למעלה ולחץ 'שמור הגדרות'."
+        )
 
-    def _on_discovery_failed(self, pid: str, err: str):
-        self.btn_discover.setEnabled(True)
-        if pid != self._current_provider:
+    def _on_discovery_failed(self, request_id: int, pid: str, category: str, err: str):
+        if request_id != self._active_request_id or pid != self._current_provider:
             return
+
+        self.btn_discover.setEnabled(True)
+        self.btn_discover.setText("🔄 רענן / נסה שוב")
+        self._set_combo_models([], preferred_model="")
+
+        cat_titles = {
+            "auth": "🔑 שגיאת מפתח/הרשאה (בדוק את מפתח ה-API):",
+            "quota": "⏳ חריגה ממכסת בקשות (429):",
+            "timeout": "⏱️ פג זמן ההתחברות/קריאה (זוהי תקלת רשת/עומס, לא בהכרח מפתח שגוי):",
+            "network": "🌐 שגיאת תקשורת לשרת הספק:",
+            "empty": "📭 הספק לא החזיר מודלים תואמי טקסט:",
+        }
+        prefix = cat_titles.get(category, "❌ שגיאה בשאיבת מודלים:")
         self.lbl_discovery_status.setStyleSheet("color: #f87171; font-size: 12px;")
-        self.lbl_discovery_status.setText(f"❌ {err}")
+        self.lbl_discovery_status.setText(f"{prefix}\n{err}")
+
+    def _cleanup_threads(self):
+        self._auto_discover_timer.stop()
+        self._cancel_inflight_discovery()
+        for th in list(self._retired_threads):
+            th.cancel()
+            if th.isRunning():
+                th.wait(1200)
+        self._retired_threads.clear()
+
+    def done(self, r: int):
+        self._cleanup_threads()
+        super().done(r)
+
+    def closeEvent(self, event):
+        self._cleanup_threads()
+        super().closeEvent(event)
 
     def _on_save(self):
         self._save_current_provider_to_dict()
@@ -410,21 +640,45 @@ class TranslateDialog(QDialog):
 
 
 class ScriptStudioDialog(QDialog):
-    def __init__(self, parent=None, settings: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        parent=None,
+        settings: Optional[Dict[str, Any]] = None,
+        default_scope: str = "chapter",
+        book_title: str = "",
+        chapter_count: int = 1,
+        current_chapter_title: str = "",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("🎬 יצירת תסריט AI (קורא ספרים חכם)")
+        self.setWindowTitle("🎬 יצירת תסריט AI (פרק נוכחי / הספר כולו)")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(540, 440)
+        self.resize(560, 500)
         self.settings = settings or load_settings()
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
         pid = self.settings.get("active_provider", "gemini")
-        model = self.settings.get("providers", {}).get(pid, {}).get("model", "")
+        model = self.settings.get("providers", {}).get(pid, {}).get("model", "") or "לא נבחר"
         lbl_active = QLabel(f"ספק ומודל פעילים ליצירת התסריט: <b>{get_provider_label(pid)}</b> (<code>{model}</code>)")
         lbl_active.setStyleSheet("background-color: #1e293b; padding: 8px 12px; border-radius: 8px; color: #fbbf24;")
         layout.addWidget(lbl_active)
+
+        grp_scope = QGroupBox("היקף היצירה (Scope)")
+        scope_lay = QVBoxLayout(grp_scope)
+        self.radio_scope_chapter = QRadioButton(
+            f"📖 הפרק הנוכחי בלבד ({current_chapter_title or 'פרק פעיל'})"
+        )
+        self.radio_scope_book = QRadioButton(
+            f"📚 הספר כולו ({book_title or 'הספר הנבחר'} — כל {chapter_count} הפרקים לפי הסדר)"
+        )
+        if default_scope == "book":
+            self.radio_scope_book.setChecked(True)
+        else:
+            self.radio_scope_chapter.setChecked(True)
+        scope_lay.addWidget(self.radio_scope_chapter)
+        scope_lay.addWidget(self.radio_scope_book)
+        layout.addWidget(grp_scope)
 
         grp_mode = QGroupBox("סגנון התסריט")
         mode_lay = QVBoxLayout(grp_mode)
@@ -441,7 +695,7 @@ class ScriptStudioDialog(QDialog):
         wiki_lay.addWidget(self.chk_wikipedia)
 
         self.txt_wiki_terms = QLineEdit()
-        self.txt_wiki_terms.setPlaceholderText("מושגים ספציפיים לחיפוש מופרדים בפסיק (השאר ריק לזיהוי אוטומטי מהפרק)")
+        self.txt_wiki_terms.setPlaceholderText("מושגים ספציפיים לחיפוש מופרדים בפסיק (השאר ריק לזיהוי אוטומטי)")
         self.txt_wiki_terms.setEnabled(False)
         self.chk_wikipedia.toggled.connect(self.txt_wiki_terms.setEnabled)
         wiki_lay.addWidget(self.txt_wiki_terms)
@@ -450,7 +704,7 @@ class ScriptStudioDialog(QDialog):
         lbl_extra = QLabel("הנחיה נוספת (אופציונלי):")
         layout.addWidget(lbl_extra)
         self.txt_instruction = QTextEdit()
-        self.txt_instruction.setMaximumHeight(85)
+        self.txt_instruction.setMaximumHeight(75)
         self.txt_instruction.setPlaceholderText("לדוגמה: הרחב על המושגים ההלכתיים, או הוסף סיכום קצר בסוף הדיאלוג...")
         layout.addWidget(self.txt_instruction)
 
@@ -468,6 +722,7 @@ class ScriptStudioDialog(QDialog):
 
     def get_options(self) -> Dict[str, Any]:
         return {
+            "scope": "book" if self.radio_scope_book.isChecked() else "chapter",
             "mode": "educational" if self.radio_edu.isChecked() else "dramatic",
             "instruction": self.txt_instruction.toPlainText().strip(),
             "use_wikipedia": self.chk_wikipedia.isChecked(),
@@ -487,7 +742,7 @@ class WikiSearchDialog(QDialog):
         layout.setSpacing(12)
 
         pid = self.settings.get("active_provider", "gemini")
-        model = self.settings.get("providers", {}).get(pid, {}).get("model", "")
+        model = self.settings.get("providers", {}).get(pid, {}).get("model", "") or "לא נבחר"
         lbl_active = QLabel(
             f"מחקר מושגים מבוסס ויקיפדיה + <b>{get_provider_label(pid)}</b> (<code>{model}</code>)"
         )
@@ -545,9 +800,9 @@ class WikiSearchDialog(QDialog):
 
 class ExportPipelineDialog(QDialog):
     """
-    דיאלוג יצוא נאכף: מציג ומריץ בסדר קשיח
-    תרגום כל המשפטים הדרושים -> תסריט מלא ועדכני -> TTS -> יצוא.
-    אינו מאפשר עקיפה או שימוש בתוצרים ישנים.
+    דיאלוג יצוא נאכף (תרגום -> תסריט -> TTS -> יצוא) התומך במפורש בהיקף:
+      - 'chapter': הפרק הנוכחי בלבד
+      - 'book': הספר כולו (כל פרקי הספר לפי הסדר, עם אריזת ZIP/תיקייה/WAV/MP3 מאוחד)
     """
 
     def __init__(
@@ -560,27 +815,58 @@ class ExportPipelineDialog(QDialog):
         store: Any = None,
         default_voice: str = "edge_avri",
         default_speed: float = 1.0,
+        book: Optional[Dict[str, Any]] = None,
+        default_scope: str = "chapter",
     ):
         super().__init__(parent)
-        self.setWindowTitle("🎧 יצוא ספר קולי מלא (תרגום ← תסריט ← TTS ← יצוא)")
+        self.setWindowTitle("🎧 יצוא ספר קולי (תרגום ← תסריט ← TTS ← יצוא)")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(610, 560)
+        self.resize(650, 640)
         self.book_id = book_id
         self.chapter_index = chapter_index
         self.source_text = source_text
+        self.book = book or {
+            "id": book_id,
+            "title": "ספר",
+            "chapters": [{"title": f"פרק {chapter_index + 1}", "text": source_text}],
+        }
         self.settings = settings or load_settings()
         self.store = store
+        self.default_speed = float(default_speed)
+        self._default_voice = default_voice
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
         lbl_info = QLabel(
             "שירות היצוא אוכף את מלוא הצינור בסדר קשיח ללא עקיפה:\n"
-            "<b>1. תרגום כל המשפטים הדרושים ← 2. תסריט AI מלא ועדכני ← 3. סינתזת TTS ← 4. שמירה אטומית</b>"
+            "<b>1. תרגום כל המשפטים הדרושים ← 2. תסריט AI מלא ועדכני ← 3. סינתזת TTS ← 4. שמירה/אריזה אטומית</b>"
         )
         lbl_info.setWordWrap(True)
         lbl_info.setStyleSheet("background-color: #1e293b; padding: 10px 12px; border-radius: 8px; color: #fbbf24;")
         layout.addWidget(lbl_info)
+
+        # בחירת היקף מפורשת
+        grp_scope = QGroupBox("היקף היצוא (Scope)")
+        sc_lay = QVBoxLayout(grp_scope)
+        ch_count = len(self.book.get("chapters") or [])
+        ch_title = (
+            self.book["chapters"][self.chapter_index].get("title", f"פרק {self.chapter_index + 1}")
+            if 0 <= self.chapter_index < ch_count
+            else f"פרק {self.chapter_index + 1}"
+        )
+        self.radio_scope_chapter = QRadioButton(f"📖 הפרק הנוכחי בלבד ({ch_title})")
+        self.radio_scope_book = QRadioButton(
+            f"📚 הספר כולו ({self.book.get('title', '')} — כל {ch_count} הפרקים לפי הסדר)"
+        )
+        if default_scope == "book":
+            self.radio_scope_book.setChecked(True)
+        else:
+            self.radio_scope_chapter.setChecked(True)
+        self.radio_scope_chapter.toggled.connect(self._on_scope_changed)
+        sc_lay.addWidget(self.radio_scope_chapter)
+        sc_lay.addWidget(self.radio_scope_book)
+        layout.addWidget(grp_scope)
 
         # שלב 1: הגדרות תרגום
         grp_trans = QGroupBox("שלב 1 — תרגום כל המשפטים הדרושים")
@@ -644,13 +930,13 @@ class ExportPipelineDialog(QDialog):
         form_s.addLayout(wiki_row)
         layout.addWidget(grp_script)
 
-        # שלב 3 ו-4: TTS ויצוא
-        grp_tts = QGroupBox("שלבים 3–4 — סינתזת TTS ופורמט יצוא")
+        # שלב 3 ו-4: TTS ואריזה
+        grp_tts = QGroupBox("שלבים 3–4 — סינתזת TTS ואריזת תוצר")
         form_a = QFormLayout(grp_tts)
+
         self.combo_format = QComboBox()
-        self.combo_format.addItem("🎵 קובץ MP3 איכותי (Edge-TTS רב-קולי)", "mp3")
-        self.combo_format.addItem("🔊 קובץ WAV אופליין (Windows SAPI5)", "wav")
-        form_a.addRow("פורמט שמע:", self.combo_format)
+        self.combo_format.currentIndexChanged.connect(self._refresh_readiness)
+        form_a.addRow("תצורת יצוא:", self.combo_format)
 
         self.combo_voice = QComboBox()
         self.combo_voice.addItem("קול עברית - אברי (Edge-TTS)", "edge_avri")
@@ -659,12 +945,11 @@ class ExportPipelineDialog(QDialog):
         v_idx = self.combo_voice.findData(default_voice)
         if v_idx >= 0:
             self.combo_voice.setCurrentIndex(v_idx)
+        self.combo_voice.currentIndexChanged.connect(self._refresh_readiness)
         form_a.addRow("קול ברירת מחדל:", self.combo_voice)
-        self.default_speed = float(default_speed)
         layout.addWidget(grp_tts)
 
-        # חיווי עדכניות חי (ללא תוצרים ישנים)
-        grp_status = QGroupBox("סטטוס עדכניות (תוצרים שהתיישנו יחודשו אוטומטית)")
+        grp_status = QGroupBox("סטטוס מוכנות ועדכניות")
         st_lay = QVBoxLayout(grp_status)
         self.lbl_stage1_status = QLabel("")
         self.lbl_stage2_status = QLabel("")
@@ -680,18 +965,66 @@ class ExportPipelineDialog(QDialog):
         btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(btn_cancel)
 
-        btn_go = QPushButton("🚀 הפעל יצוא מלא")
-        btn_go.setObjectName("primaryBtn")
-        btn_go.clicked.connect(self.accept)
-        btn_row.addWidget(btn_go)
+        self.btn_go = QPushButton("🚀 הפעל יצוא מלא")
+        self.btn_go.setObjectName("primaryBtn")
+        self.btn_go.clicked.connect(self.accept)
+        btn_row.addWidget(self.btn_go)
         layout.addLayout(btn_row)
 
+        self._populate_format_options()
+        self._refresh_readiness()
+
+    def _populate_format_options(self):
+        is_book = self.radio_scope_book.isChecked()
+        self.combo_format.blockSignals(True)
+        self.combo_format.clear()
+        if is_book:
+            self.combo_format.addItem("📦 ארכיון ZIP — פרקי MP3 ממוספרים + manifest.json", "zip_mp3")
+            self.combo_format.addItem("📦 ארכיון ZIP — פרקי WAV ממוספרים + manifest.json", "zip_wav")
+            self.combo_format.addItem("📁 תיקייה מסודרת — פרקי MP3 ממוספרים + manifest.json", "folder_mp3")
+            self.combo_format.addItem("📁 תיקייה מסודרת — פרקי WAV ממוספרים + manifest.json", "folder_wav")
+            self.combo_format.addItem("🔊 קובץ WAV מאוחד לכל הספר (הזרמה תקנית)", "unified_wav")
+            self.combo_format.addItem("🎵 קובץ MP3 מאוחד לכל הספר (פענוח/קידוד FFmpeg)", "unified_mp3")
+        else:
+            self.combo_format.addItem("🎵 קובץ MP3 לפרק הנוכחי (Edge-TTS רב-קולי)", "mp3")
+            self.combo_format.addItem("🔊 קובץ WAV אופליין לפרק הנוכחי (Windows SAPI5)", "wav")
+        self.combo_format.blockSignals(False)
+
+    def _on_scope_changed(self):
+        self._populate_format_options()
         self._refresh_readiness()
 
     def _refresh_readiness(self):
-        from export_pipeline import assess_chapter_pipeline
+        from export_pipeline import assess_book_pipeline, assess_chapter_pipeline
 
         opts = self.get_options()
+        if opts["scope"] == "book":
+            b_status = assess_book_pipeline(
+                book=self.book,
+                settings=self.settings,
+                translation_opts=opts["translation_opts"],
+                script_opts=opts["script_opts"],
+                tts_opts=opts["tts_opts"],
+                store=self.store,
+            )
+            total = b_status["chapter_count"]
+            if not b_status["book_complete"]:
+                self.lbl_stage1_status.setStyleSheet("color: #f87171; font-size: 12px; font-weight: bold;")
+                self.lbl_stage1_status.setText(f"❌ הספר אינו שלם לעיבוד מלא: {b_status['book_completeness_reason']}")
+                self.lbl_stage2_status.setStyleSheet("color: #f87171; font-size: 12px;")
+                self.lbl_stage2_status.setText("לא ניתן להכריז על ספר חלקי כספר שהושלם — תקן/בצע OCR לעמודים החסרים.")
+                return
+
+            self.lbl_stage1_status.setStyleSheet("color: #34d399; font-size: 12px;" if b_status["all_translations_ready"] else "color: #fbbf24; font-size: 12px;")
+            self.lbl_stage1_status.setText(
+                f"שלב 1 (תרגום ספר מלא): מוכנים {b_status['translations_ready']} מתוך {total} פרקים (היתר יתורגמו לפי הסדר לפני יצירת תסריט)."
+            )
+            self.lbl_stage2_status.setStyleSheet("color: #34d399; font-size: 12px;" if b_status["all_scripts_ready"] else "color: #fbbf24; font-size: 12px;")
+            self.lbl_stage2_status.setText(
+                f"שלב 2–3 (תסריט ו-TTS): תסריטים מוכנים {b_status['scripts_ready']}/{total} | שמע במטמון {b_status['tts_ready']}/{total}."
+            )
+            return
+
         status = assess_chapter_pipeline(
             book_id=self.book_id,
             chapter_index=self.chapter_index,
@@ -717,7 +1050,33 @@ class ExportPipelineDialog(QDialog):
             self.lbl_stage2_status.setText(f"⚠️ שלב 2 (תסריט): {status['script_reason']} — ייווצר מחדש לפני ה-TTS.")
 
     def get_options(self) -> Dict[str, Any]:
+        scope = "book" if self.radio_scope_book.isChecked() else "chapter"
+        raw_fmt = self.combo_format.currentData() or ("zip_mp3" if scope == "book" else "mp3")
+
+        if scope == "book":
+            if raw_fmt == "zip_mp3":
+                package_mode, audio_fmt = "zip", "mp3"
+            elif raw_fmt == "zip_wav":
+                package_mode, audio_fmt = "zip", "wav"
+            elif raw_fmt == "folder_mp3":
+                package_mode, audio_fmt = "folder", "mp3"
+            elif raw_fmt == "folder_wav":
+                package_mode, audio_fmt = "folder", "wav"
+            elif raw_fmt == "unified_wav":
+                package_mode, audio_fmt = "unified_wav", "wav"
+            else:
+                package_mode, audio_fmt = "unified_mp3", "mp3"
+        else:
+            package_mode = "single_chapter"
+            audio_fmt = raw_fmt
+
+        voice = self.combo_voice.currentData()
+        if audio_fmt == "wav" and str(voice).startswith("edge"):
+            voice = "sapi5"
+
         return {
+            "scope": scope,
+            "package_mode": package_mode,
             "translation_opts": {
                 "engine": self.combo_engine.currentData(),
                 "source_lang": self.combo_src.currentData(),
@@ -730,8 +1089,8 @@ class ExportPipelineDialog(QDialog):
                 "wiki_terms": self.txt_wiki_terms.text().strip(),
             },
             "tts_opts": {
-                "output_format": self.combo_format.currentData(),
-                "default_voice": self.combo_voice.currentData(),
+                "output_format": audio_fmt,
+                "default_voice": voice,
                 "speed": self.default_speed,
             },
         }

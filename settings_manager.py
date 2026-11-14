@@ -3,16 +3,17 @@
 מנהל הגדרות מקומי עבור PorMyCodex.
 שומר באופן מאובטח ומקומי במחשב המשתמש (AppData / .config) את:
 - ספק ה-AI הפעיל (Google Gemini, OpenAI, Anthropic, OpenRouter, Groq, שרת מותאם)
-- מפתחות API לכל חברה בנפרד
-- מודל נבחר לכל חברה + רשימת מודלים שהתגלו מהשרת
+- מפתחות API לכל חברה בנפרד (מקומית בלבד; אינם נכללים בהודעות או בלוגים)
+- מודל נבחר לכל חברה + רשימת מודלים שהתגלו מהשרת (בליווי טביעת אצבע למניעת תוצרים ישנים)
 - מנוע תרגום מועדף (AI / Google Translate חינמי / MyMemory / LibreTranslate)
 - קולות דוברים לתסריט רב-קולי (מורה / תלמיד / מספר)
 """
 
-import os
-import json
-import tempfile
 from copy import deepcopy
+import hashlib
+import json
+import os
+import tempfile
 from typing import Dict, Any
 
 
@@ -35,44 +36,59 @@ def get_settings_path() -> str:
     return os.path.join(get_settings_dir(), "settings.json")
 
 
+def compute_provider_fingerprint(provider_id: str, api_key: str, base_url: str) -> str:
+    """
+    מחשב חתימה חד-כיוונית (SHA-256) עבור שילוב ספק/מפתח/כתובת כדי לזהות תוצרי גילוי ישנים
+    מבלי לשמור או לחשוף את המפתח עצמו.
+    """
+    payload = f"{(provider_id or '').strip()}|{(base_url or '').strip().rstrip('/')}|{(api_key or '').strip()}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "active_provider": "gemini",
     "providers": {
         "gemini": {
             "api_key": "",
-            "model": "gemini-3.8-flash",
+            "model": "gemini-2.5-flash",
             "base_url": "https://generativelanguage.googleapis.com/v1beta",
             "discovered_models": [],
+            "discovered_fingerprint": "",
         },
         "openai": {
             "api_key": "",
             "model": "gpt-4o-mini",
             "base_url": "https://api.openai.com/v1",
             "discovered_models": [],
+            "discovered_fingerprint": "",
         },
         "anthropic": {
             "api_key": "",
             "model": "claude-3-7-sonnet-latest",
             "base_url": "https://api.anthropic.com/v1",
             "discovered_models": [],
+            "discovered_fingerprint": "",
         },
         "openrouter": {
             "api_key": "",
             "model": "google/gemini-2.5-flash",
             "base_url": "https://openrouter.ai/api/v1",
             "discovered_models": [],
+            "discovered_fingerprint": "",
         },
         "groq": {
             "api_key": "",
             "model": "llama-3.3-70b-versatile",
             "base_url": "https://api.groq.com/openai/v1",
             "discovered_models": [],
+            "discovered_fingerprint": "",
         },
         "custom": {
             "api_key": "",
-            "model": "llama3.1",
+            "model": "",
             "base_url": "http://localhost:11434/v1",
             "discovered_models": [],
+            "discovered_fingerprint": "",
         },
     },
     "translation": {
@@ -120,10 +136,15 @@ def load_settings() -> Dict[str, Any]:
             loaded = {}
     merged = _deep_merge(DEFAULT_SETTINGS, loaded)
 
-    # עדכון מודל ברירת מחדל ישן של Gemini שהוסר ע"י גוגל למשתמשים חדשים
+    # מיגרציה חד-פעמית משמות מודלים לא קיימים מגרסה ישנה (לעולם לא דורס מודל תקף כמו gemini-2.5-flash)
     gem_conf = merged["providers"].get("gemini", {})
-    if gem_conf.get("model") in ("", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro"):
-        gem_conf["model"] = "gemini-3.8-flash"
+    if gem_conf.get("model") in ("gemini-3.8-flash", "gemini-3.8-pro"):
+        gem_conf["model"] = "gemini-2.5-flash" if gem_conf.get("model") == "gemini-3.8-flash" else "gemini-2.5-pro"
+
+    # הסרת שמות מודלים מומצאים מרשימות גילוי שמורות אם נשארו מגרסה ישנה
+    disc = gem_conf.get("discovered_models") or []
+    if disc:
+        gem_conf["discovered_models"] = [m for m in disc if m not in ("gemini-3.8-flash", "gemini-3.8-pro")]
 
     # מילוי מפתחות ממשתני סביבה רק אם לא הוזן מפתח בהגדרות
     for pid, env_name in ENV_KEY_MAP.items():

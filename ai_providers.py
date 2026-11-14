@@ -1,100 +1,140 @@
 # -*- coding: utf-8 -*-
 """
 שכבת ספקי בינה מלאכותית אוניברסלית (Multi-Provider AI Client) עבור PorMyCodex.
-תומכת ב:
-- Google Gemini (כולל גילוי מודלים חי מה-API)
-- OpenAI (כולל גילוי מודלים חי)
-- Anthropic Claude
-- OpenRouter (מאות מודלים מכל החברות, כולל חינמיים)
-- Groq (מהירות שיא)
-- שרת מותאם / מקומי (Ollama, LM Studio, OpenAI-Compatible)
+
+מאפיינים מרכזיים:
+- הפרדה מלאה בין Connect Timeout ל-Read Timeout + תקציב זמן כולל (Deadline)
+- ניסיונות חוזרים (Retries) מוגבלים עם Exponential Backoff לכשלים זמניים בלבד (429/5xx/Timeout/Network)
+- ביטול מיידי גם בזמן המתנה/Backoff (cancel_event.wait)
+- אי-החלפה שקטה של מודלים ואי-שימוש בשמות מודלים מומצאים
+- גילוי מודלים חי מה-API הרשמי של כל ספק עם Pagination מלא וסינון לפי יכולת נדרשת (text)
+- סינון והסתרה מוחלטת של מפתחות API מכל שגיאה או לוג
 """
 
-from typing import List, Dict, Any, Optional
 import json
+import re
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 try:
     import requests
 except ImportError:
     requests = None  # type: ignore
 
 
+class AICallError(RuntimeError):
+    """שגיאה מובחנת ומתועדת בפעולת רשת / AI עם שלב, קטגוריה והנחיית פעולה."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str = "קריאת AI",
+        category: str = "error",
+        retryable: bool = False,
+        status_code: Optional[int] = None,
+    ):
+        super().__init__(message)
+        self.stage = stage
+        self.category = category
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+class AICancelledError(AICallError):
+    """נזרק מיד בעת ביטול בקשה פעילה או המתנת Backoff."""
+
+    def __init__(self, stage: str = "קריאת AI"):
+        super().__init__(
+            f"הפעולה בוטלה על ידי המשתמש בשלב '{stage}'.",
+            stage=stage,
+            category="cancelled",
+            retryable=False,
+        )
+
+
 def _require_requests():
     if requests is None:
-        raise RuntimeError("חבילת 'requests' אינה מותקנת בסביבה זו.")
+        raise AICallError(
+            "חבילת התקשורת 'requests' אינה מותקנת בסביבה זו.",
+            stage="חיבור רשת",
+            category="network",
+            retryable=False,
+        )
     return requests
+
+
+def _sanitize_error_text(text: str, secrets: Optional[List[str]] = None) -> str:
+    cleaned = str(text or "")
+    for sec in secrets or []:
+        s = (sec or "").strip()
+        if s and len(s) >= 4:
+            cleaned = cleaned.replace(s, "[REDACTED_KEY]")
+    cleaned = re.sub(r"(AIza[0-9A-Za-z\-_]{10,})", "[REDACTED_KEY]", cleaned)
+    cleaned = re.sub(r"(sk-[0-9A-Za-z\-_]{8,})", "[REDACTED_KEY]", cleaned)
+    cleaned = re.sub(r"(ghp_[0-9A-Za-z]{8,})", "[REDACTED_KEY]", cleaned)
+    cleaned = re.sub(r"([?&](?:key|api_key)=)[^&\s]+", r"\1[REDACTED_KEY]", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _check_cancelled(cancel_event: Any, stage: str) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise AICancelledError(stage=stage)
+
+
+def _sleep_cancellable(seconds: float, cancel_event: Any, stage: str) -> None:
+    if seconds <= 0:
+        _check_cancelled(cancel_event, stage)
+        return
+    if cancel_event is not None:
+        triggered = cancel_event.wait(seconds)
+        if triggered or cancel_event.is_set():
+            raise AICancelledError(stage=stage)
+    else:
+        time.sleep(seconds)
+
 
 PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
     "gemini": {
         "label": "Google Gemini",
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
         "requires_key": True,
-        "preset_models": [
-            "gemini-3.8-flash",
-            "gemini-3.8-pro",
-            "gemini-2.5-pro",
-        ],
+        "supports_discovery": True,
         "help_url": "https://aistudio.google.com/apikey",
     },
     "openai": {
         "label": "OpenAI (ChatGPT)",
         "default_base_url": "https://api.openai.com/v1",
         "requires_key": True,
-        "preset_models": [
-            "gpt-4o-mini",
-            "gpt-4o",
-            "gpt-4.1-mini",
-            "gpt-4.1",
-            "o3-mini",
-        ],
+        "supports_discovery": True,
         "help_url": "https://platform.openai.com/api-keys",
     },
     "anthropic": {
         "label": "Anthropic (Claude)",
         "default_base_url": "https://api.anthropic.com/v1",
         "requires_key": True,
-        "preset_models": [
-            "claude-3-7-sonnet-latest",
-            "claude-sonnet-4-20250514",
-            "claude-3-5-haiku-latest",
-            "claude-3-5-sonnet-latest",
-        ],
+        "supports_discovery": True,
         "help_url": "https://console.anthropic.com/settings/keys",
     },
     "openrouter": {
         "label": "OpenRouter (מגוון חברות ומודלים)",
         "default_base_url": "https://openrouter.ai/api/v1",
         "requires_key": True,
-        "preset_models": [
-            "google/gemini-2.5-flash",
-            "anthropic/claude-3.7-sonnet",
-            "openai/gpt-4o-mini",
-            "deepseek/deepseek-chat-v3-0324:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-        ],
+        "supports_discovery": True,
         "help_url": "https://openrouter.ai/keys",
     },
     "groq": {
         "label": "Groq (Llama / Mixtral במהירות גבוהה)",
         "default_base_url": "https://api.groq.com/openai/v1",
         "requires_key": True,
-        "preset_models": [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it",
-        ],
+        "supports_discovery": True,
         "help_url": "https://console.groq.com/keys",
     },
     "custom": {
         "label": "שרת מותאם / מקומי (Ollama / LM Studio / OpenAI-API)",
         "default_base_url": "http://localhost:11434/v1",
         "requires_key": False,
-        "preset_models": [
-            "llama3.1",
-            "qwen2.5:14b",
-            "gemma2",
-            "mistral",
-        ],
+        "supports_discovery": True,
         "help_url": "https://ollama.com",
     },
 }
@@ -104,104 +144,635 @@ def get_provider_label(provider_id: str) -> str:
     return PROVIDER_CATALOG.get(provider_id, {}).get("label", provider_id)
 
 
-def get_preset_models(provider_id: str) -> List[str]:
-    return list(PROVIDER_CATALOG.get(provider_id, {}).get("preset_models", []))
-
-
 def _rank_gemini_model(mid: str) -> tuple:
     low = mid.lower()
-    if low == "gemini-3.8-flash":
-        return (0, low)
-    if "gemini-3.8" in low:
-        return (1, low)
-    if "gemini-3" in low:
-        return (2, low)
-    if "gemini-2.5-pro" in low:
-        return (3, low)
-    if "gemini-2.5" in low:
-        return (4, low)
-    if "gemini-2" in low:
-        return (5, low)
-    if "gemini-" in low:
-        return (6, low)
-    return (7, low)
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", low)
+    if m:
+        maj = int(m.group(1))
+        min_v = int(m.group(2) or 0)
+        tier = 0 if "flash" in low and "lite" not in low else (1 if "pro" in low else (2 if "lite" in low else 3))
+        experimental = 1 if any(t in low for t in ("exp", "preview", "001", "latest")) else 0
+        return (0, -maj, -min_v, tier, experimental, low)
+    return (1, 0, 0, 9, 0, low)
 
 
-def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout: int = 20) -> List[str]:
+def _classify_timeout_kind(exc: Exception) -> str:
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "connecttimeout" in name or "connect timed out" in msg:
+        return "connect"
+    if "readtimeout" in name or "read timed out" in msg:
+        return "read"
+    return "timeout"
+
+
+def _parse_api_error_detail(resp: Any, secrets: Optional[List[str]] = None) -> str:
+    detail = ""
+    try:
+        err_json = resp.json()
+        if isinstance(err_json, dict):
+            err_val = err_json.get("error")
+            if isinstance(err_val, dict):
+                detail = str(err_val.get("message") or err_val.get("status") or "")
+            else:
+                detail = str(err_val or err_json.get("message") or "")
+    except Exception:
+        detail = (getattr(resp, "text", "") or "")[:240]
+    return _sanitize_error_text(detail.strip(), secrets=secrets)
+
+
+def _build_http_error(
+    provider_name: str,
+    resp: Any,
+    stage: str,
+    selected_model: str = "",
+    secrets: Optional[List[str]] = None,
+) -> AICallError:
+    code = int(getattr(resp, "status_code", 0) or 0)
+    detail = _parse_api_error_detail(resp, secrets=secrets)
+    detail_suffix = f" ({detail})" if detail else ""
+
+    if code in (401, 403):
+        msg = (
+            f"שגיאת מפתח/הרשאה בשלב '{stage}' מול {provider_name} (HTTP {code}){detail_suffix}.\n"
+            "בדוק שמפתח ה-API תקין ובעל הרשאות מתאימות, ולאחר מכן לחץ 'נסה שוב'."
+        )
+        return AICallError(msg, stage=stage, category="auth", retryable=False, status_code=code)
+
+    if code == 429:
+        msg = (
+            f"חריגה ממכסת הבקשות/קצב בשלב '{stage}' מול {provider_name} (HTTP 429){detail_suffix}.\n"
+            "המתן מספר שניות ונסה שוב, או הקטן עומס בקשות בחשבון."
+        )
+        return AICallError(msg, stage=stage, category="quota", retryable=True, status_code=code)
+
+    if code == 404:
+        model_note = f" המודל '{selected_model}' אינו זמין או שאינו נתמך בנתיב זה." if selected_model else " המשאב המבוקש לא נמצא."
+        msg = (
+            f"שגיאת זמינות מודל/נתיב בשלב '{stage}' מול {provider_name} (HTTP 404):{model_note}{detail_suffix}\n"
+            "פתח 'הגדרות AI ומודלים', לחץ 'רענן מודלים' ובחר מודל עדכני מהרשימה (המודל לא הוחלף אוטומטית)."
+        )
+        return AICallError(msg, stage=stage, category="model_not_found", retryable=False, status_code=code)
+
+    if code == 400:
+        msg = (
+            f"בקשה לא תקינה בשלב '{stage}' מול {provider_name} (HTTP 400){detail_suffix}.\n"
+            "בדוק את הגדרות המודל או גודל הטקסט ונסה שוב."
+        )
+        return AICallError(msg, stage=stage, category="validation", retryable=False, status_code=code)
+
+    retryable = code in (408, 500, 502, 503, 504)
+    cat = "server" if code >= 500 or code == 408 else "error"
+    msg = (
+        f"שגיאת שרת זמנית בשלב '{stage}' מול {provider_name} (HTTP {code}){detail_suffix}.\n"
+        "זוהי תקלת שרת/עומס (לא בהכרח בעיית מפתח) — ניתן לנסות שוב."
+        if retryable
+        else f"שגיאה בשלב '{stage}' מול {provider_name} (HTTP {code}){detail_suffix}."
+    )
+    return AICallError(msg, stage=stage, category=cat, retryable=retryable, status_code=code)
+
+
+def execute_http_with_retry(
+    method: str,
+    url: str,
+    *,
+    provider_name: str,
+    stage: str,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 35.0,
+    total_deadline: float = 105.0,
+    max_retries: int = 2,
+    backoff_base: float = 1.5,
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    selected_model: str = "",
+    secrets: Optional[List[str]] = None,
+    request_fn: Optional[Callable[..., Any]] = None,
+    clock_fn: Optional[Callable[[], float]] = None,
+) -> Any:
     """
-    מבצע בדיקת חיבור אמיתית מול הספק ומחזיר את רשימת המודלים הזמינים בחשבון.
+    מבצע בקשת HTTP עם הפרדת (connect_timeout, read_timeout), תקציב זמן כולל (total_deadline),
+    מספר מוגבל של ניסיונות חוזרים לכשלים זמניים בלבד, וביטול מיידי גם באמצע Retry/Backoff.
     """
+    req = _require_requests() if request_fn is None else None
+    caller = request_fn if request_fn is not None else req.request
+    now_fn = clock_fn or time.monotonic
+
+    connect_t = max(1.0, float(connect_timeout))
+    read_t = max(1.0, float(read_timeout))
+    deadline_ts = now_fn() + max(2.0, float(total_deadline))
+    retries_allowed = max(0, int(max_retries))
+    transient_http_codes = {408, 429, 500, 502, 503, 504}
+
+    last_error: Optional[AICallError] = None
+
+    for attempt in range(retries_allowed + 1):
+        _check_cancelled(cancel_event, stage)
+        remaining = deadline_ts - now_fn()
+        if remaining <= 0.25:
+            break
+
+        eff_connect = min(connect_t, max(0.5, remaining * 0.5))
+        eff_read = min(read_t, max(0.5, remaining))
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "headers": headers or {},
+                "params": params,
+                "timeout": (eff_connect, eff_read),
+            }
+            if json_body is not None:
+                kwargs["json"] = json_body
+
+            resp = caller(method.upper(), url, **kwargs)
+            _check_cancelled(cancel_event, stage)
+
+            if getattr(resp, "ok", False):
+                return resp
+
+            code = int(getattr(resp, "status_code", 0) or 0)
+            err = _build_http_error(
+                provider_name,
+                resp,
+                stage=stage,
+                selected_model=selected_model,
+                secrets=secrets,
+            )
+            if code not in transient_http_codes or attempt >= retries_allowed:
+                raise err
+
+            last_error = err
+            retry_after_val = 0.0
+            try:
+                ra_hdr = getattr(resp, "headers", {}).get("Retry-After")
+                if ra_hdr:
+                    retry_after_val = max(0.0, float(ra_hdr))
+            except Exception:
+                retry_after_val = 0.0
+
+            delay = max(backoff_base * (2 ** attempt), retry_after_val)
+            delay = min(delay, 12.0)
+
+        except AICancelledError:
+            raise
+        except AICallError:
+            raise
+        except Exception as exc:
+            _check_cancelled(cancel_event, stage)
+            req_exc = requests.exceptions if requests is not None else None
+            is_timeout = (
+                (req_exc is not None and isinstance(exc, req_exc.Timeout))
+                or "timeout" in type(exc).__name__.lower()
+                or "timed out" in str(exc).lower()
+            )
+            is_conn = (
+                (req_exc is not None and isinstance(exc, req_exc.ConnectionError))
+                or "connection" in type(exc).__name__.lower()
+            )
+            safe_exc = _sanitize_error_text(str(exc), secrets=secrets)
+
+            if is_timeout:
+                kind = _classify_timeout_kind(exc)
+                if kind == "connect":
+                    msg = (
+                        f"פג זמן ההתחברות לשרת {provider_name} בשלב '{stage}' (Connect Timeout={eff_connect:.0f}s).\n"
+                        "בדוק את חיבור האינטרנט/פרוקסי ונסה שוב (זוהי תקלת תקשורת, לא בעיית מפתח API)."
+                    )
+                elif kind == "read":
+                    msg = (
+                        f"השרת {provider_name} לא החזיר תשובה בזמן בשלב '{stage}' (Read Timeout={eff_read:.0f}s).\n"
+                        "תקלה זו נובעת מעומס שרת או מקטע ארוך מדי — לא בהכרח מפתח שגוי. "
+                        "האצווה חולקה או ניתן לנסות שוב."
+                    )
+                else:
+                    msg = (
+                        f"חריגת זמן המתנה מול {provider_name} בשלב '{stage}' ({safe_exc}).\n"
+                        "זוהי שגיאת זמן רשת/שרת — לחץ 'נסה שוב'."
+                    )
+                last_error = AICallError(msg, stage=stage, category="timeout", retryable=True)
+            elif is_conn:
+                last_error = AICallError(
+                    f"שגיאת חיבור רשת אל {provider_name} בשלב '{stage}': {safe_exc}.\nבדוק חיבור אינטרנט ונסה שוב.",
+                    stage=stage,
+                    category="network",
+                    retryable=True,
+                )
+            else:
+                raise AICallError(
+                    f"שגיאת תקשורת מול {provider_name} בשלב '{stage}': {safe_exc}",
+                    stage=stage,
+                    category="network",
+                    retryable=False,
+                ) from exc
+
+            if attempt >= retries_allowed:
+                raise last_error
+            delay = min(backoff_base * (2 ** attempt), 10.0)
+
+        # בדיקת תקציב הזמן לפני המתנת Backoff לניסיון הבא
+        remaining_after = deadline_ts - now_fn()
+        if remaining_after <= 1.0:
+            break
+        wait_sec = min(delay, max(0.0, remaining_after - 1.0))
+        if progress_cb:
+            progress_cb(
+                f"שלב '{stage}': השרת התעכב, מנסה שוב ({attempt + 2}/{retries_allowed + 1}) בעוד {wait_sec:.1f} שנ'..."
+            )
+        _sleep_cancellable(wait_sec, cancel_event, stage)
+
+    if last_error is not None:
+        raise AICallError(
+            f"{last_error}\n(הסתיים תקציב הזמן הכולל: {total_deadline:.0f} שנ' בשלב '{stage}').",
+            stage=stage,
+            category=last_error.category,
+            retryable=True,
+            status_code=last_error.status_code,
+        )
+    raise AICallError(
+        f"חריגה מתקציב הזמן הכולל ({total_deadline:.0f} שנ') בשלב '{stage}' מול {provider_name}. נסה שוב.",
+        stage=stage,
+        category="timeout",
+        retryable=True,
+    )
+
+
+def _filter_models_for_capability(
+    provider_id: str,
+    raw_models: List[Dict[str, Any]],
+    capability: str = "text",
+) -> Tuple[List[str], int]:
+    """
+    מסנן מודלים שהוחזרו מה-API הרשמי של הספק לפי היכולת הנדרשת (ברירת מחדל: text/chat).
+    לעולם אינו ממציא מודלים שאינם בתשובת הספק.
+    """
+    accepted: List[str] = []
+    filtered_out = 0
+
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+
+        if provider_id == "gemini":
+            methods = item.get("supportedGenerationMethods") or []
+            mid = str(item.get("name") or "").strip()
+            if mid.startswith("models/"):
+                mid = mid[len("models/"):]
+            if not mid:
+                continue
+            low = mid.lower()
+            if capability == "text":
+                bad_tokens = (
+                    "embedding",
+                    "text-embedding",
+                    "aqa",
+                    "imagen",
+                    "veo",
+                    "tts",
+                    "-audio",
+                    "native-audio",
+                    "robotics",
+                    "computer-use",
+                    "bisheng",
+                    "medlm",
+                )
+                if "generateContent" not in methods or any(tok in low for tok in bad_tokens):
+                    filtered_out += 1
+                    continue
+            accepted.append(mid)
+
+        elif provider_id == "anthropic":
+            mid = str(item.get("id") or "").strip()
+            if not mid:
+                continue
+            if capability == "text" and any(tok in mid.lower() for tok in ("embedding", "audio", "tts", "whisper")):
+                filtered_out += 1
+                continue
+            accepted.append(mid)
+
+        elif provider_id == "openai":
+            mid = str(item.get("id") or "").strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            if capability == "text":
+                is_chat = any(pref in low for pref in ("gpt-", "o1", "o3", "o4", "chatgpt"))
+                is_non_text = any(
+                    bad in low
+                    for bad in (
+                        "embedding",
+                        "audio",
+                        "realtime",
+                        "transcribe",
+                        "tts",
+                        "image",
+                        "dall-e",
+                        "whisper",
+                        "moderation",
+                        "sora",
+                        "search-api",
+                        "instruct-0914",
+                        "codex-mini",
+                    )
+                )
+                if not is_chat or is_non_text:
+                    filtered_out += 1
+                    continue
+            accepted.append(mid)
+
+        elif provider_id == "openrouter":
+            mid = str(item.get("id") or "").strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            arch = item.get("architecture") or {}
+            out_mods = arch.get("output_modalities") if isinstance(arch, dict) else None
+            if capability == "text":
+                if isinstance(out_mods, list) and out_mods and "text" not in out_mods:
+                    filtered_out += 1
+                    continue
+                if any(bad in low for bad in ("embedding", "whisper", "tts", "dall-e", "flux", "stable-diffusion")):
+                    filtered_out += 1
+                    continue
+            accepted.append(mid)
+
+        elif provider_id == "groq":
+            mid = str(item.get("id") or "").strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            if item.get("active") is False:
+                filtered_out += 1
+                continue
+            if capability == "text" and any(
+                bad in low for bad in ("whisper", "playai-tts", "orpheus", "prompt-guard", "safeguard", "embedding")
+            ):
+                filtered_out += 1
+                continue
+            accepted.append(mid)
+
+        else:
+            # custom / Ollama / LM Studio / OpenAI-compatible
+            mid = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            if capability == "text" and any(bad in low for bad in ("embed", "nomic-embed", "whisper", "tts")):
+                filtered_out += 1
+                continue
+            accepted.append(mid)
+
+    unique = list(dict.fromkeys(accepted))
+    if provider_id == "gemini":
+        unique = sorted(unique, key=_rank_gemini_model)
+    elif provider_id == "anthropic":
+        unique = sorted(unique, reverse=True)
+    else:
+        unique = sorted(unique)
+    return unique, filtered_out
+
+
+def discover_models_detailed(
+    provider_id: str,
+    api_key: str,
+    base_url: str = "",
+    *,
+    capability: str = "text",
+    connect_timeout: float = 8.0,
+    read_timeout: float = 20.0,
+    total_deadline: float = 40.0,
+    max_retries: int = 1,
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    request_fn: Optional[Callable[..., Any]] = None,
+    clock_fn: Optional[Callable[[], float]] = None,
+) -> Dict[str, Any]:
+    """
+    מבצע גילוי מודלים חי מול ה-endpoint הרשמי של הספק כולל Pagination וסינון לפי יכולת.
+    לעולם אינו מחזיר רשימת מודלים מומצאת כשיש כשל או תשובה ריקה.
+    """
+    stage = "גילוי מודלים"
     meta = PROVIDER_CATALOG.get(provider_id)
     if not meta:
-        raise ValueError(f"ספק לא מוכר: {provider_id}")
+        raise AICallError(f"ספק לא מוכר: {provider_id}", stage=stage, category="validation")
 
     key = (api_key or "").strip()
     if meta.get("requires_key", True) and not key:
-        raise ValueError("יש להזין מפתח API לפני בדיקת החיבור וגילוי המודלים.")
+        raise AICallError(
+            "יש להזין מפתח API תקין לפני שליפת המודלים הזמינים מהחברה.",
+            stage=stage,
+            category="auth",
+        )
 
     url_base = (base_url or meta["default_base_url"]).strip().rstrip("/")
-    req = _require_requests()
+    secrets = [key] if key else []
+    raw_items: List[Dict[str, Any]] = []
+    pages_fetched = 0
+    max_pages = 20
 
-    try:
-        if provider_id == "gemini":
-            resp = req.get(
-                f"{url_base}/models?pageSize=1000",
-                headers={"x-goog-api-key": key, "Accept": "application/json"},
-                timeout=timeout,
-            )
-            _raise_for_api_error("Google Gemini", resp)
-            data = resp.json()
-            models = []
-            for m in data.get("models", []):
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    mid = m.get("name", "")
-                    if mid.startswith("models/"):
-                        mid = mid[len("models/"):]
-                    low = mid.lower()
-                    if mid and not any(skip in low for skip in ("embedding", "aqa", "imagen", "veo", "tts", "audio", "robotics", "computer-use")):
-                        models.append(mid)
-            unique = sorted(set(models), key=_rank_gemini_model)
-            return unique or get_preset_models("gemini")
-
-        elif provider_id == "anthropic":
-            resp = req.get(
+    if provider_id == "gemini":
+        page_token: Optional[str] = None
+        seen_tokens = set()
+        while pages_fetched < max_pages:
+            _check_cancelled(cancel_event, stage)
+            params: Dict[str, Any] = {"pageSize": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            resp = execute_http_with_retry(
+                "GET",
                 f"{url_base}/models",
+                provider_name=meta["label"],
+                stage=stage,
+                headers={"x-goog-api-key": key, "Accept": "application/json"},
+                params=params,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                total_deadline=total_deadline,
+                max_retries=max_retries,
+                cancel_event=cancel_event,
+                progress_cb=progress_cb,
+                secrets=secrets,
+                request_fn=request_fn,
+                clock_fn=clock_fn,
+            )
+            data = resp.json() if hasattr(resp, "json") else {}
+            pages_fetched += 1
+            batch = data.get("models") or []
+            if isinstance(batch, list):
+                raw_items.extend([m for m in batch if isinstance(m, dict)])
+            next_tok = (data.get("nextPageToken") or "").strip()
+            if not next_tok or next_tok in seen_tokens:
+                break
+            seen_tokens.add(next_tok)
+            page_token = next_tok
+
+    elif provider_id == "anthropic":
+        after_id: Optional[str] = None
+        seen_cursors = set()
+        while pages_fetched < max_pages:
+            _check_cancelled(cancel_event, stage)
+            params = {"limit": 100}
+            if after_id:
+                params["after_id"] = after_id
+            resp = execute_http_with_retry(
+                "GET",
+                f"{url_base}/models",
+                provider_name=meta["label"],
+                stage=stage,
                 headers={
                     "x-api-key": key,
                     "anthropic-version": "2023-06-01",
                     "Accept": "application/json",
                 },
-                timeout=timeout,
+                params=params,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                total_deadline=total_deadline,
+                max_retries=max_retries,
+                cancel_event=cancel_event,
+                progress_cb=progress_cb,
+                secrets=secrets,
+                request_fn=request_fn,
+                clock_fn=clock_fn,
             )
-            _raise_for_api_error("Anthropic", resp)
-            data = resp.json()
-            models = [m.get("id") for m in data.get("data", []) if m.get("id")]
-            return sorted(set(models), reverse=True) or get_preset_models("anthropic")
+            data = resp.json() if hasattr(resp, "json") else {}
+            pages_fetched += 1
+            batch = data.get("data") or []
+            if isinstance(batch, list):
+                raw_items.extend([m for m in batch if isinstance(m, dict)])
+            has_more = bool(data.get("has_more"))
+            last_id = (data.get("last_id") or "").strip()
+            if not has_more or not last_id or last_id in seen_cursors:
+                break
+            seen_cursors.add(last_id)
+            after_id = last_id
 
-        else:
-            # OpenAI / OpenRouter / Groq / Custom OpenAI-compatible
-            headers = {"Accept": "application/json"}
-            if key:
-                headers["Authorization"] = f"Bearer {key}"
-            resp = req.get(f"{url_base}/models", headers=headers, timeout=timeout)
-            _raise_for_api_error(meta["label"], resp)
-            data = resp.json()
-            raw_list = data.get("data", []) if isinstance(data, dict) else []
-            models = [m.get("id") for m in raw_list if isinstance(m, dict) and m.get("id")]
-            if provider_id == "openai":
-                filtered = [
-                    m for m in models
-                    if any(pref in m for pref in ("gpt-", "o1", "o3", "o4", "chatgpt"))
-                    and not any(bad in m for bad in ("audio", "realtime", "transcribe", "tts", "image", "dall-e", "whisper"))
-                ]
-                models = filtered or models
-            return sorted(set(models)) or get_preset_models(provider_id)
+    else:
+        # OpenAI / OpenRouter / Groq / Custom OpenAI-compatible (+ Ollama /api/tags fallback)
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
 
-    except req.exceptions.Timeout:
-        raise RuntimeError(f"הבקשה אל {meta['label']} חרגה מזמן ההמתנה.")
-    except req.exceptions.RequestException as e:
-        raise RuntimeError(f"לא ניתן להתחבר אל {meta['label']}: {e}")
+        after_cursor: Optional[str] = None
+        seen_cursors = set()
+        ollama_checked = False
+
+        while pages_fetched < max_pages:
+            _check_cancelled(cancel_event, stage)
+            params = {"after": after_cursor} if after_cursor else None
+            try:
+                resp = execute_http_with_retry(
+                    "GET",
+                    f"{url_base}/models",
+                    provider_name=meta["label"],
+                    stage=stage,
+                    headers=headers,
+                    params=params,
+                    connect_timeout=connect_timeout,
+                    read_timeout=read_timeout,
+                    total_deadline=total_deadline,
+                    max_retries=max_retries,
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                    secrets=secrets,
+                    request_fn=request_fn,
+                    clock_fn=clock_fn,
+                )
+            except AICallError as err:
+                if provider_id == "custom" and err.status_code == 404 and not ollama_checked and pages_fetched == 0:
+                    ollama_checked = True
+                    root_url = url_base[:-3] if url_base.endswith("/v1") else url_base
+                    ollama_resp = execute_http_with_retry(
+                        "GET",
+                        f"{root_url}/api/tags",
+                        provider_name=meta["label"],
+                        stage=stage,
+                        headers=headers,
+                        connect_timeout=connect_timeout,
+                        read_timeout=read_timeout,
+                        total_deadline=total_deadline,
+                        max_retries=max_retries,
+                        cancel_event=cancel_event,
+                        progress_cb=progress_cb,
+                        secrets=secrets,
+                        request_fn=request_fn,
+                        clock_fn=clock_fn,
+                    )
+                    odata = ollama_resp.json() if hasattr(ollama_resp, "json") else {}
+                    pages_fetched += 1
+                    obatch = odata.get("models") or []
+                    if isinstance(obatch, list):
+                        raw_items.extend([m for m in obatch if isinstance(m, dict)])
+                    break
+                raise
+
+            data = resp.json() if hasattr(resp, "json") else {}
+            pages_fetched += 1
+            batch = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if isinstance(batch, list):
+                raw_items.extend([m for m in batch if isinstance(m, dict)])
+
+            has_more = isinstance(data, dict) and bool(data.get("has_more"))
+            last_id = (data.get("last_id") or "").strip() if isinstance(data, dict) else ""
+            if not last_id and isinstance(data, dict) and has_more and batch:
+                last_id = str((batch[-1] or {}).get("id") or "").strip()
+            if not has_more or not last_id or last_id in seen_cursors:
+                break
+            seen_cursors.add(last_id)
+            after_cursor = last_id
+
+    models, filtered_out = _filter_models_for_capability(provider_id, raw_items, capability=capability)
+    if not models:
+        raise AICallError(
+            f"הספק {meta['label']} לא החזיר מודלים תואמי טקסט/שיחה זמינים עבור מפתח זה "
+            f"(סוננו {filtered_out} מודלים לא-טקסטואליים).",
+            stage=stage,
+            category="empty",
+            retryable=True,
+        )
+
+    return {
+        "provider_id": provider_id,
+        "models": models,
+        "pages_fetched": pages_fetched,
+        "filtered_out": filtered_out,
+        "capability": capability,
+    }
+
+
+def discover_models(
+    provider_id: str,
+    api_key: str,
+    base_url: str = "",
+    timeout: Any = (8.0, 20.0),
+    capability: str = "text",
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    request_fn: Optional[Callable[..., Any]] = None,
+    clock_fn: Optional[Callable[[], float]] = None,
+) -> List[str]:
+    if isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+        conn_t, read_t = float(timeout[0]), float(timeout[1])
+    else:
+        conn_t = min(8.0, float(timeout or 20.0))
+        read_t = float(timeout or 20.0)
+
+    res = discover_models_detailed(
+        provider_id=provider_id,
+        api_key=api_key,
+        base_url=base_url,
+        capability=capability,
+        connect_timeout=conn_t,
+        read_timeout=read_t,
+        total_deadline=max(20.0, read_t * 2.0),
+        cancel_event=cancel_event,
+        progress_cb=progress_cb,
+        request_fn=request_fn,
+        clock_fn=clock_fn,
+    )
+    return res["models"]
 
 
 def chat_completion(
@@ -214,26 +785,56 @@ def chat_completion(
     json_mode: bool = False,
     temperature: float = 0.25,
     max_tokens: int = 8192,
-    timeout: int = 90,
+    timeout: Any = None,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 40.0,
+    total_deadline: float = 120.0,
+    max_retries: int = 2,
+    cancel_event: Any = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+    stage: str = "קריאת AI",
+    request_fn: Optional[Callable[..., Any]] = None,
+    clock_fn: Optional[Callable[[], float]] = None,
 ) -> str:
     """
-    קריאה אחידה להפקת טקסט או JSON בכל אחד מספקי ה-AI הנתמכים.
+    קריאה אחידה ומבוקרת לספק AI עם:
+    - connect/read timeout מופרדים + deadline כולל + retry/backoff רק לכשלים זמניים
+    - ביטול מיידי גם בזמן המתנה
+    - ללא החלפת מודל שקטה!
     """
+    _check_cancelled(cancel_event, stage)
     meta = PROVIDER_CATALOG.get(provider_id)
     if not meta:
-        raise ValueError(f"ספק AI לא מוכר: {provider_id}")
+        raise AICallError(f"ספק AI לא מוכר: {provider_id}", stage=stage, category="validation")
 
     key = (api_key or "").strip()
     if meta.get("requires_key", True) and not key:
-        raise ValueError(f"לא הוגדר מפתח API עבור {meta['label']}. פתח 'הגדרות AI' והזן מפתח.")
+        raise AICallError(
+            f"לא הוגדר מפתח API עבור {meta['label']} בשלב '{stage}'. פתח 'הגדרות AI ומודלים' והזן מפתח.",
+            stage=stage,
+            category="auth",
+        )
 
-    selected_model = (model or "").strip() or get_preset_models(provider_id)[0]
+    selected_model = (model or "").strip()
+    if not selected_model:
+        raise AICallError(
+            f"לא נבחר מודל AI פעיל עבור {meta['label']} בשלב '{stage}'. פתח 'הגדרות AI ומודלים' ובחר מודל מהרשימה.",
+            stage=stage,
+            category="validation",
+        )
+
+    if timeout is not None:
+        if isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+            connect_timeout = float(timeout[0])
+            read_timeout = float(timeout[1])
+        else:
+            read_timeout = float(timeout)
+            connect_timeout = min(connect_timeout, read_timeout)
+
     url_base = (base_url or meta["default_base_url"]).strip().rstrip("/")
+    secrets = [key] if key else []
 
     if provider_id == "gemini":
-        import re
-        import time
-
         gen_cfg: Dict[str, Any] = {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
@@ -247,58 +848,36 @@ def chat_completion(
             "generationConfig": gen_cfg,
         }
 
-        req = _require_requests()
-
-        def _post_gemini(target_model: str) -> Any:
-            return req.post(
-                f"{url_base}/models/{target_model}:generateContent",
-                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                json=payload,
-                timeout=timeout,
-            )
-
-        resp = _post_gemini(selected_model)
-
-        # אם יש עומס זמני (503/429/500), ממתינים 1.5 שניות ומנסים שוב, ואם עדיין נכשל עוברים למודל חלופי חי בחשבון
-        if resp.status_code in (429, 500, 502, 503, 504):
-            time.sleep(1.5)
-            resp = _post_gemini(selected_model)
-
-        if resp.status_code == 404 or resp.status_code in (500, 502, 503, 504):
-            body_txt = resp.text or ""
-            m_rec = re.search(r"use\s+models/([a-zA-Z0-9._-]+)", body_txt, flags=re.IGNORECASE)
-            candidates_try = []
-            if m_rec and m_rec.group(1) != selected_model:
-                candidates_try.append(m_rec.group(1))
-            for preset in ("gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-3.8-pro"):
-                if preset != selected_model and preset not in candidates_try:
-                    candidates_try.append(preset)
-
-            # אם עדיין 503/404, ננסה גם לשלוף רשימה חיה מהחשבון
-            try:
-                live_models = discover_models("gemini", key, url_base, timeout=10)
-                for lm in live_models[:5]:
-                    if lm != selected_model and lm not in candidates_try:
-                        candidates_try.append(lm)
-            except Exception:
-                pass
-
-            for cand in candidates_try[:4]:
-                alt_resp = _post_gemini(cand)
-                if alt_resp.ok:
-                    resp = alt_resp
-                    break
-
-        _raise_for_api_error("Google Gemini", resp)
+        resp = execute_http_with_retry(
+            "POST",
+            f"{url_base}/models/{selected_model}:generateContent",
+            provider_name="Google Gemini",
+            stage=stage,
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json_body=payload,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            total_deadline=total_deadline,
+            max_retries=max_retries,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+            selected_model=selected_model,
+            secrets=secrets,
+            request_fn=request_fn,
+            clock_fn=clock_fn,
+        )
         data = resp.json()
         candidates = data.get("candidates", [])
         if not candidates:
-            raise RuntimeError("Gemini לא החזיר תשובה (אולי נחסם ע\"י מסנן בטיחות).")
+            raise AICallError(
+                f"Gemini ({selected_model}) לא החזיר תוכן בשלב '{stage}' (ייתכן שנחסם ע\"י מסנן בטיחות). נסה שוב או בדוק את הטקסט.",
+                stage=stage,
+                category="invalid_response",
+            )
         parts = candidates[0].get("content", {}).get("parts", [])
         return "".join(p.get("text", "") for p in parts).strip()
 
     elif provider_id == "anthropic":
-        req = _require_requests()
         payload = {
             "model": selected_model,
             "max_tokens": min(max_tokens, 8192),
@@ -306,24 +885,33 @@ def chat_completion(
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        resp = req.post(
+        resp = execute_http_with_retry(
+            "POST",
             f"{url_base}/messages",
+            provider_name="Anthropic Claude",
+            stage=stage,
             headers={
                 "x-api-key": key,
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
             },
-            json=payload,
-            timeout=timeout,
+            json_body=payload,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            total_deadline=total_deadline,
+            max_retries=max_retries,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+            selected_model=selected_model,
+            secrets=secrets,
+            request_fn=request_fn,
+            clock_fn=clock_fn,
         )
-        _raise_for_api_error("Anthropic Claude", resp)
         data = resp.json()
         blocks = data.get("content", [])
         return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
     else:
-        req = _require_requests()
-        # OpenAI / OpenRouter / Groq / Custom OpenAI-compatible
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
@@ -339,21 +927,35 @@ def chat_completion(
                 {"role": "user", "content": user_prompt},
             ],
         }
-        # לחלק מהמודלים המקומיים/מותאמים response_format עלול להיתקע, אז מפעילים בבטחה איפה שנתמך
         if json_mode and provider_id in ("openai", "groq"):
             payload["response_format"] = {"type": "json_object"}
 
-        resp = req.post(
+        resp = execute_http_with_retry(
+            "POST",
             f"{url_base}/chat/completions",
+            provider_name=meta["label"],
+            stage=stage,
             headers=headers,
-            json=payload,
-            timeout=timeout,
+            json_body=payload,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            total_deadline=total_deadline,
+            max_retries=max_retries,
+            cancel_event=cancel_event,
+            progress_cb=progress_cb,
+            selected_model=selected_model,
+            secrets=secrets,
+            request_fn=request_fn,
+            clock_fn=clock_fn,
         )
-        _raise_for_api_error(meta["label"], resp)
         data = resp.json()
         choices = data.get("choices", [])
         if not choices:
-            raise RuntimeError(f"{meta['label']} לא החזיר תשובה.")
+            raise AICallError(
+                f"{meta['label']} ({selected_model}) לא החזיר תשובה בשלב '{stage}'. נסה שוב.",
+                stage=stage,
+                category="invalid_response",
+            )
         return (choices[0].get("message", {}).get("content") or "").strip()
 
 
@@ -376,28 +978,3 @@ def extract_json_object(raw_text: str) -> Dict[str, Any]:
         if start != -1 and end > start:
             return json.loads(txt[start:end + 1])
         raise
-
-
-def _raise_for_api_error(provider_name: str, resp: Any) -> None:
-    if resp.ok:
-        return
-    code = resp.status_code
-    detail = ""
-    try:
-        err_json = resp.json()
-        if isinstance(err_json, dict):
-            detail = (
-                err_json.get("error", {}).get("message")
-                if isinstance(err_json.get("error"), dict)
-                else str(err_json.get("error") or err_json.get("message") or "")
-            )
-    except Exception:
-        detail = (resp.text or "")[:250]
-
-    if code == 401:
-        raise RuntimeError(f"{provider_name} דחה את המפתח (401). בדוק שמפתח ה-API תקין.")
-    if code == 403:
-        raise RuntimeError(f"הגישה אל {provider_name} נדחתה (403). {detail}")
-    if code == 429:
-        raise RuntimeError(f"חריגה ממכסת הבקשות של {provider_name} (429). {detail}")
-    raise RuntimeError(f"שגיאת {provider_name} (HTTP {code}): {detail}")

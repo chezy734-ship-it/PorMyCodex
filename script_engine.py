@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 מנוע יצירת תסריט AI (Script Studio) עבור PorMyCodex.
-מייצר תסריט מלא המכסה 100% מיחידות הטקסט (ללא חיתוך/קיצור של פרקים ארוכים),
-תומך בהעשרת ידע מוויקיפדיה, ביטול נקי (cancel_event), ואימות שלמות מלא.
+- מייצר תסריט מלא המכסה 100% מיחידות הטקסט (ללא חיתוך [:80] וללא דילוג שקט)
+- מחלק לאצוות מוגבלות משפטים וגם תווים כדי למנוע Read Timeout בפרקים ארוכים
+- תומך בהעשרת ידע מוויקיפדיה, ביטול מיידי (גם באמצע Retry/Backoff), ואימות שלמות מלא
 """
 
 from typing import List, Dict, Any, Optional, Callable
 from settings_manager import load_settings, get_active_provider_config
-from ai_providers import chat_completion, extract_json_object, get_provider_label
+from ai_providers import (
+    AICancelledError,
+    chat_completion,
+    extract_json_object,
+    get_provider_label,
+)
 from book_loader import split_into_sentences
 
 
@@ -21,12 +27,52 @@ SPEAKER_DISPLAY = {
     "narrator": "🎙️ מספר",
 }
 
-UNITS_PER_SCRIPT_BATCH = 45
+UNITS_PER_SCRIPT_BATCH = 18
+MAX_CHARS_PER_SCRIPT_BATCH = 2200
 
 
 def _check_cancelled(cancel_event: Any = None) -> None:
     if cancel_event is not None and cancel_event.is_set():
-        raise ScriptCancelledError("יצירת התסריט בוטלה על ידי המשתמש.")
+        raise ScriptCancelledError("שלב 'יצירת תסריט AI': הפעולה בוטלה על ידי המשתמש.")
+
+
+def _build_script_batches(
+    units: List[Dict[str, str]],
+    max_units: int = UNITS_PER_SCRIPT_BATCH,
+    max_chars: int = MAX_CHARS_PER_SCRIPT_BATCH,
+) -> List[List[Dict[str, str]]]:
+    batches: List[List[Dict[str, str]]] = []
+    cur: List[Dict[str, str]] = []
+    cur_chars = 0
+    for u in units:
+        u_len = len(u["text"])
+        if cur and (len(cur) >= max_units or cur_chars + u_len > max_chars):
+            batches.append(cur)
+            cur = [u]
+            cur_chars = u_len
+        else:
+            cur.append(u)
+            cur_chars += u_len
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def _call_chat(caller: Callable[..., str], **kwargs) -> str:
+    try:
+        return caller(**kwargs)
+    except TypeError:
+        compact_keys = (
+            "provider_id",
+            "api_key",
+            "model",
+            "system_prompt",
+            "user_prompt",
+            "base_url",
+            "json_mode",
+            "temperature",
+        )
+        return caller(**{k: v for k, v in kwargs.items() if k in compact_keys})
 
 
 def generate_narration_script(
@@ -41,16 +87,18 @@ def generate_narration_script(
     progress_cb: Optional[Callable[[str], None]] = None,
     chat_fn: Optional[Callable[..., str]] = None,
     wiki_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
+    units_per_batch: int = UNITS_PER_SCRIPT_BATCH,
+    max_chars_per_batch: int = MAX_CHARS_PER_SCRIPT_BATCH,
 ) -> Dict[str, Any]:
     """
-    יוצר תסריט מובנה המכסה את כלל המשפטים של הפרק (באצוות אם הפרק ארוך).
+    יוצר תסריט מובנה המכסה 100% ממשפטי הפרק באצוות בטוחות מוגבלות זיכרון וזמן.
     כשל או ביטול בכל אצווה מפסיקים את התהליך מיד ואינם מחזירים תסריט חלקי כהצלחה.
     """
     _check_cancelled(cancel_event)
 
     clean_text = (text or "").strip()
     if not clean_text:
-        raise ValueError("אין טקסט בפרק ליצירת תסריט.")
+        raise ValueError("שלב 'יצירת תסריט AI': אין טקסט בפרק ליצירת תסריט.")
 
     cfg = settings or load_settings()
     pconf = get_active_provider_config(cfg)
@@ -59,11 +107,10 @@ def generate_narration_script(
     api_key = pconf.get("api_key", "")
     caller = chat_fn or chat_completion
 
-    # בדיקה מוקדמת אם יש מפתח (פרט לשרת מקומי כמו Ollama או מוק בבדיקות)
     if chat_fn is None and not api_key and pid != "custom":
         raise ValueError(
-            f"לא הוגדר מפתח API עבור {get_provider_label(pid)}.\n"
-            "לחץ בסרגל הכלים על '⚙️ הגדרות AI ומודלים' כדי להכניס מפתח API של גוגל, OpenAI, Claude או OpenRouter."
+            f"שלב 'יצירת תסריט AI': לא הוגדר מפתח API עבור {get_provider_label(pid)}.\n"
+            "לחץ בסרגל הכלים על '⚙️ הגדרות AI ומודלים' כדי להזין מפתח ולבחור מודל."
         )
 
     wiki_articles: List[Dict[str, str]] = []
@@ -88,14 +135,14 @@ def generate_narration_script(
             if wiki_data.get("context_text"):
                 wiki_section = (
                     "\n\n--- רקע אנציקלופדי מאומת מוויקיפדיה להעשרת ההסברים (שלב עובדות רלוונטיות בלבד) ---\n"
-                    + wiki_data["context_text"][:4000]
+                    + wiki_data["context_text"][:3500]
                 )
         except Exception:
             wiki_articles = []
 
     sentences = split_into_sentences(clean_text)
     if not sentences:
-        raise ValueError("לא נמצאו משפטים תקינים ליצירת תסריט.")
+        raise ValueError("שלב 'יצירת תסריט AI': לא נמצאו משפטים תקינים ליצירת תסריט.")
 
     all_units = [{"unitId": f"u{i + 1}", "text": s} for i, s in enumerate(sentences)]
 
@@ -124,10 +171,7 @@ def generate_narration_script(
         '{"title": "כותרת קצרה לתסריט", "lines": [{"unitId": "u1", "speakerRole": "teacher|student|narrator", "style": "סגנון הגשה", "text": "טקסט השורה בעברית מנוקדת/ברורה לקריאה", "needsReview": false}]}'
     )
 
-    batches = [
-        all_units[i:i + UNITS_PER_SCRIPT_BATCH]
-        for i in range(0, len(all_units), UNITS_PER_SCRIPT_BATCH)
-    ]
+    batches = _build_script_batches(all_units, max_units=units_per_batch, max_chars=max_chars_per_batch)
     total_batches = len(batches)
 
     normalized_lines: List[Dict[str, Any]] = []
@@ -137,7 +181,9 @@ def generate_narration_script(
     for batch_idx, batch_units in enumerate(batches, 1):
         _check_cancelled(cancel_event)
         if progress_cb:
-            progress_cb(f"יוצר תסריט AI (חלק {batch_idx} מתוך {total_batches})...")
+            progress_cb(
+                f"יוצר תסריט AI (חלק {batch_idx} מתוך {total_batches}, {len(batch_units)} משפטים)..."
+            )
 
         user_prompt = (
             f"שם הספר: {book_title or 'ללא שם'}\n"
@@ -148,16 +194,28 @@ def generate_narration_script(
             + (wiki_section if batch_idx == 1 else "")
         )
 
-        raw_response = caller(
-            provider_id=pid,
-            api_key=api_key,
-            model=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            base_url=pconf.get("base_url", ""),
-            json_mode=True,
-            temperature=0.35,
-        )
+        try:
+            raw_response = _call_chat(
+                caller,
+                provider_id=pid,
+                api_key=api_key,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                base_url=pconf.get("base_url", ""),
+                json_mode=True,
+                temperature=0.35,
+                connect_timeout=10.0,
+                read_timeout=45.0,
+                total_deadline=135.0,
+                max_retries=2,
+                cancel_event=cancel_event,
+                progress_cb=progress_cb,
+                stage=f"יצירת תסריט AI (חלק {batch_idx}/{total_batches})",
+            )
+        except AICancelledError as e:
+            raise ScriptCancelledError(str(e)) from e
+
         _check_cancelled(cancel_event)
 
         parsed = extract_json_object(raw_response)
@@ -166,7 +224,9 @@ def generate_narration_script(
 
         raw_lines = parsed.get("lines", [])
         if not isinstance(raw_lines, list) or not raw_lines:
-            raise RuntimeError(f"המודל לא החזיר שורות תסריט תקינות עבור חלק {batch_idx} מתוך {total_batches}.")
+            raise RuntimeError(
+                f"שלב 'יצירת תסריט AI': המודל לא החזיר שורות תסריט תקינות עבור חלק {batch_idx} מתוך {total_batches}."
+            )
 
         batch_valid_lines: List[Dict[str, Any]] = []
         expected_ids = [u["unitId"] for u in batch_units]
@@ -194,25 +254,23 @@ def generate_narration_script(
             })
 
         if not batch_valid_lines:
-            raise RuntimeError(f"התסריט שהתקבל בחלק {batch_idx} ריק.")
+            raise RuntimeError(f"שלב 'יצירת תסריט AI': התסריט שהתקבל בחלק {batch_idx} ריק.")
 
-        # אם חלק מהיחידות בחלק זה הושמטו, מאמתים שכל היחידות מיוצגות בתסריט
         missing_in_batch = [u["unitId"] for u in batch_units if u["unitId"] not in covered_units]
         if missing_in_batch and len(batch_valid_lines) >= len(batch_units):
-            # מיפוי רציף ליחידות החסרות במקרה שהמודל שמר על תוכן אך לא מספור unitId
             for uid in missing_in_batch:
                 covered_units.add(uid)
 
         still_missing = [u["unitId"] for u in batch_units if u["unitId"] not in covered_units]
         if still_missing:
             raise RuntimeError(
-                f"המודל החזיר תסריט חלקי בחלק {batch_idx} (חסרות יחידות: {', '.join(still_missing[:5])})."
+                f"שלב 'יצירת תסריט AI': המודל החזיר תסריט חלקי בחלק {batch_idx} (חסרות יחידות: {', '.join(still_missing[:5])})."
             )
 
         normalized_lines.extend(batch_valid_lines)
 
     if not normalized_lines or len(covered_units) < len(all_units):
-        raise RuntimeError("התסריט שהתקבל חלקי ואינו מכסה את כל משפטֵי הפרק.")
+        raise RuntimeError("שלב 'יצירת תסריט AI': התסריט שהתקבל חלקי ואינו מכסה את כל משפטֵי הפרק.")
 
     return {
         "title": script_title or f"תסריט - {book_title}",

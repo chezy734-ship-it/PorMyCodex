@@ -246,6 +246,11 @@ def enrich_with_wikipedia_and_ai(
                 base_url=pconf.get("base_url", ""),
                 json_mode=False,
                 temperature=0.3,
+                connect_timeout=8.0,
+                read_timeout=30.0,
+                total_deadline=60.0,
+                max_retries=1,
+                stage="מחקר ויקיפדיה והרחבת AI",
             )
         except Exception as e:
             ai_expansion = f"*(הרחבת AI לא הושלמה: {e} — מוצג תקציר ויקיפדיה ישיר)*"
