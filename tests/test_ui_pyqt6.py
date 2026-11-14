@@ -94,10 +94,9 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
 
         # הקלדה/הדבקה של מפתח ישן -> גילוי -> תוך כדי מחליפים מפתח מהר למפתח החדש!
         dlg.txt_api_key.setText("OLD_KEY")
-        # מריץ תור ישן ומוודא שמייד אחר כך מחליפים מפתח לפני שתשובה ישנה חוזרת
-        dlg.start_model_discovery(auto_triggered=False)
+        dlg.btn_discover.click()
         dlg.txt_api_key.setText(secret_key)
-        dlg.start_model_discovery(auto_triggered=False)
+        dlg._run_model_discovery()
 
         ok = self._pump_events_until(
             lambda: "gemini-2.5-flash" in [dlg.combo_model.itemText(i) for i in range(dlg.combo_model.count())],
@@ -111,7 +110,7 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
         self.assertNotIn("stale-gemini-old", items)
         self.assertTrue(dlg.combo_model.isEnabled())
 
-        # בדיקת debounce אוטומטי בהחלפת חברה (OpenAI)
+        # בדיקת רענון עם כפתור הרענון והחלפת חברה (OpenAI) + debounce אוטומטי
         openai_idx = dlg.combo_provider.findData("openai")
         dlg.combo_provider.setCurrentIndex(openai_idx)
         dlg.txt_api_key.setText("sk-live-openai-test-123456")
@@ -128,7 +127,7 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
 
         def error_discover(provider_id, api_key, base_url, cancel_event=None):
             raise AICallError(
-                f"השרת Google Gemini לא החזיר תשובה בזמן (Read Timeout=15s)",
+                "השרת Google Gemini לא החזיר תשובה בזמן (Read Timeout=15s)",
                 stage="גילוי מודלים",
                 category="timeout",
             )
@@ -136,7 +135,7 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
         dlg = SettingsDialog(None, settings, discovery_fn=error_discover)
         dlg.show()
         dlg.txt_api_key.setText(secret_key)
-        dlg.start_model_discovery(auto_triggered=False)
+        dlg.btn_discover.click()
 
         ok = self._pump_events_until(lambda: "Timeout" in dlg.lbl_discovery_status.text(), timeout_sec=3.0)
         self.assertTrue(ok)
@@ -144,6 +143,7 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
         self.assertIn("תקלת רשת/עומס", status_txt)
         self.assertNotIn(secret_key, status_txt)
         self.assertEqual(dlg.combo_model.count(), 0)
+        self.assertTrue(dlg.btn_discover.isEnabled())
         dlg.close()
 
     def test_03_whole_book_dialogs_and_mainwindow_scope_wiring(self):
