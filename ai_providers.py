@@ -12,7 +12,16 @@
 
 from typing import List, Dict, Any, Optional
 import json
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore
+
+
+def _require_requests():
+    if requests is None:
+        raise RuntimeError("חבילת 'requests' אינה מותקנת בסביבה זו.")
+    return requests
 
 PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
     "gemini": {
@@ -131,10 +140,11 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
         raise ValueError("יש להזין מפתח API לפני בדיקת החיבור וגילוי המודלים.")
 
     url_base = (base_url or meta["default_base_url"]).strip().rstrip("/")
+    req = _require_requests()
 
     try:
         if provider_id == "gemini":
-            resp = requests.get(
+            resp = req.get(
                 f"{url_base}/models?pageSize=1000",
                 headers={"x-goog-api-key": key, "Accept": "application/json"},
                 timeout=timeout,
@@ -155,7 +165,7 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
             return unique or get_preset_models("gemini")
 
         elif provider_id == "anthropic":
-            resp = requests.get(
+            resp = req.get(
                 f"{url_base}/models",
                 headers={
                     "x-api-key": key,
@@ -174,7 +184,7 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
             headers = {"Accept": "application/json"}
             if key:
                 headers["Authorization"] = f"Bearer {key}"
-            resp = requests.get(f"{url_base}/models", headers=headers, timeout=timeout)
+            resp = req.get(f"{url_base}/models", headers=headers, timeout=timeout)
             _raise_for_api_error(meta["label"], resp)
             data = resp.json()
             raw_list = data.get("data", []) if isinstance(data, dict) else []
@@ -188,9 +198,9 @@ def discover_models(provider_id: str, api_key: str, base_url: str = "", timeout:
                 models = filtered or models
             return sorted(set(models)) or get_preset_models(provider_id)
 
-    except requests.exceptions.Timeout:
+    except req.exceptions.Timeout:
         raise RuntimeError(f"הבקשה אל {meta['label']} חרגה מזמן ההמתנה.")
-    except requests.exceptions.RequestException as e:
+    except req.exceptions.RequestException as e:
         raise RuntimeError(f"לא ניתן להתחבר אל {meta['label']}: {e}")
 
 
@@ -237,8 +247,10 @@ def chat_completion(
             "generationConfig": gen_cfg,
         }
 
-        def _post_gemini(target_model: str) -> requests.Response:
-            return requests.post(
+        req = _require_requests()
+
+        def _post_gemini(target_model: str) -> Any:
+            return req.post(
                 f"{url_base}/models/{target_model}:generateContent",
                 headers={"x-goog-api-key": key, "Content-Type": "application/json"},
                 json=payload,
@@ -286,6 +298,7 @@ def chat_completion(
         return "".join(p.get("text", "") for p in parts).strip()
 
     elif provider_id == "anthropic":
+        req = _require_requests()
         payload = {
             "model": selected_model,
             "max_tokens": min(max_tokens, 8192),
@@ -293,7 +306,7 @@ def chat_completion(
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        resp = requests.post(
+        resp = req.post(
             f"{url_base}/messages",
             headers={
                 "x-api-key": key,
@@ -309,6 +322,7 @@ def chat_completion(
         return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
     else:
+        req = _require_requests()
         # OpenAI / OpenRouter / Groq / Custom OpenAI-compatible
         headers = {"Content-Type": "application/json"}
         if key:
@@ -329,7 +343,7 @@ def chat_completion(
         if json_mode and provider_id in ("openai", "groq"):
             payload["response_format"] = {"type": "json_object"}
 
-        resp = requests.post(
+        resp = req.post(
             f"{url_base}/chat/completions",
             headers=headers,
             json=payload,
@@ -364,7 +378,7 @@ def extract_json_object(raw_text: str) -> Dict[str, Any]:
         raise
 
 
-def _raise_for_api_error(provider_name: str, resp: requests.Response) -> None:
+def _raise_for_api_error(provider_name: str, resp: Any) -> None:
     if resp.ok:
         return
     code = resp.status_code

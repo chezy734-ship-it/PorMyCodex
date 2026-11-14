@@ -11,16 +11,22 @@
 
 import os
 import json
+import tempfile
 from copy import deepcopy
 from typing import Dict, Any
 
 
 def get_settings_dir() -> str:
+    override = (os.environ.get("PORMYCODEX_DATA_DIR") or "").strip()
+    if override:
+        path = os.path.abspath(override)
+        os.makedirs(path, exist_ok=True)
+        return path
     if os.name == "nt":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    path = os.path.join(base, "PorMyCodex")
+    path = os.path.abspath(os.path.join(base, "PorMyCodex"))
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -131,8 +137,23 @@ def load_settings() -> Dict[str, Any]:
 def save_settings(settings: Dict[str, Any]) -> None:
     path = get_settings_path()
     clean = _deep_merge(DEFAULT_SETTINGS, settings)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    raw = json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_settings_", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def get_active_provider_config(settings: Dict[str, Any] = None) -> Dict[str, Any]:

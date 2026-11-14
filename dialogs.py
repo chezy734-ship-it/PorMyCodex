@@ -541,3 +541,197 @@ class WikiSearchDialog(QDialog):
             "lang": self.combo_lang.currentData(),
             "use_ai": self.radio_ai_enrich.isChecked(),
         }
+
+
+class ExportPipelineDialog(QDialog):
+    """
+    דיאלוג יצוא נאכף: מציג ומריץ בסדר קשיח
+    תרגום כל המשפטים הדרושים -> תסריט מלא ועדכני -> TTS -> יצוא.
+    אינו מאפשר עקיפה או שימוש בתוצרים ישנים.
+    """
+
+    def __init__(
+        self,
+        parent=None,
+        book_id: str = "",
+        chapter_index: int = 0,
+        source_text: str = "",
+        settings: Optional[Dict[str, Any]] = None,
+        store: Any = None,
+        default_voice: str = "edge_avri",
+        default_speed: float = 1.0,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("🎧 יצוא ספר קולי מלא (תרגום ← תסריט ← TTS ← יצוא)")
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.resize(610, 560)
+        self.book_id = book_id
+        self.chapter_index = chapter_index
+        self.source_text = source_text
+        self.settings = settings or load_settings()
+        self.store = store
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        lbl_info = QLabel(
+            "שירות היצוא אוכף את מלוא הצינור בסדר קשיח ללא עקיפה:\n"
+            "<b>1. תרגום כל המשפטים הדרושים ← 2. תסריט AI מלא ועדכני ← 3. סינתזת TTS ← 4. שמירה אטומית</b>"
+        )
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("background-color: #1e293b; padding: 10px 12px; border-radius: 8px; color: #fbbf24;")
+        layout.addWidget(lbl_info)
+
+        # שלב 1: הגדרות תרגום
+        grp_trans = QGroupBox("שלב 1 — תרגום כל המשפטים הדרושים")
+        form_t = QFormLayout(grp_trans)
+        t_cfg = self.settings.get("translation", {})
+
+        self.combo_engine = QComboBox()
+        for eid, elabel in TRANSLATION_ENGINES:
+            self.combo_engine.addItem(elabel, eid)
+        idx = self.combo_engine.findData(t_cfg.get("engine", "google_free"))
+        if idx >= 0:
+            self.combo_engine.setCurrentIndex(idx)
+        self.combo_engine.currentIndexChanged.connect(self._refresh_readiness)
+        form_t.addRow("מנוע תרגום:", self.combo_engine)
+
+        lang_row = QHBoxLayout()
+        self.combo_src = QComboBox()
+        self.combo_tgt = QComboBox()
+        for code, label in LANGUAGE_OPTIONS:
+            self.combo_src.addItem(label, code)
+            if code != "auto":
+                self.combo_tgt.addItem(label, code)
+        self.combo_src.setCurrentIndex(max(0, self.combo_src.findData(t_cfg.get("source_lang", "auto"))))
+        self.combo_tgt.setCurrentIndex(max(0, self.combo_tgt.findData(t_cfg.get("target_lang", "he"))))
+        self.combo_src.currentIndexChanged.connect(self._refresh_readiness)
+        self.combo_tgt.currentIndexChanged.connect(self._refresh_readiness)
+        lang_row.addWidget(QLabel("מקור:"))
+        lang_row.addWidget(self.combo_src, 1)
+        lang_row.addWidget(QLabel("יעד:"))
+        lang_row.addWidget(self.combo_tgt, 1)
+        form_t.addRow("שפות:", lang_row)
+        layout.addWidget(grp_trans)
+
+        # שלב 2: הגדרות תסריט
+        grp_script = QGroupBox("שלב 2 — תסריט AI מלא ועדכני")
+        form_s = QVBoxLayout(grp_script)
+        mode_row = QHBoxLayout()
+        self.radio_edu = QRadioButton("🎓 לימודי (מורה ותלמיד)")
+        self.radio_edu.setChecked(True)
+        self.radio_dramatic = QRadioButton("🎭 דרמטי (קריינות)")
+        self.radio_edu.toggled.connect(self._refresh_readiness)
+        mode_row.addWidget(self.radio_edu)
+        mode_row.addWidget(self.radio_dramatic)
+        form_s.addLayout(mode_row)
+
+        self.txt_instruction = QLineEdit()
+        self.txt_instruction.setPlaceholderText("הנחיה נוספת לתסריט (אופציונלי)")
+        self.txt_instruction.textChanged.connect(self._refresh_readiness)
+        form_s.addWidget(self.txt_instruction)
+
+        wiki_row = QHBoxLayout()
+        self.chk_wiki = QCheckBox("🌐 העשר מוויקיפדיה")
+        self.chk_wiki.toggled.connect(self._refresh_readiness)
+        self.txt_wiki_terms = QLineEdit()
+        self.txt_wiki_terms.setPlaceholderText("מושגים מופרדים בפסיק (ריק = אוטומטי)")
+        self.txt_wiki_terms.setEnabled(False)
+        self.chk_wiki.toggled.connect(self.txt_wiki_terms.setEnabled)
+        self.txt_wiki_terms.textChanged.connect(self._refresh_readiness)
+        wiki_row.addWidget(self.chk_wiki)
+        wiki_row.addWidget(self.txt_wiki_terms, 1)
+        form_s.addLayout(wiki_row)
+        layout.addWidget(grp_script)
+
+        # שלב 3 ו-4: TTS ויצוא
+        grp_tts = QGroupBox("שלבים 3–4 — סינתזת TTS ופורמט יצוא")
+        form_a = QFormLayout(grp_tts)
+        self.combo_format = QComboBox()
+        self.combo_format.addItem("🎵 קובץ MP3 איכותי (Edge-TTS רב-קולי)", "mp3")
+        self.combo_format.addItem("🔊 קובץ WAV אופליין (Windows SAPI5)", "wav")
+        form_a.addRow("פורמט שמע:", self.combo_format)
+
+        self.combo_voice = QComboBox()
+        self.combo_voice.addItem("קול עברית - אברי (Edge-TTS)", "edge_avri")
+        self.combo_voice.addItem("קול עברית - הילה (Edge-TTS)", "edge_hila")
+        self.combo_voice.addItem("מנוע מקומי Windows (SAPI5)", "sapi5")
+        v_idx = self.combo_voice.findData(default_voice)
+        if v_idx >= 0:
+            self.combo_voice.setCurrentIndex(v_idx)
+        form_a.addRow("קול ברירת מחדל:", self.combo_voice)
+        self.default_speed = float(default_speed)
+        layout.addWidget(grp_tts)
+
+        # חיווי עדכניות חי (ללא תוצרים ישנים)
+        grp_status = QGroupBox("סטטוס עדכניות (תוצרים שהתיישנו יחודשו אוטומטית)")
+        st_lay = QVBoxLayout(grp_status)
+        self.lbl_stage1_status = QLabel("")
+        self.lbl_stage2_status = QLabel("")
+        self.lbl_stage1_status.setWordWrap(True)
+        self.lbl_stage2_status.setWordWrap(True)
+        st_lay.addWidget(self.lbl_stage1_status)
+        st_lay.addWidget(self.lbl_stage2_status)
+        layout.addWidget(grp_status)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("ביטול")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_go = QPushButton("🚀 הפעל יצוא מלא")
+        btn_go.setObjectName("primaryBtn")
+        btn_go.clicked.connect(self.accept)
+        btn_row.addWidget(btn_go)
+        layout.addLayout(btn_row)
+
+        self._refresh_readiness()
+
+    def _refresh_readiness(self):
+        from export_pipeline import assess_chapter_pipeline
+
+        opts = self.get_options()
+        status = assess_chapter_pipeline(
+            book_id=self.book_id,
+            chapter_index=self.chapter_index,
+            source_text=self.source_text,
+            settings=self.settings,
+            translation_opts=opts["translation_opts"],
+            script_opts=opts["script_opts"],
+            tts_opts=opts["tts_opts"],
+            store=self.store,
+        )
+        if status["translation_ready"]:
+            self.lbl_stage1_status.setStyleSheet("color: #34d399; font-size: 12px;")
+            self.lbl_stage1_status.setText("✅ שלב 1 (תרגום כל המשפטים): עדכני ושלם בתיקיית המשתמש.")
+        else:
+            self.lbl_stage1_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+            self.lbl_stage1_status.setText(f"⚠️ שלב 1 (תרגום): {status['translation_reason']} — יבוצע לפני יצירת התסריט.")
+
+        if status["script_ready"]:
+            self.lbl_stage2_status.setStyleSheet("color: #34d399; font-size: 12px;")
+            self.lbl_stage2_status.setText("✅ שלב 2 (תסריט AI מלא): עדכני ותואם לתרגום ולהגדרות.")
+        else:
+            self.lbl_stage2_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+            self.lbl_stage2_status.setText(f"⚠️ שלב 2 (תסריט): {status['script_reason']} — ייווצר מחדש לפני ה-TTS.")
+
+    def get_options(self) -> Dict[str, Any]:
+        return {
+            "translation_opts": {
+                "engine": self.combo_engine.currentData(),
+                "source_lang": self.combo_src.currentData(),
+                "target_lang": self.combo_tgt.currentData(),
+            },
+            "script_opts": {
+                "mode": "educational" if self.radio_edu.isChecked() else "dramatic",
+                "instruction": self.txt_instruction.text().strip(),
+                "use_wikipedia": self.chk_wiki.isChecked(),
+                "wiki_terms": self.txt_wiki_terms.text().strip(),
+            },
+            "tts_opts": {
+                "output_format": self.combo_format.currentData(),
+                "default_voice": self.combo_voice.currentData(),
+                "speed": self.default_speed,
+            },
+        }

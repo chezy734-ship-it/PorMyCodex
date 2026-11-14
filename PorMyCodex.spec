@@ -21,6 +21,8 @@ hiddenimports = [
     'script_engine',
     'audio_exporter',
     'wiki_engine',
+    'library_store',
+    'export_pipeline',
     'dialogs',
 ]
 

@@ -1,21 +1,33 @@
 # -*- coding: utf-8 -*-
 """
 מודול ייצוא אודיו נייד (Portable Audiobook Exporter) עבור PorMyCodex.
-מאפשר לייצר קובץ שמע אמיתי (.mp3 או .wav) מכל פרק, טקסט מתורגם או תסריט רב-קולי,
-כדי להעביר לנגן, לוואטסאפ, לטלפון, לרכב או לכל מחשב אחר — ללא צורך ב-FFmpeg חיצוני.
+מאפשר לייצר קובץ שמע אמיתי (.mp3 או .wav) מכתיבה אטומית מלאה (temp + fsync + os.replace):
+- אימות של 100% מהמקטעים (לעולם לא מדלג על מקטע שנכשל ולא יוצר קובץ חלקי)
+- תמיכה מלאה בביטול נקי (cancel_event) בלי להשאיר שאריות בנתיב היעד
 """
 
-import os
-import wave
 import asyncio
+import io
+import os
 import tempfile
-from typing import List, Optional, Callable, Tuple
+import wave
+from typing import Any, Callable, List, Optional, Tuple
+
+from library_store import atomic_write_bytes
+
+
+class ExportCancelledError(RuntimeError):
+    """נזרק כאשר פעולת ייצוא האודיו בוטלה במפורש."""
+
+
+def _check_cancelled(cancel_event: Any = None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ExportCancelledError("ייצוא השמע בוטל על ידי המשתמש.")
 
 
 def _strip_id3v2_header(mp3_bytes: bytes) -> bytes:
     """מסיר תגית ID3v2 בתחילת מקטע MP3 משני כדי לאחד מספר מקטעי Edge-TTS לקובץ MP3 תקין אחד."""
     if len(mp3_bytes) >= 10 and mp3_bytes[:3] == b"ID3":
-        # Synchsafe integer size in bytes 6..9
         size = (
             ((mp3_bytes[6] & 0x7F) << 21)
             | ((mp3_bytes[7] & 0x7F) << 14)
@@ -80,9 +92,11 @@ def export_to_mp3(
     speed: float = 1.0,
     voice_overrides: Optional[List[str]] = None,
     progress_cb: Optional[Callable[[str], None]] = None,
+    cancel_event: Any = None,
+    mp3_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
 ) -> str:
-    """מייצא קובץ MP3 איכותי באמצעות Edge-TTS (כולל תמיכה בריבוי דוברים)."""
-    import edge_tts
+    """מייצא קובץ MP3 איכותי באמצעות Edge-TTS (או מסנתז מוזרק לבדיקות) בכתיבה אטומית מלאה."""
+    _check_cancelled(cancel_event)
 
     segments = _group_segments(sentences, default_voice, voice_overrides)
     if not segments:
@@ -90,42 +104,61 @@ def export_to_mp3(
 
     rate_str = f"{int((speed - 1.0) * 100):+d}%"
     total = len(segments)
+    combined = bytearray()
 
-    async def synthesize_all() -> bytes:
-        combined = bytearray()
+    if mp3_synth_fn is not None:
         for i, (v_id, text_chunk) in enumerate(segments, 1):
+            _check_cancelled(cancel_event)
             if progress_cb:
                 progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
             voice_name = _voice_id_to_edge_name(v_id)
-            fd, tmp_part = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            try:
-                communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
-                await communicate.save(tmp_part)
-                with open(tmp_part, "rb") as f:
-                    part_bytes = f.read()
-                if not part_bytes:
-                    raise RuntimeError(f"התקבל מקטע ריק בחלק {i}")
-                if i == 1:
-                    combined.extend(part_bytes)
-                else:
-                    combined.extend(_strip_id3v2_header(part_bytes))
-            finally:
-                try:
-                    if os.path.exists(tmp_part):
-                        os.remove(tmp_part)
-                except Exception:
-                    pass
-        return bytes(combined)
+            part_bytes = mp3_synth_fn(text_chunk, voice_name, speed)
+            if not part_bytes:
+                raise RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
+            if i == 1:
+                combined.extend(part_bytes)
+            else:
+                combined.extend(_strip_id3v2_header(part_bytes))
+    else:
+        import edge_tts
 
-    mp3_data = asyncio.run(synthesize_all())
+        async def synthesize_all() -> bytes:
+            out_buf = bytearray()
+            for i, (v_id, text_chunk) in enumerate(segments, 1):
+                _check_cancelled(cancel_event)
+                if progress_cb:
+                    progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
+                voice_name = _voice_id_to_edge_name(v_id)
+                fd, tmp_part = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd)
+                try:
+                    communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
+                    await communicate.save(tmp_part)
+                    _check_cancelled(cancel_event)
+                    with open(tmp_part, "rb") as f:
+                        part_bytes = f.read()
+                    if not part_bytes:
+                        raise RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
+                    if i == 1:
+                        out_buf.extend(part_bytes)
+                    else:
+                        out_buf.extend(_strip_id3v2_header(part_bytes))
+                finally:
+                    try:
+                        if os.path.exists(tmp_part):
+                            os.remove(tmp_part)
+                    except Exception:
+                        pass
+            return bytes(out_buf)
+
+        combined.extend(asyncio.run(synthesize_all()))
+
+    _check_cancelled(cancel_event)
+    mp3_data = bytes(combined)
     if not mp3_data:
         raise RuntimeError("יצירת קובץ ה-MP3 נכשלה (תוכן ריק).")
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "wb") as out_f:
-        out_f.write(mp3_data)
-    return output_path
+    return atomic_write_bytes(output_path, mp3_data)
 
 
 def export_to_wav_offline(
@@ -133,62 +166,91 @@ def export_to_wav_offline(
     output_path: str,
     speed: float = 1.0,
     progress_cb: Optional[Callable[[str], None]] = None,
+    cancel_event: Any = None,
+    wav_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
+    default_voice: str = "sapi5",
+    voice_overrides: Optional[List[str]] = None,
 ) -> str:
-    """מייצא קובץ WAV אופליין מלא באמצעות מנוע הקול של Windows (SAPI5 / pyttsx3)."""
-    import pyttsx3
+    """מייצא קובץ WAV אופליין מלא בכתיבה אטומית, בלי לדלג על מקטעים שכשלו."""
+    _check_cancelled(cancel_event)
 
-    segments = _group_segments(sentences, "sapi5", None, max_chars_per_batch=3000)
+    segments = _group_segments(sentences, default_voice, voice_overrides, max_chars_per_batch=3000)
     if not segments:
         raise ValueError("אין טקסט לייצוא.")
 
-    temp_wavs: List[str] = []
-    try:
-        engine = pyttsx3.init()
-        base_rate = engine.getProperty("rate")
-        engine.setProperty("rate", int(base_rate * speed))
-        voices = engine.getProperty("voices")
-        for v in voices:
-            if any(k in (v.name + " " + str(v.languages)).lower() for k in ("hebrew", "he-il", "asaf", "hila")):
-                engine.setProperty("voice", v.id)
-                break
+    total = len(segments)
+    params = None
+    frames_all: List[bytes] = []
 
-        total = len(segments)
-        for i, (_, text_chunk) in enumerate(segments, 1):
+    if wav_synth_fn is not None:
+        for i, (v_id, text_chunk) in enumerate(segments, 1):
+            _check_cancelled(cancel_event)
             if progress_cb:
-                progress_cb(f"מייצר אודיו WAV אופליין: חלק {i} מתוך {total}...")
-            fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            temp_wavs.append(tmp_wav)
-            engine.save_to_file(text_chunk, tmp_wav)
-        engine.runAndWait()
+                progress_cb(f"מייצר אודיו WAV: חלק {i} מתוך {total}...")
+            wav_bytes = wav_synth_fn(text_chunk, v_id, speed)
+            if not wav_bytes or len(wav_bytes) <= 44:
+                raise RuntimeError(f"התקבל מקטע WAV ריק/לא תקין בחלק {i} מתוך {total}.")
+            with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+                if params is None:
+                    params = w.getparams()
+                chunk_frames = w.readframes(w.getnframes())
+                if not chunk_frames:
+                    raise RuntimeError(f"לא התקבלו פריימים של שמע בחלק {i} מתוך {total}.")
+                frames_all.append(chunk_frames)
+    else:
+        import pyttsx3
 
-        # איחוד כל קבצי ה-WAV לקובץ אחד תקין
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        params = None
-        frames_all = []
-        for tw in temp_wavs:
-            if os.path.exists(tw) and os.path.getsize(tw) > 44:
+        temp_wavs: List[str] = []
+        try:
+            engine = pyttsx3.init()
+            base_rate = engine.getProperty("rate")
+            engine.setProperty("rate", int(base_rate * speed))
+            voices = engine.getProperty("voices")
+            for v in voices:
+                if any(k in (v.name + " " + str(v.languages)).lower() for k in ("hebrew", "he-il", "asaf", "hila")):
+                    engine.setProperty("voice", v.id)
+                    break
+
+            for i, (_, text_chunk) in enumerate(segments, 1):
+                _check_cancelled(cancel_event)
+                if progress_cb:
+                    progress_cb(f"מייצר אודיו WAV אופליין: חלק {i} מתוך {total}...")
+                fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                temp_wavs.append(tmp_wav)
+                engine.save_to_file(text_chunk, tmp_wav)
+            engine.runAndWait()
+            _check_cancelled(cancel_event)
+
+            for i, tw in enumerate(temp_wavs, 1):
+                if not os.path.exists(tw) or os.path.getsize(tw) <= 44:
+                    raise RuntimeError(f"מנוע SAPI5 נכשל ביצירת חלק {i} מתוך {total}.")
                 with wave.open(tw, "rb") as w:
                     if params is None:
                         params = w.getparams()
-                    frames_all.append(w.readframes(w.getnframes()))
+                    chunk_frames = w.readframes(w.getnframes())
+                    if not chunk_frames:
+                        raise RuntimeError(f"מנוע SAPI5 הפיק שמע ריק בחלק {i} מתוך {total}.")
+                    frames_all.append(chunk_frames)
+        finally:
+            for tw in temp_wavs:
+                try:
+                    if os.path.exists(tw):
+                        os.remove(tw)
+                except Exception:
+                    pass
 
-        if not params or not frames_all:
-            raise RuntimeError("מנוע SAPI5 לא יצר נתוני שמע. ודא שמותקן קול דיבור ב-Windows.")
+    _check_cancelled(cancel_event)
+    if not params or len(frames_all) != total:
+        raise RuntimeError("ייצוא ה-WAV נכשל: חסרים מקטעי שמע.")
 
-        with wave.open(output_path, "wb") as out_w:
-            out_w.setparams(params)
-            for fr in frames_all:
-                out_w.writeframes(fr)
+    out_buf = io.BytesIO()
+    with wave.open(out_buf, "wb") as out_w:
+        out_w.setparams(params)
+        for fr in frames_all:
+            out_w.writeframes(fr)
 
-        return output_path
-    finally:
-        for tw in temp_wavs:
-            try:
-                if os.path.exists(tw):
-                    os.remove(tw)
-            except Exception:
-                pass
+    return atomic_write_bytes(output_path, out_buf.getvalue())
 
 
 def export_audiobook_file(
@@ -198,28 +260,60 @@ def export_audiobook_file(
     speed: float = 1.0,
     voice_overrides: Optional[List[str]] = None,
     progress_cb: Optional[Callable[[str], None]] = None,
+    cancel_event: Any = None,
+    allow_fallback: bool = False,
+    mp3_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
+    wav_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
 ) -> str:
-    """מזהה לפי סיומת הקובץ (.mp3 או .wav) ומייצא קובץ שמע נייד לשיתוף."""
+    """
+    מייצא קובץ שמע נייד (.mp3 או .wav) באופן אטומי.
+    כברירת מחדל (allow_fallback=False) אינו מסתיר כשל ב-MP3 מאחורי פורמט חלופי.
+    """
+    _check_cancelled(cancel_event)
+
     ext = os.path.splitext(output_path)[1].lower()
-    if ext == ".wav" or default_voice == "sapi5" and ext != ".mp3":
+    if ext == ".wav" or (default_voice == "sapi5" and ext != ".mp3"):
         if ext != ".wav":
             output_path = f"{output_path}.wav"
-        return export_to_wav_offline(sentences, output_path, speed=speed, progress_cb=progress_cb)
-    else:
-        if ext != ".mp3":
-            output_path = f"{output_path}.mp3"
-        try:
-            return export_to_mp3(
-                sentences,
-                output_path,
-                default_voice=default_voice,
-                speed=speed,
-                voice_overrides=voice_overrides,
-                progress_cb=progress_cb,
-            )
-        except Exception as e:
-            # אם Edge-TTS נכשל בגלל חוסר אינטרנט, נופל אוטומטית לייצוא WAV אופליין
-            wav_fallback = os.path.splitext(output_path)[0] + ".wav"
-            if progress_cb:
-                progress_cb(f"Edge-TTS אינו זמין ({e}), עובר לייצוא WAV מקומי...")
-            return export_to_wav_offline(sentences, wav_fallback, speed=speed, progress_cb=progress_cb)
+        return export_to_wav_offline(
+            sentences,
+            output_path,
+            speed=speed,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            wav_synth_fn=wav_synth_fn,
+            default_voice=default_voice,
+            voice_overrides=voice_overrides,
+        )
+
+    if ext != ".mp3":
+        output_path = f"{output_path}.mp3"
+    try:
+        return export_to_mp3(
+            sentences,
+            output_path,
+            default_voice=default_voice,
+            speed=speed,
+            voice_overrides=voice_overrides,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            mp3_synth_fn=mp3_synth_fn,
+        )
+    except ExportCancelledError:
+        raise
+    except Exception as e:
+        if not allow_fallback:
+            raise
+        wav_fallback = os.path.splitext(output_path)[0] + ".wav"
+        if progress_cb:
+            progress_cb(f"Edge-TTS אינו זמין ({e}), עובר לייצוא WAV מקומי...")
+        return export_to_wav_offline(
+            sentences,
+            wav_fallback,
+            speed=speed,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            wav_synth_fn=wav_synth_fn,
+            default_voice=default_voice,
+            voice_overrides=voice_overrides,
+        )

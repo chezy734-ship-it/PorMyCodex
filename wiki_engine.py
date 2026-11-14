@@ -8,7 +8,10 @@
 import re
 from typing import List, Dict, Any
 from urllib.parse import quote
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore
 
 from settings_manager import load_settings, get_active_provider_config
 from ai_providers import chat_completion, get_provider_label
@@ -36,6 +39,8 @@ def search_wikipedia_articles(query: str, lang: str = "auto", limit: int = 3, ti
         langs_to_try = [lang]
 
     results: List[Dict[str, str]] = []
+    if requests is None:
+        return results
     for lg in langs_to_try:
         api_url = f"https://{lg}.wikipedia.org/w/api.php"
         try:
