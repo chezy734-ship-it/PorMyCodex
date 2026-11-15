@@ -237,6 +237,129 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
 
         win.close()
 
+    def test_04_settings_fallback_opt_in_and_recovery_banner_and_dialog(self):
+        from dialogs import BookRecoveryDialog
+        from library_store import LibraryStore
+        from settings_manager import load_settings
+
+        # 1. תיבת Fallback ל-AI כבויה כברירת מחדל ונשמרת בהעדפות המשתמש עם ציון מכסה/תשלום
+        settings = deepcopy(DEFAULT_SETTINGS)
+        self.assertFalse(settings["translation"].get("fallback_to_ai_on_failure", False))
+        dlg = SettingsDialog(None, settings, discovery_fn=lambda *a, **k: {"models": ["gemini-2.5-flash"], "pages_fetched": 1})
+        self.assertFalse(dlg.chk_fallback_ai.isChecked())
+        self.assertIn("מכסה", dlg.chk_fallback_ai.text())
+        dlg.chk_fallback_ai.setChecked(True)
+        dlg._on_save()
+        reloaded = load_settings()
+        self.assertTrue(reloaded["translation"]["fallback_to_ai_on_failure"])
+        dlg.close()
+
+        # 2. BookRecoveryDialog אינו מדליף HTML, מציג פרק ויחידה + כפתורי החלפת ספק / השהיה
+        r_dlg = BookRecoveryDialog(
+            None,
+            book_title="ספר חסימה",
+            chapter_number=23,
+            chapter_count=140,
+            unit_index=60,
+            unit_id="u61",
+            stage="translation",
+            error_summary="<html><body>raw html should be hidden</body></html>",
+            is_blocked=True,
+            blocked_provider="Google Translate חינמי",
+            blocked_filter="NetFree",
+            settings=deepcopy(DEFAULT_SETTINGS),
+            completed_count=22,
+            units_completed=280,
+            units_missing=40,
+            units_failed=1,
+            failed_chapters={"22": {"chapter_number": 23}},
+        )
+        diag_txt = r_dlg.lbl_diagnosis.text()
+        self.assertIn("23 מתוך 140", diag_txt)
+        self.assertIn("u61", diag_txt)
+        self.assertNotIn("raw html", r_dlg.lbl_error_detail.text())
+        self.assertIn("280", r_dlg.lbl_preserved.text())
+        r_dlg.btn_switch_provider.click()
+        dec = r_dlg.get_recovery_decision()
+        self.assertEqual(dec["action"], "switch_and_resume")
+        r_dlg.close()
+
+        # 3. MainWindow מציג באנר 'המשך מנקודת העצירה' בפתיחת ספר עם התקדמות חלקית שמורה בדיסק
+        store = LibraryStore()
+        book = {
+            "id": "ui_resume_bk",
+            "title": "ספר להמשך",
+            "chapters": [
+                {"title": "פרק 1", "text": "First A. Second B. Third C."},
+                {"title": "פרק 2", "text": "Fourth D. Fifth E."},
+            ],
+        }
+        store.save_translation_unit_progress(
+            book_id="ui_resume_bk",
+            chapter_index=0,
+            source_sentences=["First A.", "Second B.", "Third C."],
+            source_hash="h1",
+            config_hash="c1",
+            source_lang="en",
+            target_lang="he",
+            unit_index=0,
+            unit_status="completed",
+            translated_text="ראשון א.",
+            job_status="blocked",
+        )
+        store.save_whole_book_job(
+            "ui_resume_bk",
+            {
+                "job_type": "whole_book_script",
+                "status": "blocked",
+                "chapter_count": 2,
+                "stage": "translation",
+                "failed_or_cancelled_chapter": 1,
+                "unit_index": 1,
+                "unit_id": "u2",
+                "is_blocked": True,
+                "blocked_provider": "Google Translate חינמי",
+                "blocked_filter": "NetFree",
+            },
+        )
+        win = MainWindow()
+        win.books = [book]
+        win.load_book_to_ui(0)
+        win.show()
+        self.app.processEvents()
+        self.assertFalse(win.resume_banner_frame.isHidden())
+        self.assertTrue(win.resume_banner_frame.isVisible())
+        self.assertEqual(win.btn_resume_banner.text(), "▶️ המשך מנקודת העצירה")
+
+        # סיום עם 418 בספר שלם מפעיל את BookRecoveryDialog ולא קורס
+        with mock.patch("main_window.BookRecoveryDialog") as mock_rec_cls:
+            inst = mock_rec_cls.return_value
+            inst.exec.return_value = 0
+            win._on_whole_book_script_finished({
+                "success": False,
+                "scope": "book",
+                "status": "blocked",
+                "is_blocked": True,
+                "blocked_provider": "Google Translate חינמי",
+                "blocked_filter": "NetFree",
+                "book_id": "ui_resume_bk",
+                "book_title": "ספר להמשך",
+                "chapter_number": 1,
+                "chapter_count": 2,
+                "unit_index": 1,
+                "unit_id": "u2",
+                "stage": "translation",
+                "completed_translations": [],
+                "units_completed": 1,
+                "units_missing": 4,
+                "units_failed": 1,
+                "failed_chapters": {"0": {"chapter_number": 1}},
+                "error": "הספק חסום 418",
+            })
+            mock_rec_cls.assert_called_once()
+        win.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

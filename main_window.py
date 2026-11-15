@@ -33,13 +33,14 @@ from book_loader import (
 from audio_engine import AudioEngine
 from audio_exporter import find_ffmpeg_executable
 from ai_linguist import vocalize_and_expand_hebrew, ask_companion
-from settings_manager import load_settings, get_active_provider_config
+from settings_manager import load_settings, save_settings, get_active_provider_config
 from ai_providers import AICancelledError, get_provider_label
 from script_engine import format_script_as_text
 from wiki_engine import enrich_with_wikipedia_and_ai, fetch_wikipedia_context_for_terms
 from library_store import LibraryStore, sanitize_filename_part
 from export_pipeline import (
     PipelineCancelledError,
+    assess_book_pipeline,
     assess_chapter_pipeline,
     ensure_translation_for_chapter,
     ensure_script_for_chapter,
@@ -53,6 +54,7 @@ from dialogs import (
     ScriptStudioDialog,
     WikiSearchDialog,
     ExportPipelineDialog,
+    BookRecoveryDialog,
 )
 
 
@@ -120,6 +122,7 @@ class TaskWorkerThread(QThread):
     finished_ok = pyqtSignal(object)
     cancelled = pyqtSignal(str)
     failed = pyqtSignal(str)
+    failed_details = pyqtSignal(dict)
 
     def __init__(self, fn: Callable[[threading.Event, Callable[[str], None]], Any]):
         super().__init__()
@@ -142,7 +145,28 @@ class TaskWorkerThread(QThread):
             if self.cancel_event.is_set():
                 self.cancelled.emit("הפעולה בוטלה לבקשת המשתמש.")
             else:
-                self.failed.emit(str(e))
+                msg = str(e)
+                low = msg.lower()
+                if "<html" in low or "<!doctype" in low:
+                    msg = "התקבלה תשובת HTML/חסימה מהספק במקום נתוני תרגום תקינים."
+                details = {
+                    "error": msg,
+                    "is_blocked": bool(
+                        getattr(e, "is_blocked", False)
+                        or getattr(e, "category", "") == "blocked"
+                        or getattr(e, "status_code", None) in (418, 451)
+                        or "netfree" in low
+                        or "418" in low
+                    ),
+                    "blocked_provider": str(getattr(e, "provider_id", "") or ""),
+                    "blocked_filter": str(getattr(e, "blocked_filter", "") or ""),
+                    "unit_index": getattr(e, "unit_index", None),
+                    "unit_id": str(getattr(e, "unit_id", "") or ""),
+                    "batch_index": getattr(e, "batch_index", None),
+                    "category": str(getattr(e, "category", "") or "error"),
+                }
+                self.failed_details.emit(details)
+                self.failed.emit(msg)
 
 
 class MainWindow(QMainWindow):
@@ -176,6 +200,8 @@ class MainWindow(QMainWindow):
         self._whole_book_script_progress_dlg: Optional[QProgressDialog] = None
         self._export_thread: Optional[PipelineExportThread] = None
         self._export_progress_dlg: Optional[QProgressDialog] = None
+        self._last_whole_book_script_params: Optional[Dict[str, Any]] = None
+        self._last_whole_book_export_params: Optional[Dict[str, Any]] = None
 
         # Audio Engine
         self.audio = AudioEngine()
@@ -286,6 +312,11 @@ class MainWindow(QMainWindow):
         self.action_export_whole_book.triggered.connect(self.export_whole_book_audio_dialog)
         toolbar.addAction(self.action_export_whole_book)
 
+        self.action_resume_book = QAction("🔄 המשך מטמון", self)
+        self.action_resume_book.setToolTip("המשך עיבוד ספר שנעצר / תקן פרקים שנכשלו בלי ליצור מחדש פרקים תקינים")
+        self.action_resume_book.triggered.connect(self.resume_whole_book_job)
+        toolbar.addAction(self.action_resume_book)
+
         toolbar.addSeparator()
 
         explain_action = QAction("💡 באר", self)
@@ -373,6 +404,24 @@ class MainWindow(QMainWindow):
         header_row.addWidget(btn_font_minus)
 
         center_layout.addLayout(header_row)
+
+        # באנר המשך התקדמות שמורה (מוצג בעת פתיחת ספר עם עבודה חלקית / שנעצרה)
+        self.resume_banner_frame = QFrame()
+        self.resume_banner_frame.setVisible(False)
+        self.resume_banner_frame.setStyleSheet(
+            "QFrame { background-color: #1e293b; border: 1px solid #f59e0b; border-radius: 8px; padding: 6px 10px; }"
+        )
+        rb_lay = QHBoxLayout(self.resume_banner_frame)
+        rb_lay.setContentsMargins(8, 4, 8, 4)
+        self.lbl_resume_banner = QLabel("")
+        self.lbl_resume_banner.setWordWrap(True)
+        self.lbl_resume_banner.setStyleSheet("color: #fde68a; font-size: 12px; border: none;")
+        rb_lay.addWidget(self.lbl_resume_banner, 1)
+        self.btn_resume_banner = QPushButton("▶️ המשך מנקודת העצירה")
+        self.btn_resume_banner.setObjectName("primaryBtn")
+        self.btn_resume_banner.clicked.connect(self.resume_whole_book_job)
+        rb_lay.addWidget(self.btn_resume_banner)
+        center_layout.addWidget(self.resume_banner_frame)
 
         self.text_browser = QTextBrowser()
         self.text_browser.setOpenExternalLinks(False)
@@ -474,6 +523,52 @@ class MainWindow(QMainWindow):
         icon = "🟢" if has_key else "🟡"
         self.btn_ai_badge.setText(f"⚙️ {icon} {get_provider_label(pid)} | {model} (שינוי)")
 
+    def _refresh_resume_banner(self):
+        if not hasattr(self, "resume_banner_frame"):
+            return
+        if not self.books or not (0 <= self.current_book_index < len(self.books)):
+            self.resume_banner_frame.setVisible(False)
+            return
+        book = self.books[self.current_book_index]
+        book_id = book.get("id", "")
+        job = self.store.get_whole_book_job(book_id) or {}
+        assess = assess_book_pipeline(book=book, settings=self.settings, store=self.store)
+        total = assess["chapter_count"]
+        t_ready = assess["translations_ready"]
+        s_ready = assess["scripts_ready"]
+        u_done = assess.get("units_completed", 0)
+        u_tot = assess.get("total_translation_units", 0)
+        rp = assess.get("resume_point") or {}
+        job_status = job.get("status", "")
+        has_failed = bool(job.get("failed_chapters"))
+        is_stopped_job = job_status in ("failed", "blocked", "cancelled", "partial", "in_progress")
+        show = bool(
+            (assess.get("has_resumable_progress") or is_stopped_job or has_failed)
+            and not (assess.get("all_translations_ready") and assess.get("all_scripts_ready") and not has_failed)
+        )
+        if not show:
+            self.resume_banner_frame.setVisible(False)
+            return
+
+        if is_stopped_job and job_status == "blocked":
+            ch_n = job.get("failed_or_cancelled_chapter") or rp.get("chapter_number", 1)
+            uid = job.get("unit_id") or rp.get("unit_id") or ""
+            u_txt = f" ({uid})" if uid else ""
+            msg = (
+                f"⛔ <b>נמצאה התקדמות שמורה שנעצרה עקב חסימה</b> בפרק {ch_n}/{total}{u_txt} — "
+                f"נשמרו אטומית <b>{u_done}/{u_tot}</b> יחידות תקינות ({t_ready}/{total} פרקים)."
+            )
+        else:
+            rp_txt = ""
+            if rp:
+                rp_txt = f" | נקודת המשך: פרק {rp.get('chapter_number', 1)}/{total} ({rp.get('unit_id', 'u1')})"
+            msg = (
+                f"💾 <b>נמצאה התקדמות שמורה לספר:</b> תרגומים {t_ready}/{total} | תסריטים {s_ready}/{total} | "
+                f"יחידות תקינות {u_done}/{u_tot}{rp_txt}."
+            )
+        self.lbl_resume_banner.setText(msg)
+        self.resume_banner_frame.setVisible(True)
+
     def _restore_initial_position(self, book_idx: int, chapter_idx: int, sentence_idx: int):
         self.load_book_to_ui(book_idx)
         if not self.books:
@@ -486,6 +581,7 @@ class MainWindow(QMainWindow):
             self.active_sentence_index = max(0, min(len(self.sentences) - 1, sentence_idx))
             self.render_text()
             self.update_progress_display()
+        self._refresh_resume_banner()
 
     def _persist_library_and_progress(self):
         if getattr(self, "_restoring_state", False) or not self.books:
@@ -533,6 +629,7 @@ class MainWindow(QMainWindow):
             self.chapter_list.addItem(f"{idx+1}. {ch['title']}")
         if book["chapters"]:
             self.chapter_list.setCurrentRow(0)
+        self._refresh_resume_banner()
 
     def on_chapter_selected(self, row: int):
         if row < 0:
@@ -591,6 +688,7 @@ class MainWindow(QMainWindow):
         self.update_progress_display()
         self.audio.stop()
         self._persist_progress_only()
+        self._refresh_resume_banner()
 
     def restore_original_chapter_text(self):
         if not self.books:
@@ -851,8 +949,10 @@ class MainWindow(QMainWindow):
                     self.btn_restore_original.setVisible(False)
                     self.render_text()
                     self.update_progress_display()
+                    self._refresh_resume_banner()
                     self.statusBar.showMessage("ההגדרות נשמרו; התסריט הקודם התיישן ולא ישמש ליצוא.", 6000)
                     return
+            self._refresh_resume_banner()
             self.statusBar.showMessage("הגדרות ה-AI, המודלים, התרגום והקולות נשמרו!", 4000)
 
     # --- Background Worker Helper (עם התקדמות וביטול מיידי) ---
@@ -870,6 +970,7 @@ class MainWindow(QMainWindow):
         fn: Callable[[threading.Event, Callable[[str], None]], Any],
         on_ok: Callable[[Any], None],
         title: str = "מבצע משימת AI ברקע",
+        on_error: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         if self._task_thread and self._task_thread.isRunning():
             QMessageBox.information(self, "פעולה רצה", "משימת AI/תרגום אחרת עדיין רצה ברקע, אנא המתן לסיומה.")
@@ -886,6 +987,7 @@ class MainWindow(QMainWindow):
         prog_dlg.setMinimumWidth(420)
         prog_dlg.canceled.connect(th.cancel)
         self._task_progress_dlg = prog_dlg
+        last_err_details: Dict[str, Any] = {}
 
         def _on_prog(msg: str):
             self.statusBar.showMessage(msg)
@@ -898,26 +1000,38 @@ class MainWindow(QMainWindow):
 
         def _on_cancelled(msg: str):
             self._close_task_progress()
+            self._refresh_resume_banner()
             self.statusBar.showMessage(msg, 5000)
             QMessageBox.information(self, "הפעולה בוטלה", msg)
 
+        def _on_failed_details(d: dict):
+            last_err_details.clear()
+            last_err_details.update(d or {})
+
         def _on_failed(err: str):
             self._close_task_progress()
-            self._on_background_task_error(err)
+            self._refresh_resume_banner()
+            if on_error is not None:
+                details = dict(last_err_details)
+                details.setdefault("error", err)
+                on_error(details)
+            else:
+                self._on_background_task_error(err)
 
         th.progress.connect(_on_prog)
         th.finished_ok.connect(_on_ok_wrap)
         th.cancelled.connect(_on_cancelled)
+        th.failed_details.connect(_on_failed_details)
         th.failed.connect(_on_failed)
         th.start()
         prog_dlg.show()
 
     def _on_background_task_error(self, err: str):
-        self.statusBar.showMessage("הפעולה הופסקה עם שגיאה — לא נשמר פלט חלקי כהצלחה.", 6000)
+        self.statusBar.showMessage("הפעולה הופסקה עם שגיאה — התקדמות תקינה נשמרה.", 6000)
         QMessageBox.warning(
             self,
             "שגיאה בביצוע המשימה",
-            f"{err}\n\nניתן לבדוק את ההגדרות / החיבור ולנסות שוב (התקדמות שמורה תקינה תישמר).",
+            f"{err}\n\nניתן לבדוק את ההגדרות / החיבור ולנסות שוב (יחידות תקינות שכבר הושלמו נשמרו).",
         )
 
     # --- AI Vocalization & Companion ---
@@ -1146,9 +1260,130 @@ class MainWindow(QMainWindow):
             _worker,
             self._on_script_generated,
             title="יצירת תסריט AI (פרק נוכחי)",
+            on_error=lambda err_d: self._handle_chapter_task_recovery(
+                book=book,
+                chapter_index=chapter_idx,
+                stage="script",
+                err_details=err_d,
+                retry_fn=lambda: self._run_single_chapter_script_with_opts(book, chapter_idx, opts),
+            ),
         )
 
-    def _start_whole_book_script_job(self, book: Dict[str, Any], script_opts: Dict[str, Any]):
+    def _run_single_chapter_script_with_opts(self, book: Dict[str, Any], chapter_idx: int, opts: Dict[str, Any]):
+        source_text = book["chapters"][chapter_idx]["text"]
+        cfg = self.settings
+        book_id = book.get("id", "")
+
+        def _worker(cancel_ev, prog_cb):
+            ensure_translation_for_chapter(
+                book_id=book_id,
+                chapter_index=chapter_idx,
+                source_text=source_text,
+                settings=cfg,
+                store=self.store,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
+            )
+            return ensure_script_for_chapter(
+                book_id=book_id,
+                chapter_index=chapter_idx,
+                source_text=source_text,
+                book_title=book.get("title", ""),
+                settings=cfg,
+                script_opts=opts,
+                store=self.store,
+                cancel_event=cancel_ev,
+                progress_cb=prog_cb,
+            )
+
+        self._run_background_task(
+            "ממשיך תרגום/תסריט AI לפרק מהנקודה שנשמרה...",
+            _worker,
+            self._on_script_generated,
+            title="יצירת תסריט AI (פרק נוכחי)",
+            on_error=lambda err_d: self._handle_chapter_task_recovery(
+                book=book,
+                chapter_index=chapter_idx,
+                stage="script",
+                err_details=err_d,
+                retry_fn=lambda: self._run_single_chapter_script_with_opts(book, chapter_idx, opts),
+            ),
+        )
+
+    def _handle_chapter_task_recovery(
+        self,
+        *,
+        book: Dict[str, Any],
+        chapter_index: int,
+        stage: str,
+        err_details: Dict[str, Any],
+        retry_fn: Callable[[], None],
+    ):
+        chapters = book.get("chapters") or []
+        src = chapters[chapter_index].get("text", "") if 0 <= chapter_index < len(chapters) else ""
+        ch_assess = assess_chapter_pipeline(
+            book_id=book.get("id", ""),
+            chapter_index=chapter_index,
+            source_text=src,
+            settings=self.settings,
+            store=self.store,
+        )
+        tp = ch_assess.get("translation_progress") or {}
+        sp = ch_assess.get("script_progress") or {}
+        use_sp = stage == "script" and ch_assess.get("translation_ready") and not ch_assess.get("script_ready")
+        stats = sp if use_sp else tp
+        dlg = BookRecoveryDialog(
+            self,
+            book_title=book.get("title", ""),
+            chapter_number=chapter_index + 1,
+            chapter_count=len(chapters) or 1,
+            unit_index=err_details.get("unit_index"),
+            unit_id=err_details.get("unit_id") or stats.get("next_unit_id", ""),
+            stage=stage,
+            error_summary=err_details.get("error", ""),
+            is_blocked=bool(err_details.get("is_blocked")),
+            blocked_provider=err_details.get("blocked_provider", ""),
+            blocked_filter=err_details.get("blocked_filter", ""),
+            settings=self.settings,
+            completed_count=0,
+            units_completed=int(stats.get("completed_count") or 0),
+            units_missing=int(stats.get("missing_count") or 0),
+            units_failed=int(stats.get("failed_count") or 0),
+            failed_chapters={},
+            allow_continue_other_chapters=False,
+        )
+        if not dlg.exec():
+            self.statusBar.showMessage("ההתקדמות נשמרה אטומית בפרק — תוכל להמשיך מאותה נקודה בכל עת.", 6000)
+            return
+        decision = dlg.get_recovery_decision()
+        action = decision["action"]
+        self._apply_fallback_policy_preference(
+            decision.get("fallback_to_ai_on_failure"),
+            new_engine=decision.get("engine") if action == "switch_and_resume" else None,
+        )
+        retry_fn()
+
+    def _apply_fallback_policy_preference(self, fallback_to_ai: Optional[bool], new_engine: Optional[str] = None):
+        changed = False
+        trans_cfg = self.settings.setdefault("translation", {})
+        if fallback_to_ai is not None and bool(trans_cfg.get("fallback_to_ai_on_failure", False)) != bool(fallback_to_ai):
+            trans_cfg["fallback_to_ai_on_failure"] = bool(fallback_to_ai)
+            changed = True
+        if new_engine and trans_cfg.get("engine") != new_engine:
+            trans_cfg["engine"] = new_engine
+            changed = True
+        if changed:
+            save_settings(self.settings)
+
+    def _start_whole_book_script_job(
+        self,
+        book: Dict[str, Any],
+        script_opts: Dict[str, Any],
+        *,
+        translation_opts: Optional[Dict[str, Any]] = None,
+        retry_failed_only: bool = False,
+        continue_on_chapter_failure: bool = False,
+    ):
         if self._whole_book_script_thread and self._whole_book_script_thread.isRunning():
             QMessageBox.information(self, "תהליך בתהליך", "יצירת תסריט לספר שלם עדיין רצה ברקע.")
             return
@@ -1162,15 +1397,31 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if "fallback_to_ai_on_failure" in script_opts:
+            self._apply_fallback_policy_preference(bool(script_opts.get("fallback_to_ai_on_failure")))
+
         book_snapshot = deepcopy(book)
+        clean_script_opts = {
+            k: v for k, v in dict(script_opts).items() if k != "fallback_to_ai_on_failure"
+        }
+        eff_trans_opts = dict(translation_opts or {})
+        self._last_whole_book_script_params = {
+            "book_id": book_snapshot.get("id", ""),
+            "script_opts": dict(clean_script_opts),
+            "translation_opts": dict(eff_trans_opts),
+        }
+
         total = len(book_snapshot.get("chapters") or [])
         self.statusBar.showMessage(f"מייצר תרגום ותסריט לכל הספר ({total} פרקים לפי הסדר)...")
 
         th = WholeBookScriptThread({
             "book": book_snapshot,
             "settings": deepcopy(self.settings),
-            "script_opts": dict(script_opts),
+            "translation_opts": eff_trans_opts or None,
+            "script_opts": clean_script_opts,
             "store": self.store,
+            "retry_failed_only": bool(retry_failed_only),
+            "continue_on_chapter_failure": bool(continue_on_chapter_failure),
         })
         self._whole_book_script_thread = th
 
@@ -1192,10 +1443,206 @@ class MainWindow(QMainWindow):
         th.start()
         prog_dlg.show()
 
+    def _launch_whole_book_export_thread(self, job_kwargs: Dict[str, Any]):
+        if self._export_thread and self._export_thread.isRunning():
+            QMessageBox.information(self, "ייצוא בתהליך", "ייצוא שמע קודם עדיין רץ ברקע, אנא המתן לסיומו.")
+            return
+
+        total_ch = len((job_kwargs.get("book") or {}).get("chapters") or [])
+        self._last_whole_book_export_params = {
+            "book": deepcopy(job_kwargs["book"]),
+            "output_path": job_kwargs["output_path"],
+            "package_mode": job_kwargs["package_mode"],
+            "translation_opts": dict(job_kwargs.get("translation_opts") or {}),
+            "script_opts": dict(job_kwargs.get("script_opts") or {}),
+            "tts_opts": dict(job_kwargs.get("tts_opts") or {}),
+        }
+
+        self.statusBar.showMessage(f"מפעיל יצוא מלא לכל הספר ({total_ch} פרקים לפי הסדר)...")
+        self._export_thread = PipelineExportThread(
+            {
+                **job_kwargs,
+                "settings": deepcopy(self.settings),
+                "store": self.store,
+            },
+            scope="book",
+        )
+        prog_dlg = QProgressDialog(
+            f"מתחיל עיבוד הספר כולו ({total_ch} פרקים לפי הסדר)...",
+            "🛑 בטל יצוא",
+            0,
+            0,
+            self,
+        )
+        prog_dlg.setWindowTitle(f"📚🎧 מייצא את הספר כולו ({total_ch} פרקים)")
+        prog_dlg.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        prog_dlg.setMinimumWidth(440)
+        prog_dlg.canceled.connect(self._export_thread.cancel)
+        self._export_progress_dlg = prog_dlg
+
+        def _on_prog(msg: str):
+            self.statusBar.showMessage(msg)
+            if self._export_progress_dlg:
+                self._export_progress_dlg.setLabelText(msg)
+
+        self._export_thread.progress.connect(_on_prog)
+        self._export_thread.finished_result.connect(self._on_pipeline_finished)
+        self._export_thread.start()
+        prog_dlg.show()
+
+    def _find_book_by_id(self, book_id: str) -> Optional[Dict[str, Any]]:
+        for b in self.books:
+            if b.get("id") == book_id:
+                return b
+        if self.books:
+            return self.books[self.current_book_index]
+        return None
+
+    def _handle_whole_book_recovery(self, res: dict, *, is_export: bool = False):
+        book_id = res.get("book_id") or (
+            self.books[self.current_book_index].get("id", "") if self.books else ""
+        )
+        book = self._find_book_by_id(book_id)
+        if not book:
+            QMessageBox.critical(self, "שגיאה", res.get("error", "שגיאה לא ידועה"))
+            return
+
+        assess = assess_book_pipeline(book=book, settings=self.settings, store=self.store)
+        total = int(res.get("chapter_count") or len(book.get("chapters") or []) or 1)
+        ch_num = int(res.get("chapter_number") or 1)
+        if res.get("status") == "partial":
+            needs = res.get("needs_attention_chapters") or []
+            ch_num = (needs[0] + 1) if needs else ch_num
+        completed_list = res.get("completed_translations") or []
+        completed_cnt = len(completed_list) if completed_list else int(assess.get("translations_ready", 0))
+        rp = assess.get("resume_point") or {}
+        u_idx = res.get("unit_index") if res.get("unit_index") is not None else rp.get("unit_index")
+        u_id = res.get("unit_id") or rp.get("unit_id") or ""
+        u_done = res.get("units_completed") if res.get("units_completed") is not None else assess.get("units_completed", 0)
+        u_miss = res.get("units_missing") if res.get("units_missing") is not None else assess.get("units_missing", 0)
+        u_fail = res.get("units_failed") if res.get("units_failed") is not None else assess.get("units_failed", 0)
+
+        dlg = BookRecoveryDialog(
+            self,
+            book_title=book.get("title", ""),
+            chapter_number=ch_num,
+            chapter_count=total,
+            unit_index=u_idx,
+            unit_id=u_id,
+            stage=res.get("stage", "translation"),
+            error_summary=res.get("error", "העיבוד נעצר."),
+            is_blocked=bool(res.get("is_blocked")),
+            blocked_provider=res.get("blocked_provider", ""),
+            blocked_filter=res.get("blocked_filter", ""),
+            settings=self.settings,
+            completed_count=completed_cnt,
+            units_completed=int(u_done or 0),
+            units_missing=int(u_miss or 0),
+            units_failed=int(u_fail or 0),
+            failed_chapters=res.get("failed_chapters") or {},
+            allow_continue_other_chapters=not is_export,
+        )
+        if not dlg.exec():
+            self.statusBar.showMessage("התקדמות הפרקים והיחידות נשמרה אטומית — ניתן להמשיך בכל עת מ'המשך מטמון'.", 6000)
+            self._refresh_resume_banner()
+            return
+
+        decision = dlg.get_recovery_decision()
+        action = decision["action"]
+        self._apply_fallback_policy_preference(
+            decision.get("fallback_to_ai_on_failure"),
+            new_engine=decision.get("engine") if action == "switch_and_resume" else None,
+        )
+
+        if is_export and self._last_whole_book_export_params:
+            exp_p = deepcopy(self._last_whole_book_export_params)
+            exp_t_opts = dict(exp_p.get("translation_opts") or {})
+            if action == "switch_and_resume" and decision.get("engine"):
+                exp_t_opts["engine"] = decision["engine"]
+            exp_t_opts["fallback_to_ai_on_failure"] = bool(
+                self.settings.get("translation", {}).get("fallback_to_ai_on_failure", False)
+            )
+            exp_p["translation_opts"] = exp_t_opts
+            self._launch_whole_book_export_thread(exp_p)
+            return
+
+        last_s = self._last_whole_book_script_params or {
+            "script_opts": {"mode": "educational", "instruction": "", "use_wikipedia": False, "wiki_terms": ""},
+            "translation_opts": {},
+        }
+        t_opts = dict(last_s.get("translation_opts") or {})
+        if action == "switch_and_resume" and decision.get("engine"):
+            t_opts["engine"] = decision["engine"]
+        t_opts["fallback_to_ai_on_failure"] = bool(
+            self.settings.get("translation", {}).get("fallback_to_ai_on_failure", False)
+        )
+
+        self._start_whole_book_script_job(
+            book,
+            dict(last_s.get("script_opts") or {}),
+            translation_opts=t_opts,
+            retry_failed_only=(action == "resume_failed_only"),
+            continue_on_chapter_failure=(action == "continue_other_chapters"),
+        )
+
+    def resume_whole_book_job(self):
+        if not self.books:
+            QMessageBox.information(self, "אין ספר", "אין ספר פעיל להמשך עיבוד.")
+            return
+        book = self.books[self.current_book_index]
+        book_id = book.get("id", "")
+        job = self.store.get_whole_book_job(book_id)
+        assess = assess_book_pipeline(book=book, settings=self.settings, store=self.store)
+        total = assess["chapter_count"]
+        t_ready = assess["translations_ready"]
+        s_ready = assess["scripts_ready"]
+        failed_map = (job or {}).get("failed_chapters") or {}
+
+        if assess["all_translations_ready"] and assess["all_scripts_ready"] and not failed_map:
+            QMessageBox.information(
+                self,
+                "הספר מוכן ומאומת",
+                f"כל {total} פרקי הספר '{book.get('title', '')}' כבר מתורגמים ומתוסרטים במטמון.\n"
+                "ניתן להפעיל ישירות '📚🎧 שמע לכל הספר'.",
+            )
+            return
+
+        rp = assess.get("resume_point") or {}
+        ch_num = int((job or {}).get("failed_or_cancelled_chapter") or rp.get("chapter_number") or 1)
+        if not job and rp:
+            ch_num = int(rp.get("chapter_number") or 1)
+
+        pseudo_res = {
+            "book_id": book_id,
+            "book_title": book.get("title", ""),
+            "status": (job or {}).get("status", "failed"),
+            "stage": (job or {}).get("stage") or rp.get("stage") or "translation",
+            "chapter_number": ch_num,
+            "chapter_count": total,
+            "unit_index": (job or {}).get("unit_index") if (job or {}).get("unit_index") is not None else rp.get("unit_index"),
+            "unit_id": (job or {}).get("unit_id") or rp.get("unit_id") or "",
+            "is_blocked": bool((job or {}).get("is_blocked", False)),
+            "blocked_provider": (job or {}).get("blocked_provider", ""),
+            "blocked_filter": (job or {}).get("blocked_filter", ""),
+            "completed_translations": [cs["chapter_index"] for cs in assess["chapters"] if cs["translation_ready"]],
+            "units_completed": assess.get("units_completed", 0),
+            "units_missing": assess.get("units_missing", 0),
+            "units_failed": assess.get("units_failed", 0),
+            "failed_chapters": failed_map,
+            "error": (job or {}).get("error") or (
+                f"מוכנים {t_ready}/{total} תרגומים ו-{s_ready}/{total} תסריטים "
+                f"({assess.get('units_completed', 0)}/{assess.get('total_translation_units', 0)} יחידות תקינות)."
+            ),
+        }
+        self._handle_whole_book_recovery(pseudo_res, is_export=False)
+
     def _on_whole_book_script_finished(self, res: dict):
         if self._whole_book_script_progress_dlg:
             self._whole_book_script_progress_dlg.close()
             self._whole_book_script_progress_dlg = None
+
+        self._refresh_resume_banner()
 
         if res.get("success") and res.get("status") == "completed":
             scripts = res.get("scripts") or []
@@ -1214,22 +1661,23 @@ class MainWindow(QMainWindow):
                 "ניתן כעת להפעיל '📚🎧 שמע לכל הספר' ללא יצירה חוזרת של פרקים תקינים.",
             )
         elif res.get("status") == "cancelled":
-            msg = res.get("error", "בוטל.")
-            self.statusBar.showMessage("יצירת התסריט לספר כולו בוטלה (פרקים שהושלמו נשמרו להמשך).", 6000)
+            self.statusBar.showMessage("יצירת התסריט לספר כולו בוטלה (פרקים ויחידות שהושלמו נשמרו להמשך).", 6000)
             QMessageBox.information(
                 self,
                 "יצירת תסריט לספר בוטלה",
                 f"התהליך בוטל ({res.get('stage', '')}, פרק {res.get('chapter_number', 0)}/{res.get('chapter_count', 0)}).\n"
-                "הפרקים שכבר הושלמו נשמרו אטומית — בהפעלה הבאה נמשיך בלי ליצור מחדש פרקים תקינים.",
+                "הפרקים והיחידות שכבר הושלמו נשמרו אטומית — ניתן להמשיך דרך '🔄 המשך מטמון' בלי ליצור מחדש עבודה תקינה.",
             )
+        elif res.get("status") == "partial":
+            needs = [i + 1 for i in (res.get("needs_attention_chapters") or [])]
+            self.statusBar.showMessage(
+                f"עיבוד הספר הסתיים במצב חלקי — פרקים טעוני טיפול: {needs[:10]}",
+                8000,
+            )
+            self._handle_whole_book_recovery(res, is_export=False)
         else:
-            err = res.get("error", "שגיאה לא ידועה")
-            self.statusBar.showMessage("יצירת התסריט לספר כולו נכשלה.", 6000)
-            QMessageBox.critical(
-                self,
-                "כשל ביצירת תסריט לכל הספר",
-                f"{err}\n\nהספר לא הוכרז כהושלם; בדוק את החיבור/הגדרות ונסה שוב.",
-            )
+            self.statusBar.showMessage("יצירת התסריט לספר כולו נעצרה (התקדמות נשמרה להתאוששות).", 6000)
+            self._handle_whole_book_recovery(res, is_export=False)
 
     def _on_script_generated(self, script_data: dict):
         self.current_script_data = script_data
@@ -1256,6 +1704,7 @@ class MainWindow(QMainWindow):
             f"התסריט המלא נוצר ונשמר ({len(lines)} שורות)! לחץ ▶ להקראה רב-קולית.",
             6000,
         )
+        self._refresh_resume_banner()
 
     def export_current_script(self):
         if not self.current_script_data:
@@ -1280,33 +1729,62 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "שגיאה בשמירה", str(e))
 
     # --- Translation Engine (AI or Free — תרגום כל המשפטים ושמירה אטומית) ---
-    def open_translate_dialog(self):
-        dlg = TranslateDialog(self, self.settings)
-        if not dlg.exec():
-            return
-        opts = dlg.get_options()
-        book = self.books[self.current_book_index]
-        chapter = book["chapters"][self.current_chapter_index]
-        source_text = chapter["text"]
+    def _run_chapter_translation_job(self, book: Dict[str, Any], chapter_idx: int, opts: Dict[str, Any]):
+        source_text = book["chapters"][chapter_idx]["text"]
         cfg = self.settings
         book_id = book.get("id", "")
-        chapter_idx = self.current_chapter_index
+        trans_opts = {
+            "source_lang": opts.get("source_lang", "auto"),
+            "target_lang": opts.get("target_lang", "he"),
+            "fallback_to_ai_on_failure": bool(
+                opts.get(
+                    "fallback_to_ai_on_failure",
+                    self.settings.get("translation", {}).get("fallback_to_ai_on_failure", False),
+                )
+            ),
+        }
+        if opts.get("engine"):
+            trans_opts["engine"] = opts["engine"]
+
+        def _retry_same_or_switched():
+            updated_opts = dict(opts)
+            updated_opts["engine"] = self.settings.get("translation", {}).get("engine", "google_free")
+            updated_opts["fallback_to_ai_on_failure"] = bool(
+                self.settings.get("translation", {}).get("fallback_to_ai_on_failure", False)
+            )
+            self._run_chapter_translation_job(book, chapter_idx, updated_opts)
 
         self._run_background_task(
-            "מתרגם את כל משפטֵי הפרק ושומר אטומית...",
+            "מתרגם את כל משפטֵי הפרק ושומר אטומית אחרי כל יחידה...",
             lambda cancel_ev, prog_cb: ensure_translation_for_chapter(
                 book_id=book_id,
                 chapter_index=chapter_idx,
                 source_text=source_text,
                 settings=cfg,
-                translation_opts=opts,
+                translation_opts=trans_opts,
                 store=self.store,
                 cancel_event=cancel_ev,
                 progress_cb=prog_cb,
             ),
-            lambda res: self._on_translation_done(res, replace_reader=opts["replace_reader"]),
+            lambda res: self._on_translation_done(res, replace_reader=opts.get("replace_reader", True)),
             title="תרגום פרק מלא",
+            on_error=lambda err_d: self._handle_chapter_task_recovery(
+                book=book,
+                chapter_index=chapter_idx,
+                stage="translation",
+                err_details=err_d,
+                retry_fn=_retry_same_or_switched,
+            ),
         )
+
+    def open_translate_dialog(self):
+        dlg = TranslateDialog(self, self.settings)
+        if not dlg.exec():
+            return
+        opts = dlg.get_options()
+        self._apply_fallback_policy_preference(opts.get("fallback_to_ai_on_failure"))
+        book = self.books[self.current_book_index]
+        self._run_chapter_translation_job(book, self.current_chapter_index, opts)
 
     def _on_translation_done(self, res: dict, replace_reader: bool):
         translated = res.get("translated_text", "")
@@ -1338,6 +1816,7 @@ class MainWindow(QMainWindow):
             self.companion_widget.setVisible(True)
             self.comp_text.setMarkdown("\n\n".join(md_blocks))
             self.statusBar.showMessage(f"התרגום הושלם ונשמר ({engine_label}).", 5000)
+        self._refresh_resume_banner()
 
     # --- Enforced Audiobook Export Pipeline (פרק נוכחי / הספר כולו) ---
     def export_whole_book_audio_dialog(self):
@@ -1446,23 +1925,18 @@ class MainWindow(QMainWindow):
                 if not target_path.lower().endswith(".mp3"):
                     target_path = f"{os.path.splitext(target_path)[0]}.mp3"
 
-            total_ch = len(chapters)
-            self.statusBar.showMessage(f"מפעיל יצוא מלא לכל הספר ({total_ch} פרקים לפי הסדר)...")
-            self._export_thread = PipelineExportThread(
-                {
-                    "book": deepcopy(book),
-                    "output_path": target_path,
-                    "package_mode": package_mode,
-                    "settings": deepcopy(self.settings),
-                    "translation_opts": opts["translation_opts"],
-                    "script_opts": opts["script_opts"],
-                    "tts_opts": opts["tts_opts"],
-                    "store": self.store,
-                },
-                scope="book",
-            )
-            dlg_title = f"📚🎧 מייצא את הספר כולו ({total_ch} פרקים)"
-            initial_lbl = f"מתחיל עיבוד הספר כולו ({total_ch} פרקים לפי הסדר)..."
+            if "fallback_to_ai_on_failure" in (opts.get("translation_opts") or {}):
+                self._apply_fallback_policy_preference(bool(opts["translation_opts"]["fallback_to_ai_on_failure"]))
+
+            self._launch_whole_book_export_thread({
+                "book": deepcopy(book),
+                "output_path": target_path,
+                "package_mode": package_mode,
+                "translation_opts": opts["translation_opts"],
+                "script_opts": opts["script_opts"],
+                "tts_opts": opts["tts_opts"],
+            })
+            return
         else:
             default_name = f"{safe_title}_chapter_{chapter_idx + 1}.{fmt}"
             filter_str = (
@@ -1525,6 +1999,8 @@ class MainWindow(QMainWindow):
             self._export_progress_dlg.close()
             self._export_progress_dlg = None
 
+        self._refresh_resume_banner()
+
         scope = res.get("scope", "chapter")
         if res.get("success") and res.get("status") == "completed":
             saved_path = res.get("output_path", "")
@@ -1559,12 +2035,15 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         elif res.get("status") == "cancelled":
-            self.statusBar.showMessage("היצוא בוטל — לא נשמר תוצר סופי חלקי.", 5000)
+            self.statusBar.showMessage("היצוא בוטל — התקדמות תקינה נשמרה אטומית.", 5000)
             QMessageBox.information(
                 self,
                 "היצוא בוטל",
-                f"התהליך בוטל בשלב '{res.get('stage', '')}'. לא נוצר קובץ סופי חלקי (פרקים קודמים נשמרו להמשך).",
+                f"התהליך בוטל בשלב '{res.get('stage', '')}'. לא נוצר קובץ סופי חלקי (יחידות ופרקים קודמים נשמרו להמשך).",
             )
+        elif scope == "book":
+            self.statusBar.showMessage("ייצוא הספר נעצר — התקדמות תקינה נשמרה להתאוששות.", 6000)
+            self._handle_whole_book_recovery(res, is_export=True)
         else:
             stage = res.get("stage", "")
             err = res.get("error", "שגיאה לא ידועה")

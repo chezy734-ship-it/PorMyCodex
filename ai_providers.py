@@ -13,6 +13,7 @@
 
 import json
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -33,12 +34,24 @@ class AICallError(RuntimeError):
         category: str = "error",
         retryable: bool = False,
         status_code: Optional[int] = None,
+        provider_id: str = "",
+        blocked_filter: str = "",
     ):
         super().__init__(message)
         self.stage = stage
         self.category = category
         self.retryable = retryable
         self.status_code = status_code
+        self.provider_id = provider_id
+        self.blocked_filter = blocked_filter
+
+    @property
+    def is_blocked(self) -> bool:
+        return (
+            self.category == "blocked"
+            or self.status_code in (418, 451)
+            or bool(self.blocked_filter)
+        )
 
 
 class AICancelledError(AICallError):
@@ -75,6 +88,183 @@ def _sanitize_error_text(text: str, secrets: Optional[List[str]] = None) -> str:
     cleaned = re.sub(r"(ghp_[0-9A-Za-z]{8,})", "[REDACTED_KEY]", cleaned)
     cleaned = re.sub(r"([?&](?:key|api_key)=)[^&\s]+", r"\1[REDACTED_KEY]", cleaned, flags=re.IGNORECASE)
     return cleaned
+
+
+def detect_blocked_response(
+    resp: Any,
+    body_text: str = "",
+    secrets: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    מזהה תגובת חסימה / סינון תוכן / דף HTML במקום JSON או טקסט שירות תקין
+    (כגון HTTP 418, דף חסימה של NetFree, או תגובת HTML משער/פרוקסי).
+    לעולם אינו מחזיר את גוף ה-HTML הגולמי למשתמש.
+    """
+    code = int(getattr(resp, "status_code", 0) or 0) if resp is not None else 0
+    headers_raw = getattr(resp, "headers", None) or {}
+    content_type = ""
+    if isinstance(headers_raw, dict):
+        for hk, hv in headers_raw.items():
+            if str(hk).lower() == "content-type":
+                content_type = str(hv or "").lower()
+                break
+
+    raw_text = body_text or (getattr(resp, "text", "") if resp is not None else "") or ""
+    sample = _sanitize_error_text(str(raw_text)[:4096], secrets=secrets)
+    low = sample.lower()
+
+    is_html_ct = "text/html" in content_type or "application/xhtml" in content_type
+    is_html_body = any(
+        tok in low
+        for tok in (
+            "<!doctype html",
+            "<html",
+            "<head>",
+            "<head ",
+            "<body>",
+            "<body ",
+            "<title>",
+        )
+    )
+    is_html = is_html_ct or is_html_body
+
+    filter_name = ""
+    if any(tok in low for tok in ("netfree.link", "netfree", "נטפרי")):
+        filter_name = "סינון NetFree (netfree.link)"
+    elif any(
+        tok in low
+        for tok in ("אתר זה חסום", "האתר חסום", "סינון אינטרנט", "blocked by", "content filter", "web filter")
+    ):
+        filter_name = "מסנן תוכן"
+    elif is_html:
+        filter_name = "דף HTML במקום JSON"
+
+    if code in (418, 451):
+        return {
+            "is_blocked": True,
+            "status_code": code,
+            "is_html": is_html,
+            "filter_name": filter_name or f"חסימת שרת/סינון (HTTP {code})",
+        }
+
+    if is_html or filter_name:
+        if code in (0, 200, 403, 406, 407, 429, 451, 502, 503) or code >= 400:
+            return {
+                "is_blocked": True,
+                "status_code": code,
+                "is_html": is_html,
+                "filter_name": filter_name or "תגובת HTML/חסימה",
+            }
+
+    return None
+
+
+class ProviderCircuitBreaker:
+    """
+    מפסק זרם (Circuit Breaker) לפי ספק/מנוע למניעת לולאת ניסיונות אינסופית כאשר ספק נחסם
+    (למשל HTTP 418 / NetFree) או סובל מכשלים רצופים לאורך עשרות פרקים.
+    """
+
+    def __init__(self, transient_threshold: int = 4):
+        self._lock = threading.RLock()
+        self._transient_threshold = max(2, int(transient_threshold))
+        self._states: Dict[str, Dict[str, Any]] = {}
+
+    def is_open(self, provider_id: str) -> bool:
+        with self._lock:
+            st = self._states.get(provider_id)
+            return bool(st and st.get("open"))
+
+    def get_state(self, provider_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            st = self._states.get(provider_id)
+            return dict(st) if st else None
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._states.items()}
+
+    def reset(self, provider_id: Optional[str] = None) -> None:
+        with self._lock:
+            if provider_id is None:
+                self._states.clear()
+            else:
+                self._states.pop(provider_id, None)
+
+    def check_or_raise(self, provider_id: str, stage: str = "תרגום") -> None:
+        with self._lock:
+            st = self._states.get(provider_id)
+            if not st or not st.get("open"):
+                return
+            reason = st.get("reason") or f"הספק '{provider_id}' נחסם זמנית בצינור זה."
+            raise AICallError(
+                reason,
+                stage=stage or st.get("stage") or "תרגום",
+                category=st.get("category") or "blocked",
+                retryable=False,
+                status_code=st.get("status_code"),
+                provider_id=provider_id,
+                blocked_filter=st.get("blocked_filter", ""),
+            )
+
+    def record_success(self, provider_id: str) -> None:
+        with self._lock:
+            st = self._states.get(provider_id)
+            if st and not st.get("open"):
+                st["consecutive_transient"] = 0
+
+    def record_failure(self, provider_id: str, err: Exception) -> bool:
+        cat = str(getattr(err, "category", "") or "").lower()
+        code = getattr(err, "status_code", None)
+        b_filter = str(getattr(err, "blocked_filter", "") or "")
+        stage = str(getattr(err, "stage", "") or "תרגום")
+        err_msg = str(err or "")
+
+        is_hard_block = (
+            cat in ("blocked", "auth", "model_not_found")
+            or code in (418, 451)
+            or bool(b_filter)
+            or "netfree" in err_msg.lower()
+            or "418" in err_msg
+        )
+
+        with self._lock:
+            st = self._states.setdefault(
+                provider_id,
+                {
+                    "open": False,
+                    "category": "",
+                    "status_code": None,
+                    "blocked_filter": "",
+                    "reason": "",
+                    "stage": stage,
+                    "tripped_at": 0.0,
+                    "consecutive_transient": 0,
+                },
+            )
+            if is_hard_block:
+                st["open"] = True
+                st["category"] = "blocked" if (cat == "blocked" or code in (418, 451) or b_filter) else cat
+                st["status_code"] = code
+                st["blocked_filter"] = b_filter
+                st["stage"] = stage
+                st["reason"] = err_msg
+                st["tripped_at"] = time.monotonic()
+                return True
+
+            st["consecutive_transient"] = int(st.get("consecutive_transient", 0)) + 1
+            if st["consecutive_transient"] >= self._transient_threshold:
+                st["open"] = True
+                st["category"] = cat or "network"
+                st["status_code"] = code
+                st["blocked_filter"] = b_filter
+                st["stage"] = stage
+                st["reason"] = (
+                    f"הופסקו ניסיונות חוזרים מול '{provider_id}' עקב {st['consecutive_transient']} כשלים רצופים: {err_msg}"
+                )
+                st["tripped_at"] = time.monotonic()
+                return True
+            return False
 
 
 def _check_cancelled(cancel_event: Any, stage: str) -> None:
@@ -167,6 +357,8 @@ def _classify_timeout_kind(exc: Exception) -> str:
 
 
 def _parse_api_error_detail(resp: Any, secrets: Optional[List[str]] = None) -> str:
+    if detect_blocked_response(resp, secrets=secrets) is not None:
+        return ""
     detail = ""
     try:
         err_json = resp.json()
@@ -177,7 +369,10 @@ def _parse_api_error_detail(resp: Any, secrets: Optional[List[str]] = None) -> s
             else:
                 detail = str(err_val or err_json.get("message") or "")
     except Exception:
-        detail = (getattr(resp, "text", "") or "")[:240]
+        raw = (getattr(resp, "text", "") or "")[:240]
+        if "<html" in raw.lower() or "<!doctype" in raw.lower():
+            return ""
+        detail = raw
     return _sanitize_error_text(detail.strip(), secrets=secrets)
 
 
@@ -189,6 +384,26 @@ def _build_http_error(
     secrets: Optional[List[str]] = None,
 ) -> AICallError:
     code = int(getattr(resp, "status_code", 0) or 0)
+    blk = detect_blocked_response(resp, secrets=secrets)
+    if blk is not None:
+        f_name = blk.get("filter_name") or ""
+        f_note = f" — זוהה: {f_name}" if f_name else ""
+        code_txt = f"HTTP {code}" if code else "תגובת חסימה"
+        msg = (
+            f"השירות '{provider_name}' חסום בשלב '{stage}' ({code_txt}{f_note}): "
+            "התקבל דף חסימה/HTML במקום תשובת שירות תקינה.\n"
+            "אפשרויות התאוששות: בדוק את מדיניות הסינון, הפעל מעבר מורשה לספק ה-AI שנבחר, או החלף ספק והמשך מהשמירה."
+        )
+        return AICallError(
+            msg,
+            stage=stage,
+            category="blocked",
+            retryable=False,
+            status_code=code,
+            provider_id=provider_name,
+            blocked_filter=f_name,
+        )
+
     detail = _parse_api_error_detail(resp, secrets=secrets)
     detail_suffix = f" ({detail})" if detail else ""
 
@@ -252,10 +467,12 @@ def execute_http_with_retry(
     secrets: Optional[List[str]] = None,
     request_fn: Optional[Callable[..., Any]] = None,
     clock_fn: Optional[Callable[[], float]] = None,
+    expect_json: bool = False,
 ) -> Any:
     """
     מבצע בקשת HTTP עם הפרדת (connect_timeout, read_timeout), תקציב זמן כולל (total_deadline),
     מספר מוגבל של ניסיונות חוזרים לכשלים זמניים בלבד, וביטול מיידי גם באמצע Retry/Backoff.
+    מזהה תגובות חסימה (418 / HTML / NetFree) ומונע ניסיונות חוזרים עיוורים.
     """
     req = _require_requests() if request_fn is None else None
     caller = request_fn if request_fn is not None else req.request
@@ -291,6 +508,16 @@ def execute_http_with_retry(
             _check_cancelled(cancel_event, stage)
 
             if getattr(resp, "ok", False):
+                if expect_json:
+                    blk_ok = detect_blocked_response(resp, secrets=secrets)
+                    if blk_ok is not None:
+                        raise _build_http_error(
+                            provider_name,
+                            resp,
+                            stage=stage,
+                            selected_model=selected_model,
+                            secrets=secrets,
+                        )
                 return resp
 
             code = int(getattr(resp, "status_code", 0) or 0)
@@ -301,7 +528,7 @@ def execute_http_with_retry(
                 selected_model=selected_model,
                 secrets=secrets,
             )
-            if code not in transient_http_codes or attempt >= retries_allowed:
+            if err.category == "blocked" or code not in transient_http_codes or attempt >= retries_allowed:
                 raise err
 
             last_error = err
@@ -596,6 +823,7 @@ def discover_models_detailed(
                 secrets=secrets,
                 request_fn=request_fn,
                 clock_fn=clock_fn,
+                expect_json=True,
             )
             data = resp.json() if hasattr(resp, "json") else {}
             pages_fetched += 1
@@ -636,6 +864,7 @@ def discover_models_detailed(
                 secrets=secrets,
                 request_fn=request_fn,
                 clock_fn=clock_fn,
+                expect_json=True,
             )
             data = resp.json() if hasattr(resp, "json") else {}
             pages_fetched += 1
@@ -679,6 +908,7 @@ def discover_models_detailed(
                     secrets=secrets,
                     request_fn=request_fn,
                     clock_fn=clock_fn,
+                    expect_json=True,
                 )
             except AICallError as err:
                 if provider_id == "custom" and err.status_code == 404 and not ollama_checked and pages_fetched == 0:
@@ -699,6 +929,7 @@ def discover_models_detailed(
                         secrets=secrets,
                         request_fn=request_fn,
                         clock_fn=clock_fn,
+                        expect_json=True,
                     )
                     odata = ollama_resp.json() if hasattr(ollama_resp, "json") else {}
                     pages_fetched += 1
@@ -865,6 +1096,7 @@ def chat_completion(
             secrets=secrets,
             request_fn=request_fn,
             clock_fn=clock_fn,
+            expect_json=True,
         )
         data = resp.json()
         candidates = data.get("candidates", [])
@@ -906,6 +1138,7 @@ def chat_completion(
             secrets=secrets,
             request_fn=request_fn,
             clock_fn=clock_fn,
+            expect_json=True,
         )
         data = resp.json()
         blocks = data.get("content", [])
@@ -947,6 +1180,7 @@ def chat_completion(
             secrets=secrets,
             request_fn=request_fn,
             clock_fn=clock_fn,
+            expect_json=True,
         )
         data = resp.json()
         choices = data.get("choices", [])

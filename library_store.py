@@ -119,26 +119,30 @@ def compute_source_hash(text: str) -> str:
     return _sha256_obj({"text": norm, "sentences": sents})
 
 
+def compute_unit_source_hash(text: str) -> str:
+    norm = (text or "").replace("\r\n", "\n").strip()
+    return _sha256_obj({"unit_text": norm})
+
+
 def compute_translation_config_hash(
     settings: Dict[str, Any],
     engine: str,
     source_lang: str,
     target_lang: str,
+    translation_instruction: str = "",
 ) -> str:
-    trans_cfg = (settings or {}).get("translation", {})
+    """
+    מחשב חתימת תוקף להגדרות התרגום המהותיות בלבד (שפת מקור, שפת יעד, והוראות תרגום מהותיות).
+    שם ספק התרגום/מנוע/מודל נשמר כתיעוד מקור (provenance) על כל תוצר ואינו פוסל תרגומים תקינים
+    שכבר הושלמו כאשר מחליפים ספק לצורך התאוששות (למשל עקב חסימת שרת).
+    """
     payload: Dict[str, Any] = {
-        "engine": (engine or "google_free").strip(),
         "source_lang": (source_lang or "auto").strip(),
         "target_lang": (target_lang or "he").strip(),
     }
-    if payload["engine"] == "libretranslate":
-        payload["libretranslate_url"] = (trans_cfg.get("libretranslate_url") or "").strip()
-    elif payload["engine"] == "ai":
-        pid = (settings or {}).get("active_provider", "gemini")
-        pconf = ((settings or {}).get("providers") or {}).get(pid, {})
-        payload["ai_provider"] = pid
-        payload["ai_model"] = (pconf.get("model") or "").strip()
-        payload["ai_base_url"] = (pconf.get("base_url") or "").strip()
+    clean_inst = (translation_instruction or "").strip()
+    if clean_inst:
+        payload["translation_instruction"] = clean_inst
     return _sha256_obj(payload)
 
 
@@ -337,15 +341,758 @@ class LibraryStore:
         state = self.load_raw_state()
         ck = chapter_key(book_id, chapter_index)
         art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+        prev_t = art.get("translation")
+        if isinstance(prev_t, dict) and prev_t.get("is_complete"):
+            if (
+                prev_t.get("source_hash") != translation_record.get("source_hash")
+                or prev_t.get("config_hash") != translation_record.get("config_hash")
+                or prev_t.get("translated_hash") != translation_record.get("translated_hash")
+            ):
+                hist = art.setdefault("translation_history", [])
+                hist.append(deepcopy(prev_t))
+                if len(hist) > 10:
+                    del hist[:-10]
+
         rec = deepcopy(translation_record)
         rec["saved_at"] = _now_iso()
         art["translation"] = rec
-        # תרגום חדש פוסל כל תסריט ישן שאינו תואם לתרגום החדש
+
+        # סנכרון מלא של translation_progress כך שיחידות שלא השתנו בהמשך יוכלו להישמר ממוקדת
+        src_sents = rec.get("source_sentences") or []
+        dst_sents = rec.get("translated_sentences") or []
+        u_prov = rec.get("unit_provenance") or {}
+        if src_sents and len(src_sents) == len(dst_sents):
+            existing_tp = art.get("translation_progress") if isinstance(art.get("translation_progress"), dict) else {}
+            prev_units = existing_tp.get("units") if isinstance(existing_tp.get("units"), dict) else {}
+            units_map: Dict[str, Any] = {}
+            for i, (ss, ds) in enumerate(zip(src_sents, dst_sents)):
+                key = str(i)
+                prior_u = prev_units.get(key) if isinstance(prev_units.get(key), dict) else {}
+                hist_u = list(prior_u.get("previous_versions") or [])
+                if (
+                    prior_u.get("status") == "completed"
+                    and (prior_u.get("translated_text") or "").strip()
+                    and (
+                        prior_u.get("unit_source_hash") != compute_unit_source_hash(ss)
+                        or prior_u.get("config_hash") != rec.get("config_hash")
+                    )
+                ):
+                    snap = {k: v for k, v in prior_u.items() if k != "previous_versions"}
+                    hist_u.append(snap)
+                    if len(hist_u) > 5:
+                        hist_u = hist_u[-5:]
+                p_info = u_prov.get(key) if isinstance(u_prov.get(key), dict) else {}
+                units_map[key] = {
+                    "unit_id": f"u{i + 1}",
+                    "unit_index": i,
+                    "source_text": ss,
+                    "unit_source_hash": compute_unit_source_hash(ss),
+                    "config_hash": rec.get("config_hash", ""),
+                    "translated_text": ds,
+                    "status": "completed",
+                    "engine": p_info.get("engine") or rec.get("engine", ""),
+                    "engine_label": p_info.get("engine_label") or rec.get("engine_label", ""),
+                    "ai_provider": p_info.get("ai_provider") if "ai_provider" in p_info else rec.get("ai_provider", ""),
+                    "ai_model": p_info.get("ai_model") if "ai_model" in p_info else rec.get("ai_model", ""),
+                    "fallback_used": bool(p_info.get("fallback_used", rec.get("fallback_used", False))),
+                    "error": "",
+                    "previous_versions": hist_u,
+                    "updated_at": rec["saved_at"],
+                }
+            art["translation_progress"] = {
+                "book_id": book_id,
+                "chapter_index": int(chapter_index),
+                "source_hash": rec.get("source_hash", ""),
+                "config_hash": rec.get("config_hash", ""),
+                "source_lang": rec.get("source_lang", "auto"),
+                "target_lang": rec.get("target_lang", "he"),
+                "total_units": len(src_sents),
+                "status": "completed",
+                "completed_count": len(src_sents),
+                "missing_count": 0,
+                "failed_count": 0,
+                "outdated_count": 0,
+                "next_unit_index": len(src_sents),
+                "next_unit_id": "",
+                "units": units_map,
+                "updated_at": rec["saved_at"],
+            }
+
+        # תרגום חדש פוסל רק את הסטטוס השלם של התסריט הישן אם התרגום הכולל השתנה (תוך שמירה בארכיון, ללא מחיקה עיוורת)
         existing_script = art.get("script")
         if existing_script and existing_script.get("translation_hash") != rec.get("translated_hash"):
+            shist = art.setdefault("script_history", [])
+            shist.append(deepcopy(existing_script))
+            if len(shist) > 10:
+                del shist[:-10]
             art.pop("script", None)
             art.pop("last_export", None)
+
+        # ניקוי רשומת כשל ישנה אם הפרק שוחזר/תורגם בהצלחה
+        job = (state.get("whole_book_jobs") or {}).get(book_id)
+        if isinstance(job, dict) and isinstance(job.get("failed_chapters"), dict):
+            job["failed_chapters"].pop(str(int(chapter_index)), None)
+            if isinstance(job.get("completed_translations"), list) and int(chapter_index) not in job["completed_translations"]:
+                job["completed_translations"].append(int(chapter_index))
+                job["completed_translations"].sort()
         self._save_raw_state(state)
+
+    def _compute_translation_progress_view(
+        self,
+        art: Dict[str, Any],
+        book_id: str,
+        chapter_index: int,
+        source_sentences: List[str],
+        config_hash: str,
+        source_lang: str,
+        target_lang: str,
+        source_hash: str,
+    ) -> Dict[str, Any]:
+        """מחזיר תמונת מצב עקבית של יחידות התרגום (ללא כתיבה לדיסק) תוך פסילה ממוקדת בלבד."""
+        total = len(source_sentences)
+        raw_tp = art.get("translation_progress") if isinstance(art.get("translation_progress"), dict) else {}
+        existing_units = raw_tp.get("units") if isinstance(raw_tp.get("units"), dict) else {}
+
+        # אם לא קיים translation_progress אך קיים תרגום שלם קודם (למשל מגרסה קודמת לפני עדכון ה-schema),
+        # טוענים אותו כבסיס להשוואת יחידות כדי ששינוי מקור נקודתי ישמר יחידות זהות.
+        if not existing_units:
+            prev_complete = art.get("translation") if isinstance(art.get("translation"), dict) else {}
+            p_src = prev_complete.get("source_sentences") or []
+            p_dst = prev_complete.get("translated_sentences") or []
+            p_cfg = prev_complete.get("config_hash", "")
+            if p_src and len(p_src) == len(p_dst):
+                seeded: Dict[str, Any] = {}
+                for i, (ss, ds) in enumerate(zip(p_src, p_dst)):
+                    if (ds or "").strip():
+                        seeded[str(i)] = {
+                            "unit_id": f"u{i + 1}",
+                            "unit_index": i,
+                            "source_text": ss,
+                            "unit_source_hash": compute_unit_source_hash(ss),
+                            "config_hash": p_cfg,
+                            "translated_text": ds,
+                            "status": "completed",
+                            "engine": prev_complete.get("engine", ""),
+                            "engine_label": prev_complete.get("engine_label", ""),
+                            "ai_provider": prev_complete.get("ai_provider", ""),
+                            "ai_model": prev_complete.get("ai_model", ""),
+                            "fallback_used": bool(prev_complete.get("fallback_used", False)),
+                            "error": "",
+                        }
+                existing_units = seeded
+
+        units_out: Dict[str, Any] = {}
+        completed_cnt = 0
+        failed_cnt = 0
+        outdated_cnt = 0
+        next_idx: Optional[int] = None
+
+        for i, sent in enumerate(source_sentences):
+            key = str(i)
+            u_hash = compute_unit_source_hash(sent)
+            prev = existing_units.get(key) if isinstance(existing_units.get(key), dict) else None
+            hist = list((prev or {}).get("previous_versions") or [])
+            if prev:
+                prev_status = prev.get("status", "pending")
+                same_unit = (prev.get("unit_source_hash") == u_hash and prev.get("config_hash") == config_hash)
+                if same_unit and prev_status == "completed" and (prev.get("translated_text") or "").strip():
+                    u_entry = deepcopy(prev)
+                    u_entry["unit_id"] = f"u{i + 1}"
+                    u_entry["unit_index"] = i
+                    units_out[key] = u_entry
+                    completed_cnt += 1
+                    continue
+                if prev_status == "completed" and (prev.get("translated_text") or "").strip():
+                    snap = {k: v for k, v in prev.items() if k != "previous_versions"}
+                    if not hist or hist[-1].get("unit_source_hash") != snap.get("unit_source_hash") or hist[-1].get("config_hash") != snap.get("config_hash"):
+                        hist.append(snap)
+                        if len(hist) > 5:
+                            hist = hist[-5:]
+                    units_out[key] = {
+                        "unit_id": f"u{i + 1}",
+                        "unit_index": i,
+                        "source_text": sent,
+                        "unit_source_hash": u_hash,
+                        "config_hash": config_hash,
+                        "translated_text": "",
+                        "status": "outdated",
+                        "engine": "",
+                        "engine_label": "",
+                        "ai_provider": "",
+                        "ai_model": "",
+                        "fallback_used": False,
+                        "error": "היחידה התיישנה בעקבות שינוי טקסט המקור או הגדרות שפה/הוראות.",
+                        "previous_versions": hist,
+                        "updated_at": prev.get("updated_at", ""),
+                    }
+                    outdated_cnt += 1
+                    if next_idx is None:
+                        next_idx = i
+                    continue
+                if same_unit and prev_status == "failed":
+                    u_entry = deepcopy(prev)
+                    u_entry["unit_id"] = f"u{i + 1}"
+                    u_entry["unit_index"] = i
+                    u_entry["previous_versions"] = hist
+                    units_out[key] = u_entry
+                    failed_cnt += 1
+                    if next_idx is None:
+                        next_idx = i
+                    continue
+
+            units_out[key] = {
+                "unit_id": f"u{i + 1}",
+                "unit_index": i,
+                "source_text": sent,
+                "unit_source_hash": u_hash,
+                "config_hash": config_hash,
+                "translated_text": "",
+                "status": "pending",
+                "engine": "",
+                "engine_label": "",
+                "ai_provider": "",
+                "ai_model": "",
+                "fallback_used": False,
+                "error": "",
+                "previous_versions": hist,
+            }
+            if next_idx is None:
+                next_idx = i
+
+        if next_idx is None:
+            next_idx = total
+        missing_cnt = max(0, total - completed_cnt)
+        status_val = raw_tp.get("status", "pending")
+        if total > 0 and completed_cnt == total:
+            status_val = "completed"
+        elif failed_cnt > 0 and status_val not in ("blocked", "cancelled"):
+            status_val = "failed"
+        elif outdated_cnt > 0 and status_val == "completed":
+            status_val = "in_progress"
+
+        return {
+            "book_id": book_id,
+            "chapter_index": int(chapter_index),
+            "source_hash": source_hash,
+            "config_hash": config_hash,
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "total_units": total,
+            "status": status_val,
+            "completed_count": completed_cnt,
+            "missing_count": missing_cnt,
+            "failed_count": failed_cnt,
+            "outdated_count": outdated_cnt,
+            "next_unit_index": next_idx,
+            "next_unit_id": f"u{next_idx + 1}" if next_idx < total else "",
+            "units": units_out,
+            "updated_at": raw_tp.get("updated_at", ""),
+        }
+
+    def reconcile_translation_progress(
+        self,
+        book_id: str,
+        chapter_index: int,
+        source_sentences: List[str],
+        config_hash: str,
+        source_lang: str,
+        target_lang: str,
+        source_hash: str,
+        *,
+        persist: bool = False,
+    ) -> Dict[str, Any]:
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.get("chapter_artifacts", {}).get(ck, {})
+        view = self._compute_translation_progress_view(
+            art=art,
+            book_id=book_id,
+            chapter_index=chapter_index,
+            source_sentences=source_sentences,
+            config_hash=config_hash,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            source_hash=source_hash,
+        )
+        if persist and art is not None:
+            art_mut = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+            view["updated_at"] = _now_iso()
+            art_mut["translation_progress"] = view
+            self._save_raw_state(state)
+        return view
+
+    def save_translation_unit_progress(
+        self,
+        book_id: str,
+        chapter_index: int,
+        source_sentences: List[str],
+        source_hash: str,
+        config_hash: str,
+        source_lang: str,
+        target_lang: str,
+        unit_index: int,
+        unit_status: str,
+        *,
+        translated_text: str = "",
+        engine: str = "",
+        engine_label: str = "",
+        ai_provider: str = "",
+        ai_model: str = "",
+        fallback_used: bool = False,
+        error: str = "",
+        job_status: str = "in_progress",
+    ) -> Dict[str, Any]:
+        """שומר אטומית התקדמות ברמת משפט בודד מבלי לסמן פרק חלקי כמוכן ליצוא."""
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+        view = self._compute_translation_progress_view(
+            art=art,
+            book_id=book_id,
+            chapter_index=chapter_index,
+            source_sentences=source_sentences,
+            config_hash=config_hash,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            source_hash=source_hash,
+        )
+        idx = int(unit_index)
+        total = len(source_sentences)
+        if 0 <= idx < total:
+            key = str(idx)
+            sent = source_sentences[idx]
+            existing_u = view["units"].get(key) or {}
+            hist = list(existing_u.get("previous_versions") or [])
+            now_ts = _now_iso()
+            if unit_status == "completed" and (translated_text or "").strip():
+                view["units"][key] = {
+                    "unit_id": f"u{idx + 1}",
+                    "unit_index": idx,
+                    "source_text": sent,
+                    "unit_source_hash": compute_unit_source_hash(sent),
+                    "config_hash": config_hash,
+                    "translated_text": translated_text.strip(),
+                    "status": "completed",
+                    "engine": engine,
+                    "engine_label": engine_label,
+                    "ai_provider": ai_provider,
+                    "ai_model": ai_model,
+                    "fallback_used": bool(fallback_used),
+                    "error": "",
+                    "previous_versions": hist,
+                    "updated_at": now_ts,
+                }
+            else:
+                view["units"][key] = {
+                    "unit_id": f"u{idx + 1}",
+                    "unit_index": idx,
+                    "source_text": sent,
+                    "unit_source_hash": compute_unit_source_hash(sent),
+                    "config_hash": config_hash,
+                    "translated_text": existing_u.get("translated_text", "") if existing_u.get("status") == "completed" else "",
+                    "status": unit_status if existing_u.get("status") != "completed" else "completed",
+                    "engine": engine or existing_u.get("engine", ""),
+                    "engine_label": engine_label or existing_u.get("engine_label", ""),
+                    "ai_provider": ai_provider,
+                    "ai_model": ai_model,
+                    "fallback_used": bool(fallback_used),
+                    "error": error,
+                    "previous_versions": hist,
+                    "updated_at": now_ts,
+                }
+
+        completed_cnt = 0
+        failed_cnt = 0
+        outdated_cnt = 0
+        next_idx: Optional[int] = None
+        for i in range(total):
+            u = view["units"].get(str(i), {})
+            st_u = u.get("status", "pending")
+            if st_u == "completed":
+                completed_cnt += 1
+            else:
+                if next_idx is None:
+                    next_idx = i
+                if st_u == "failed":
+                    failed_cnt += 1
+                elif st_u == "outdated":
+                    outdated_cnt += 1
+
+        if next_idx is None:
+            next_idx = total
+        view["completed_count"] = completed_cnt
+        view["missing_count"] = max(0, total - completed_cnt)
+        view["failed_count"] = failed_cnt
+        view["outdated_count"] = outdated_cnt
+        view["next_unit_index"] = next_idx
+        view["next_unit_id"] = f"u{next_idx + 1}" if next_idx < total else ""
+        view["status"] = job_status
+        view["updated_at"] = _now_iso()
+        art["translation_progress"] = view
+        self._save_raw_state(state)
+        return view
+
+    def mark_translation_progress_status(
+        self,
+        book_id: str,
+        chapter_index: int,
+        job_status: str,
+    ) -> None:
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.get("chapter_artifacts", {}).get(ck)
+        if isinstance(art, dict) and isinstance(art.get("translation_progress"), dict):
+            art["translation_progress"]["status"] = job_status
+            art["translation_progress"]["updated_at"] = _now_iso()
+            self._save_raw_state(state)
+
+    def _compute_script_progress_view(
+        self,
+        art: Dict[str, Any],
+        book_id: str,
+        chapter_index: int,
+        batches_spec: List[Dict[str, Any]],
+        source_hash: str,
+        translation_hash: str,
+        config_hash: str,
+        mode: str,
+    ) -> Dict[str, Any]:
+        total_batches = len(batches_spec)
+        total_units = sum(len(b["unit_ids"]) for b in batches_spec)
+        raw_sp = art.get("script_progress") if isinstance(art.get("script_progress"), dict) else {}
+        existing_batches = raw_sp.get("batches") if isinstance(raw_sp.get("batches"), dict) else {}
+
+        # אם לא קיים script_progress אך קיים תסריט שלם קודם, אפשר לשחזר אצוות תקינות שיחידות התרגום שלהן לא השתנו
+        if not existing_batches:
+            prev_complete = art.get("script") if isinstance(art.get("script"), dict) else {}
+            prev_lines = prev_complete.get("lines") or []
+            prev_cfg = prev_complete.get("config_hash", "")
+            prev_th = prev_complete.get("translation_hash", "")
+            if prev_lines and prev_cfg == config_hash and prev_th == translation_hash:
+                by_uid: Dict[str, List[Dict[str, Any]]] = {}
+                for ln in prev_lines:
+                    if isinstance(ln, dict) and ln.get("unitId"):
+                        by_uid.setdefault(str(ln["unitId"]), []).append(ln)
+                seeded_b: Dict[str, Any] = {}
+                for b in batches_spec:
+                    b_idx = b["batch_index"]
+                    uids = b["unit_ids"]
+                    if all(uid in by_uid for uid in uids):
+                        b_lines = []
+                        for uid in uids:
+                            b_lines.extend(by_uid[uid])
+                        seeded_b[str(b_idx)] = {
+                            "batch_index": b_idx,
+                            "unit_ids": uids,
+                            "unit_hashes": b["unit_hashes"],
+                            "config_hash": prev_cfg,
+                            "status": "completed",
+                            "title": prev_complete.get("title", ""),
+                            "lines": b_lines,
+                            "wiki_articles": prev_complete.get("wiki_articles", []),
+                            "provider_label": prev_complete.get("provider_label", ""),
+                            "error": "",
+                        }
+                existing_batches = seeded_b
+
+        batches_out: Dict[str, Any] = {}
+        units_out: Dict[str, Any] = {}
+        completed_units_set = set()
+        failed_units_cnt = 0
+        outdated_units_cnt = 0
+        next_batch_idx: Optional[int] = None
+        next_unit_id = ""
+        next_unit_idx: Optional[int] = None
+
+        global_u_cursor = 0
+        for b in batches_spec:
+            b_idx = int(b["batch_index"])
+            b_key = str(b_idx)
+            uids = list(b["unit_ids"])
+            u_hashes = dict(b["unit_hashes"])
+            prev_b = existing_batches.get(b_key) if isinstance(existing_batches.get(b_key), dict) else None
+            hist_b = list((prev_b or {}).get("previous_versions") or [])
+
+            matched_ok = False
+            b_status = "pending"
+            if prev_b:
+                p_status = prev_b.get("status", "pending")
+                same_cfg = prev_b.get("config_hash") == config_hash
+                same_ids = prev_b.get("unit_ids") == uids
+                p_hashes = prev_b.get("unit_hashes") or {}
+                same_unit_hashes = all(p_hashes.get(uid) == u_hashes.get(uid) for uid in uids)
+                has_lines = isinstance(prev_b.get("lines"), list) and len(prev_b["lines"]) > 0
+                if p_status == "completed" and same_cfg and same_ids and same_unit_hashes and has_lines:
+                    matched_ok = True
+                    b_status = "completed"
+                elif p_status == "completed" and has_lines:
+                    snap = {k: v for k, v in prev_b.items() if k != "previous_versions"}
+                    hist_b.append(snap)
+                    if len(hist_b) > 5:
+                        hist_b = hist_b[-5:]
+                    b_status = "outdated"
+                elif same_cfg and same_ids and same_unit_hashes and p_status == "failed":
+                    b_status = "failed"
+
+            if matched_ok and prev_b is not None:
+                b_entry = deepcopy(prev_b)
+                b_entry["previous_versions"] = hist_b
+                batches_out[b_key] = b_entry
+                for local_offset, uid in enumerate(uids):
+                    completed_units_set.add(uid)
+                    units_out[uid] = {
+                        "unit_id": uid,
+                        "unit_index": global_u_cursor + local_offset,
+                        "batch_index": b_idx,
+                        "unit_translation_hash": u_hashes.get(uid, ""),
+                        "config_hash": config_hash,
+                        "status": "completed",
+                        "provider_label": b_entry.get("provider_label", ""),
+                        "error": "",
+                    }
+            else:
+                if next_batch_idx is None:
+                    next_batch_idx = b_idx
+                    next_unit_idx = global_u_cursor
+                    next_unit_id = uids[0] if uids else ""
+                err_txt = (prev_b or {}).get("error", "") if b_status == "failed" else (
+                    "האצווה התיישנה בעקבות שינוי תרגום או הגדרות תסריט." if b_status == "outdated" else ""
+                )
+                batches_out[b_key] = {
+                    "batch_index": b_idx,
+                    "unit_ids": uids,
+                    "unit_hashes": u_hashes,
+                    "config_hash": config_hash,
+                    "status": b_status,
+                    "title": "",
+                    "lines": [],
+                    "wiki_articles": [],
+                    "provider_label": (prev_b or {}).get("provider_label", ""),
+                    "error": err_txt,
+                    "previous_versions": hist_b,
+                    "updated_at": (prev_b or {}).get("updated_at", ""),
+                }
+                for local_offset, uid in enumerate(uids):
+                    if b_status == "failed":
+                        failed_units_cnt += 1
+                    elif b_status == "outdated":
+                        outdated_units_cnt += 1
+                    units_out[uid] = {
+                        "unit_id": uid,
+                        "unit_index": global_u_cursor + local_offset,
+                        "batch_index": b_idx,
+                        "unit_translation_hash": u_hashes.get(uid, ""),
+                        "config_hash": config_hash,
+                        "status": b_status,
+                        "error": err_txt,
+                    }
+            global_u_cursor += len(uids)
+
+        completed_cnt = len(completed_units_set)
+        missing_cnt = max(0, total_units - completed_cnt)
+        if next_batch_idx is None:
+            next_batch_idx = total_batches
+            next_unit_idx = total_units
+            next_unit_id = ""
+
+        sp_status = raw_sp.get("status", "pending")
+        if total_units > 0 and completed_cnt == total_units:
+            sp_status = "completed"
+        elif failed_units_cnt > 0 and sp_status not in ("blocked", "cancelled"):
+            sp_status = "failed"
+        elif outdated_units_cnt > 0 and sp_status == "completed":
+            sp_status = "in_progress"
+
+        return {
+            "book_id": book_id,
+            "chapter_index": int(chapter_index),
+            "source_hash": source_hash,
+            "translation_hash": translation_hash,
+            "config_hash": config_hash,
+            "mode": mode,
+            "total_units": total_units,
+            "total_batches": total_batches,
+            "status": sp_status,
+            "completed_units": [uid for b in batches_spec for uid in b["unit_ids"] if uid in completed_units_set],
+            "completed_count": completed_cnt,
+            "missing_count": missing_cnt,
+            "failed_count": failed_units_cnt,
+            "outdated_count": outdated_units_cnt,
+            "next_batch_index": next_batch_idx,
+            "next_unit_index": next_unit_idx,
+            "next_unit_id": next_unit_id,
+            "batches": batches_out,
+            "units": units_out,
+            "updated_at": raw_sp.get("updated_at", ""),
+        }
+
+    def reconcile_script_progress(
+        self,
+        book_id: str,
+        chapter_index: int,
+        batches_spec: List[Dict[str, Any]],
+        source_hash: str,
+        translation_hash: str,
+        config_hash: str,
+        mode: str,
+        *,
+        persist: bool = False,
+    ) -> Dict[str, Any]:
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.get("chapter_artifacts", {}).get(ck, {})
+        view = self._compute_script_progress_view(
+            art=art,
+            book_id=book_id,
+            chapter_index=chapter_index,
+            batches_spec=batches_spec,
+            source_hash=source_hash,
+            translation_hash=translation_hash,
+            config_hash=config_hash,
+            mode=mode,
+        )
+        if persist and art is not None:
+            art_mut = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+            view["updated_at"] = _now_iso()
+            art_mut["script_progress"] = view
+            self._save_raw_state(state)
+        return view
+
+    def save_script_batch_progress(
+        self,
+        book_id: str,
+        chapter_index: int,
+        batches_spec: List[Dict[str, Any]],
+        source_hash: str,
+        translation_hash: str,
+        config_hash: str,
+        mode: str,
+        batch_index: int,
+        batch_status: str,
+        *,
+        lines: Optional[List[Dict[str, Any]]] = None,
+        title: str = "",
+        wiki_articles: Optional[List[Dict[str, Any]]] = None,
+        provider_label: str = "",
+        error: str = "",
+        job_status: str = "in_progress",
+    ) -> Dict[str, Any]:
+        """שומר אטומית אצוות תסריט מאומתת לדיסק מבלי לסמן פרק חלקי כמוכן ליצוא."""
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+        view = self._compute_script_progress_view(
+            art=art,
+            book_id=book_id,
+            chapter_index=chapter_index,
+            batches_spec=batches_spec,
+            source_hash=source_hash,
+            translation_hash=translation_hash,
+            config_hash=config_hash,
+            mode=mode,
+        )
+        b_key = str(int(batch_index))
+        spec = next((b for b in batches_spec if int(b["batch_index"]) == int(batch_index)), None)
+        if spec is not None:
+            existing_b = view["batches"].get(b_key) or {}
+            hist_b = list(existing_b.get("previous_versions") or [])
+            now_ts = _now_iso()
+            if batch_status == "completed" and lines:
+                view["batches"][b_key] = {
+                    "batch_index": int(batch_index),
+                    "unit_ids": list(spec["unit_ids"]),
+                    "unit_hashes": dict(spec["unit_hashes"]),
+                    "config_hash": config_hash,
+                    "status": "completed",
+                    "title": title,
+                    "lines": deepcopy(lines),
+                    "wiki_articles": deepcopy(wiki_articles or []),
+                    "provider_label": provider_label,
+                    "error": "",
+                    "previous_versions": hist_b,
+                    "updated_at": now_ts,
+                }
+            else:
+                keep_ok = existing_b.get("status") == "completed" and bool(existing_b.get("lines"))
+                if not keep_ok:
+                    view["batches"][b_key] = {
+                        "batch_index": int(batch_index),
+                        "unit_ids": list(spec["unit_ids"]),
+                        "unit_hashes": dict(spec["unit_hashes"]),
+                        "config_hash": config_hash,
+                        "status": batch_status,
+                        "title": title,
+                        "lines": [],
+                        "wiki_articles": [],
+                        "provider_label": provider_label,
+                        "error": error,
+                        "previous_versions": hist_b,
+                        "updated_at": now_ts,
+                    }
+
+        # חישוב מחדש של המונים ונקודת ההמשך הבאה
+        completed_units_set = set()
+        failed_u = 0
+        outdated_u = 0
+        next_b_idx: Optional[int] = None
+        next_u_idx: Optional[int] = None
+        next_u_id = ""
+        cursor = 0
+        for b in batches_spec:
+            bk = str(int(b["batch_index"]))
+            b_rec = view["batches"].get(bk, {})
+            st_b = b_rec.get("status", "pending")
+            for offset, uid in enumerate(b["unit_ids"]):
+                if st_b == "completed":
+                    completed_units_set.add(uid)
+                    view["units"][uid] = {
+                        "unit_id": uid,
+                        "unit_index": cursor + offset,
+                        "batch_index": int(b["batch_index"]),
+                        "unit_translation_hash": b["unit_hashes"].get(uid, ""),
+                        "config_hash": config_hash,
+                        "status": "completed",
+                        "provider_label": b_rec.get("provider_label", ""),
+                        "error": "",
+                    }
+                else:
+                    if next_b_idx is None:
+                        next_b_idx = int(b["batch_index"])
+                        next_u_idx = cursor + offset
+                        next_u_id = uid
+                    if st_b == "failed":
+                        failed_u += 1
+                    elif st_b == "outdated":
+                        outdated_u += 1
+                    view["units"][uid] = {
+                        "unit_id": uid,
+                        "unit_index": cursor + offset,
+                        "batch_index": int(b["batch_index"]),
+                        "unit_translation_hash": b["unit_hashes"].get(uid, ""),
+                        "config_hash": config_hash,
+                        "status": st_b,
+                        "error": b_rec.get("error", ""),
+                    }
+            cursor += len(b["unit_ids"])
+
+        if next_b_idx is None:
+            next_b_idx = len(batches_spec)
+            next_u_idx = view["total_units"]
+            next_u_id = ""
+
+        view["completed_units"] = [uid for b in batches_spec for uid in b["unit_ids"] if uid in completed_units_set]
+        view["completed_count"] = len(completed_units_set)
+        view["missing_count"] = max(0, view["total_units"] - len(completed_units_set))
+        view["failed_count"] = failed_u
+        view["outdated_count"] = outdated_u
+        view["next_batch_index"] = next_b_idx
+        view["next_unit_index"] = next_u_idx
+        view["next_unit_id"] = next_u_id
+        view["status"] = job_status
+        view["updated_at"] = _now_iso()
+        art["script_progress"] = view
+        self._save_raw_state(state)
+        return view
 
     def save_chapter_script(
         self,
@@ -362,9 +1109,24 @@ class LibraryStore:
         state = self.load_raw_state()
         ck = chapter_key(book_id, chapter_index)
         art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+        prev_s = art.get("script")
+        if isinstance(prev_s, dict) and prev_s.get("is_complete"):
+            if (
+                prev_s.get("source_hash") != script_record.get("source_hash")
+                or prev_s.get("translation_hash") != script_record.get("translation_hash")
+                or prev_s.get("config_hash") != script_record.get("config_hash")
+            ):
+                shist = art.setdefault("script_history", [])
+                shist.append(deepcopy(prev_s))
+                if len(shist) > 10:
+                    del shist[:-10]
+
         rec = deepcopy(script_record)
         rec["saved_at"] = _now_iso()
         art["script"] = rec
+        if isinstance(art.get("script_progress"), dict):
+            art["script_progress"]["status"] = "completed"
+            art["script_progress"]["updated_at"] = rec["saved_at"]
         art.pop("last_export", None)
         self._save_raw_state(state)
 
@@ -396,10 +1158,32 @@ class LibraryStore:
         if not art:
             return
         if not keep_translation:
-            art.pop("translation", None)
-        art.pop("script", None)
+            prev_t = art.pop("translation", None)
+            if isinstance(prev_t, dict) and prev_t.get("is_complete"):
+                art.setdefault("translation_history", []).append(deepcopy(prev_t))
+        prev_s = art.pop("script", None)
+        if isinstance(prev_s, dict) and prev_s.get("is_complete"):
+            art.setdefault("script_history", []).append(deepcopy(prev_s))
         art.pop("last_export", None)
         self._save_raw_state(state)
+
+    def restore_previous_translation_version(self, book_id: str, chapter_index: int) -> Optional[Dict[str, Any]]:
+        """משחזר את גרסת התרגום השלמה הקודמת שנשמרה בארכיון."""
+        state = self.load_raw_state()
+        ck = chapter_key(book_id, chapter_index)
+        art = state.get("chapter_artifacts", {}).get(ck)
+        if not isinstance(art, dict):
+            return None
+        hist = art.get("translation_history") or []
+        if not hist:
+            return None
+        prev_rec = hist.pop()
+        if isinstance(art.get("translation"), dict):
+            hist.append(art["translation"])
+        art["translation"] = deepcopy(prev_rec)
+        art["translation_history"] = hist[-10:]
+        self._save_raw_state(state)
+        return deepcopy(prev_rec)
 
     @staticmethod
     def is_translation_fresh(

@@ -75,6 +75,21 @@ def _call_chat(caller: Callable[..., str], **kwargs) -> str:
         return caller(**{k: v for k, v in kwargs.items() if k in compact_keys})
 
 
+def build_script_batches_spec(
+    text: str,
+    units_per_batch: int = UNITS_PER_SCRIPT_BATCH,
+    max_chars_per_batch: int = MAX_CHARS_PER_SCRIPT_BATCH,
+) -> List[List[Dict[str, str]]]:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return []
+    sentences = split_into_sentences(clean_text)
+    if not sentences:
+        return []
+    all_units = [{"unitId": f"u{i + 1}", "text": s} for i, s in enumerate(sentences)]
+    return _build_script_batches(all_units, max_units=units_per_batch, max_chars=max_chars_per_batch)
+
+
 def generate_narration_script(
     text: str,
     mode: str = "educational",
@@ -89,10 +104,14 @@ def generate_narration_script(
     wiki_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
     units_per_batch: int = UNITS_PER_SCRIPT_BATCH,
     max_chars_per_batch: int = MAX_CHARS_PER_SCRIPT_BATCH,
+    existing_batches: Optional[Dict[int, Dict[str, Any]]] = None,
+    batch_progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     יוצר תסריט מובנה המכסה 100% ממשפטי הפרק באצוות בטוחות מוגבלות זיכרון וזמן.
-    כשל או ביטול בכל אצווה מפסיקים את התהליך מיד ואינם מחזירים תסריט חלקי כהצלחה.
+    - מדלג על אצוות מאומתות שכבר נשמרו (`existing_batches`) ללא קריאות AI כפולות
+    - מדווח מיד לאחר כל אצווה דרך `batch_progress_cb` לשמירה אטומית הדרגתית
+    - מאחד אצוות לפי הסדר (ללא כפילויות) ומאמת כיסוי מלא ורציף
     """
     _check_cancelled(cancel_event)
 
@@ -145,6 +164,7 @@ def generate_narration_script(
         raise ValueError("שלב 'יצירת תסריט AI': לא נמצאו משפטים תקינים ליצירת תסריט.")
 
     all_units = [{"unitId": f"u{i + 1}", "text": s} for i, s in enumerate(sentences)]
+    all_unit_ids_set = {u["unitId"] for u in all_units}
 
     if mode == "dramatic":
         style_guide = (
@@ -173,25 +193,60 @@ def generate_narration_script(
 
     batches = _build_script_batches(all_units, max_units=units_per_batch, max_chars=max_chars_per_batch)
     total_batches = len(batches)
-
-    normalized_lines: List[Dict[str, Any]] = []
+    saved_batches = existing_batches or {}
+    batch_results: Dict[int, List[Dict[str, Any]]] = {}
     covered_units = set()
     script_title = ""
+    current_prov_label = f"{get_provider_label(pid)} ({model})"
 
-    for batch_idx, batch_units in enumerate(batches, 1):
-        _check_cancelled(cancel_event)
+    for b_idx0, batch_units in enumerate(batches):
+        batch_num = b_idx0 + 1
+        expected_ids = [u["unitId"] for u in batch_units]
+        expected_set = set(expected_ids)
+        first_uid = expected_ids[0] if expected_ids else ""
+
+        try:
+            _check_cancelled(cancel_event)
+        except ScriptCancelledError:
+            if batch_progress_cb is not None:
+                batch_progress_cb({
+                    "event": "batch_cancelled",
+                    "batch_index": b_idx0,
+                    "unit_id": first_uid,
+                })
+            raise
+
+        cached_b = saved_batches.get(b_idx0)
+        if cached_b and cached_b.get("lines"):
+            reused_lines: List[Dict[str, Any]] = []
+            for ln in cached_b["lines"]:
+                if isinstance(ln, dict) and (ln.get("text") or "").strip():
+                    uid = str(ln.get("unitId") or "").strip()
+                    if uid in expected_set:
+                        covered_units.add(uid)
+                        reused_lines.append(ln)
+            if reused_lines and expected_set.issubset(covered_units):
+                if not script_title and cached_b.get("title"):
+                    script_title = str(cached_b.get("title")).strip()
+                batch_results[b_idx0] = reused_lines
+                if progress_cb:
+                    progress_cb(
+                        f"תסריט AI: משתמש בחלק שמור מאומת ({batch_num}/{total_batches})..."
+                    )
+                continue
+
         if progress_cb:
             progress_cb(
-                f"יוצר תסריט AI (חלק {batch_idx} מתוך {total_batches}, {len(batch_units)} משפטים)..."
+                f"יוצר תסריט AI (חלק {batch_num} מתוך {total_batches}, {len(batch_units)} משפטים)..."
             )
 
         user_prompt = (
             f"שם הספר: {book_title or 'ללא שם'}\n"
             f"מצב תסריט: {'לימודי (מורה ותלמיד)' if mode == 'educational' else 'דרמטי (קריינות)'}\n"
-            f"חלק {batch_idx} מתוך {total_batches}\n"
+            f"חלק {batch_num} מתוך {total_batches}\n"
             "יחידות המקור:\n"
             + "\n".join(f"[{u['unitId']}] {u['text']}" for u in batch_units)
-            + (wiki_section if batch_idx == 1 else "")
+            + (wiki_section if batch_num == 1 else "")
         )
 
         try:
@@ -211,63 +266,121 @@ def generate_narration_script(
                 max_retries=2,
                 cancel_event=cancel_event,
                 progress_cb=progress_cb,
-                stage=f"יצירת תסריט AI (חלק {batch_idx}/{total_batches})",
+                stage=f"יצירת תסריט AI (חלק {batch_num}/{total_batches})",
             )
         except AICancelledError as e:
+            if batch_progress_cb is not None:
+                batch_progress_cb({
+                    "event": "batch_cancelled",
+                    "batch_index": b_idx0,
+                    "unit_id": first_uid,
+                })
             raise ScriptCancelledError(str(e)) from e
+        except Exception as exc:
+            setattr(exc, "batch_index", b_idx0)
+            setattr(exc, "unit_id", first_uid)
+            if batch_progress_cb is not None:
+                batch_progress_cb({
+                    "event": "batch_failed",
+                    "batch_index": b_idx0,
+                    "unit_id": first_uid,
+                    "error": str(exc),
+                    "provider_label": current_prov_label,
+                })
+            raise
 
         _check_cancelled(cancel_event)
 
-        parsed = extract_json_object(raw_response)
-        if not script_title and parsed.get("title"):
-            script_title = str(parsed.get("title")).strip()
+        try:
+            parsed = extract_json_object(raw_response)
+            b_title = str(parsed.get("title") or "").strip()
+            if not script_title and b_title:
+                script_title = b_title
 
-        raw_lines = parsed.get("lines", [])
-        if not isinstance(raw_lines, list) or not raw_lines:
-            raise RuntimeError(
-                f"שלב 'יצירת תסריט AI': המודל לא החזיר שורות תסריט תקינות עבור חלק {batch_idx} מתוך {total_batches}."
-            )
+            raw_lines = parsed.get("lines", [])
+            if not isinstance(raw_lines, list) or not raw_lines:
+                raise RuntimeError(
+                    f"שלב 'יצירת תסריט AI': המודל לא החזיר שורות תסריט תקינות עבור חלק {batch_num} מתוך {total_batches}."
+                )
 
-        batch_valid_lines: List[Dict[str, Any]] = []
-        expected_ids = [u["unitId"] for u in batch_units]
+            batch_valid_lines: List[Dict[str, Any]] = []
+            batch_covered = set()
 
-        for idx, line in enumerate(raw_lines):
-            if not isinstance(line, dict):
-                continue
-            text_val = str(line.get("text") or "").strip()
-            if not text_val:
-                continue
-            role = str(line.get("speakerRole") or "narrator").strip().lower()
-            if role not in ("teacher", "student", "narrator"):
-                role = "narrator"
-            uid = str(line.get("unitId") or "").strip()
-            if not uid or uid not in expected_ids:
-                uid = expected_ids[min(idx, len(expected_ids) - 1)]
-            covered_units.add(uid)
-            batch_valid_lines.append({
-                "unitId": uid,
-                "speakerRole": role,
-                "speakerLabel": SPEAKER_DISPLAY.get(role, "🎙️ מספר"),
-                "style": str(line.get("style") or "רגוע").strip(),
-                "text": text_val,
-                "needsReview": bool(line.get("needsReview", False)),
+            for idx, line in enumerate(raw_lines):
+                if not isinstance(line, dict):
+                    continue
+                text_val = str(line.get("text") or "").strip()
+                if not text_val:
+                    continue
+                role = str(line.get("speakerRole") or "narrator").strip().lower()
+                if role not in ("teacher", "student", "narrator"):
+                    role = "narrator"
+                uid = str(line.get("unitId") or "").strip()
+                if uid and uid in all_unit_ids_set and uid not in expected_set:
+                    # יחידה השייכת לאצווה אחרת (כפילות בין אצוות) — מדלגים כדי למנוע שכפול שורות
+                    continue
+                if not uid or uid not in expected_set:
+                    uid = expected_ids[min(idx, len(expected_ids) - 1)]
+                batch_covered.add(uid)
+                covered_units.add(uid)
+                batch_valid_lines.append({
+                    "unitId": uid,
+                    "speakerRole": role,
+                    "speakerLabel": SPEAKER_DISPLAY.get(role, "🎙️ מספר"),
+                    "style": str(line.get("style") or "רגוע").strip(),
+                    "text": text_val,
+                    "needsReview": bool(line.get("needsReview", False)),
+                })
+
+            if not batch_valid_lines:
+                raise RuntimeError(f"שלב 'יצירת תסריט AI': התסריט שהתקבל בחלק {batch_num} ריק.")
+
+            missing_in_batch = [uid for uid in expected_ids if uid not in batch_covered]
+            if missing_in_batch and len(batch_valid_lines) >= len(batch_units):
+                for uid in missing_in_batch:
+                    batch_covered.add(uid)
+                    covered_units.add(uid)
+
+            still_missing = [uid for uid in expected_ids if uid not in batch_covered]
+            if still_missing:
+                raise RuntimeError(
+                    f"שלב 'יצירת תסריט AI': המודל החזיר תסריט חלקי בחלק {batch_num} (חסרות יחידות: {', '.join(still_missing[:5])})."
+                )
+        except Exception as exc:
+            setattr(exc, "batch_index", b_idx0)
+            setattr(exc, "unit_id", first_uid)
+            if batch_progress_cb is not None:
+                batch_progress_cb({
+                    "event": "batch_failed",
+                    "batch_index": b_idx0,
+                    "unit_id": first_uid,
+                    "error": str(exc),
+                    "provider_label": current_prov_label,
+                })
+            raise
+
+        batch_results[b_idx0] = batch_valid_lines
+        if batch_progress_cb is not None:
+            batch_progress_cb({
+                "event": "batch_done",
+                "batch_index": b_idx0,
+                "unit_ids": expected_ids,
+                "lines": batch_valid_lines,
+                "title": script_title or f"תסריט - {book_title}",
+                "wiki_articles": wiki_articles if b_idx0 == 0 else [],
+                "provider_label": current_prov_label,
             })
 
-        if not batch_valid_lines:
-            raise RuntimeError(f"שלב 'יצירת תסריט AI': התסריט שהתקבל בחלק {batch_idx} ריק.")
-
-        missing_in_batch = [u["unitId"] for u in batch_units if u["unitId"] not in covered_units]
-        if missing_in_batch and len(batch_valid_lines) >= len(batch_units):
-            for uid in missing_in_batch:
-                covered_units.add(uid)
-
-        still_missing = [u["unitId"] for u in batch_units if u["unitId"] not in covered_units]
-        if still_missing:
-            raise RuntimeError(
-                f"שלב 'יצירת תסריט AI': המודל החזיר תסריט חלקי בחלק {batch_idx} (חסרות יחידות: {', '.join(still_missing[:5])})."
-            )
-
-        normalized_lines.extend(batch_valid_lines)
+    # מיזוג מסודר של כל האצוות לפי סדר batch_index (0..M-1) וללא כפילויות יחידות בין אצוות
+    normalized_lines: List[Dict[str, Any]] = []
+    seen_batch_uids = set()
+    for b_idx0, batch_units in enumerate(batches):
+        b_expected = {u["unitId"] for u in batch_units}
+        for line in batch_results.get(b_idx0, []):
+            uid = line["unitId"]
+            if uid in b_expected and uid not in seen_batch_uids:
+                normalized_lines.append(line)
+        seen_batch_uids.update(b_expected)
 
     if not normalized_lines or len(covered_units) < len(all_units):
         raise RuntimeError("שלב 'יצירת תסריט AI': התסריט שהתקבל חלקי ואינו מכסה את כל משפטֵי הפרק.")
@@ -275,11 +388,11 @@ def generate_narration_script(
     return {
         "title": script_title or f"תסריט - {book_title}",
         "mode": mode,
-        "provider_label": f"{get_provider_label(pid)} ({model})",
+        "provider_label": current_prov_label,
         "lines": normalized_lines,
         "wiki_articles": wiki_articles,
         "unit_count": len(all_units),
-        "covered_units": sorted(covered_units),
+        "covered_units": sorted(covered_units, key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999),
         "line_count": len(normalized_lines),
         "is_complete": True,
     }

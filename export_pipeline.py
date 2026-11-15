@@ -17,6 +17,7 @@
 import os
 from typing import Any, Callable, Dict, List, Optional
 
+from ai_providers import ProviderCircuitBreaker, _sanitize_error_text
 from audio_exporter import (
     ExportCancelledError,
     export_audiobook_file,
@@ -29,11 +30,22 @@ from library_store import (
     compute_source_hash,
     compute_translation_config_hash,
     compute_tts_config_hash,
+    compute_unit_source_hash,
     get_chapter_audio_cache_path,
 )
-from script_engine import ScriptCancelledError, generate_narration_script
+from script_engine import (
+    MAX_CHARS_PER_SCRIPT_BATCH,
+    UNITS_PER_SCRIPT_BATCH,
+    ScriptCancelledError,
+    build_script_batches_spec,
+    generate_narration_script,
+)
 from settings_manager import load_settings
-from translator_engine import TranslationCancelledError, translate_required_sentences
+from translator_engine import (
+    TranslationCancelledError,
+    TranslationProviderError,
+    translate_required_sentences,
+)
 
 
 class PipelineError(RuntimeError):
@@ -116,7 +128,7 @@ def assess_chapter_pipeline(
     elif t_rec.get("source_hash") != src_hash:
         t_reason = "טקסט המקור השתנה מאז התרגום האחרון."
     elif t_rec.get("config_hash") != trans_cfg_hash:
-        t_reason = "הגדרות התרגום (מנוע/שפות/מודל) השתנו."
+        t_reason = "הגדרות התרגום המהותיות (שפות/הוראות) השתנו."
     elif not LibraryStore.is_translation_fresh(t_rec, src_hash, trans_cfg_hash):
         t_reason = "התרגום השמור אינו מכסה את כל המשפטים הדרושים."
     else:
@@ -155,6 +167,48 @@ def assess_chapter_pipeline(
         )
     )
 
+    # אבחון יחידות הדרגתי (קריאה בלבד) להצגת יחידות שהושלמו/חסרות/נכשלו ונקודת המשך מדויקת
+    src_sentences = split_into_sentences(source_text or "") if (source_text or "").strip() else []
+    tp_view = (
+        st.reconcile_translation_progress(
+            book_id=book_id,
+            chapter_index=chapter_index,
+            source_sentences=src_sentences,
+            config_hash=trans_cfg_hash,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            source_hash=src_hash,
+            persist=False,
+        )
+        if src_sentences
+        else {
+            "total_units": 0,
+            "completed_count": 0,
+            "missing_count": 0,
+            "failed_count": 0,
+            "outdated_count": 0,
+            "next_unit_index": 0,
+            "next_unit_id": "",
+            "status": "pending",
+        }
+    )
+
+    raw_sp = artifacts.get("script_progress") if isinstance(artifacts.get("script_progress"), dict) else {}
+    sp_summary = {
+        "total_units": int(raw_sp.get("total_units") or (len(src_sentences) if t_ready else 0)),
+        "completed_count": int(s_rec.get("unit_count", len(src_sentences))) if s_ready and s_rec else int(raw_sp.get("completed_count") or 0),
+        "missing_count": 0 if s_ready else int(raw_sp.get("missing_count") or (len(src_sentences) if t_ready else 0)),
+        "failed_count": 0 if s_ready else int(raw_sp.get("failed_count") or 0),
+        "outdated_count": 0 if s_ready else int(raw_sp.get("outdated_count") or 0),
+        "next_batch_index": int(raw_sp.get("total_batches", 0)) if s_ready else int(raw_sp.get("next_batch_index") or 0),
+        "next_unit_index": int(raw_sp.get("total_units", 0)) if s_ready else int(raw_sp.get("next_unit_index") or 0),
+        "next_unit_id": "" if s_ready else str(raw_sp.get("next_unit_id") or ""),
+        "status": "completed" if s_ready else str(raw_sp.get("status") or "pending"),
+    }
+
+    has_partial_translation = bool(not t_ready and tp_view.get("completed_count", 0) > 0)
+    has_partial_script = bool(not s_ready and sp_summary.get("completed_count", 0) > 0)
+
     return {
         "book_id": book_id,
         "chapter_index": int(chapter_index),
@@ -181,9 +235,13 @@ def assess_chapter_pipeline(
         "translation_ready": t_ready,
         "translation_reason": t_reason,
         "translation_record": t_rec if t_ready else None,
+        "translation_progress": tp_view,
+        "has_partial_translation": has_partial_translation,
         "script_ready": s_ready,
         "script_reason": s_reason,
         "script_record": s_rec if s_ready else None,
+        "script_progress": sp_summary,
+        "has_partial_script": has_partial_script,
         "tts_ready": tts_ready,
         "tts_record": c_rec if tts_ready else None,
         "last_export": e_rec,
@@ -198,7 +256,7 @@ def assess_book_pipeline(
     tts_opts: Optional[Dict[str, Any]] = None,
     store: Optional[LibraryStore] = None,
 ) -> Dict[str, Any]:
-    """מאבחן מוכנות ועדכניות עבור כל פרקי הספר (0..K-1) כולל בדיקת כיסוי PDF."""
+    """מאבחן מוכנות ועדכניות עבור כל פרקי הספר (0..K-1) כולל בדיקת כיסוי PDF והתקדמות ברמת יחידות."""
     cfg = settings or load_settings()
     st = store or LibraryStore()
     bid = (book or {}).get("id", "")
@@ -209,6 +267,13 @@ def assess_book_pipeline(
     t_ready_cnt = 0
     s_ready_cnt = 0
     tts_ready_cnt = 0
+    total_trans_units = 0
+    done_trans_units = 0
+    missing_trans_units = 0
+    failed_trans_units = 0
+    outdated_trans_units = 0
+    first_trans_resume: Optional[Dict[str, Any]] = None
+    first_script_resume: Optional[Dict[str, Any]] = None
 
     for idx, ch in enumerate(chapters):
         cs = assess_chapter_pipeline(
@@ -222,13 +287,41 @@ def assess_book_pipeline(
             store=st,
         )
         cs["chapter_title"] = ch.get("title", f"פרק {idx + 1}")
+        tp = cs.get("translation_progress") or {}
+        total_trans_units += int(tp.get("total_units") or 0)
+        done_trans_units += int(tp.get("completed_count") or 0)
+        missing_trans_units += int(tp.get("missing_count") or 0)
+        failed_trans_units += int(tp.get("failed_count") or 0)
+        outdated_trans_units += int(tp.get("outdated_count") or 0)
+
         if cs["translation_ready"]:
             t_ready_cnt += 1
+        elif first_trans_resume is None:
+            u_idx = int(tp.get("next_unit_index") or 0)
+            first_trans_resume = {
+                "stage": "translation",
+                "chapter_index": idx,
+                "chapter_number": idx + 1,
+                "unit_index": u_idx,
+                "unit_id": tp.get("next_unit_id") or f"u{u_idx + 1}",
+            }
         if cs["script_ready"]:
             s_ready_cnt += 1
+        elif cs["translation_ready"] and first_script_resume is None:
+            sp = cs.get("script_progress") or {}
+            su_idx = int(sp.get("next_unit_index") or 0)
+            first_script_resume = {
+                "stage": "script",
+                "chapter_index": idx,
+                "chapter_number": idx + 1,
+                "unit_index": su_idx,
+                "unit_id": sp.get("next_unit_id") or f"u{su_idx + 1}",
+            }
         if cs["tts_ready"]:
             tts_ready_cnt += 1
         chapter_statuses.append(cs)
+
+    first_resume_point = first_trans_resume or first_script_resume
 
     return {
         "book_id": bid,
@@ -242,7 +335,71 @@ def assess_book_pipeline(
         "all_translations_ready": len(chapters) > 0 and t_ready_cnt == len(chapters),
         "all_scripts_ready": len(chapters) > 0 and s_ready_cnt == len(chapters),
         "all_tts_ready": len(chapters) > 0 and tts_ready_cnt == len(chapters),
+        "total_translation_units": total_trans_units,
+        "units_completed": done_trans_units,
+        "units_missing": missing_trans_units,
+        "units_failed": failed_trans_units,
+        "units_outdated": outdated_trans_units,
+        "resume_point": first_resume_point,
+        "has_resumable_progress": bool(done_trans_units > 0 and not (len(chapters) > 0 and s_ready_cnt == len(chapters))),
         "chapters": chapter_statuses,
+    }
+
+
+def _collect_secrets(settings: Dict[str, Any]) -> List[str]:
+    secs: List[str] = []
+    for p in ((settings or {}).get("providers") or {}).values():
+        k = (p.get("api_key") or "").strip()
+        if k:
+            secs.append(k)
+    lk = ((settings or {}).get("translation", {}).get("libretranslate_api_key") or "").strip()
+    if lk:
+        secs.append(lk)
+    return secs
+
+
+def _extract_failure_details(
+    exc: Exception,
+    *,
+    chapter_index: int,
+    chapter_title: str,
+    stage: str,
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw = _sanitize_error_text(str(exc or ""), secrets=_collect_secrets(settings))
+    low = raw.lower()
+    if "<html" in low or "<!doctype" in low:
+        raw = f"הספק חסום בשלב '{stage}' (התקבל דף חסימה/HTML)."
+    cat = str(getattr(exc, "category", "") or "").lower() or "error"
+    code = getattr(exc, "status_code", None)
+    b_filter = str(getattr(exc, "blocked_filter", "") or "")
+    prov = str(getattr(exc, "provider_id", "") or "")
+    is_blocked = bool(
+        getattr(exc, "is_blocked", False)
+        or cat == "blocked"
+        or code in (418, 451)
+        or "netfree" in low
+        or "418" in low
+        or bool(b_filter)
+    )
+    if is_blocked and not b_filter and "netfree" in low:
+        b_filter = "סינון NetFree (netfree.link)"
+    if is_blocked and cat == "error":
+        cat = "blocked"
+    return {
+        "chapter_index": int(chapter_index),
+        "chapter_number": int(chapter_index) + 1,
+        "chapter_title": chapter_title or f"פרק {int(chapter_index) + 1}",
+        "unit_index": getattr(exc, "unit_index", None),
+        "unit_id": str(getattr(exc, "unit_id", "") or ""),
+        "batch_index": getattr(exc, "batch_index", None),
+        "stage": stage,
+        "category": cat,
+        "is_blocked": is_blocked,
+        "status_code": code,
+        "blocked_provider": prov,
+        "blocked_filter": b_filter,
+        "error": raw,
     }
 
 
@@ -257,8 +414,15 @@ def ensure_translation_for_chapter(
     progress_cb: Optional[Callable[[str], None]] = None,
     chat_fn: Optional[Callable[..., str]] = None,
     single_translate_fn: Optional[Callable[[str, str, str, str], str]] = None,
+    fallback_translate_fn: Optional[Callable[[str, str, str, str], str]] = None,
+    circuit_breaker: Optional[ProviderCircuitBreaker] = None,
+    fallback_policy: Optional[Dict[str, Any]] = None,
+    request_fn: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
-    """שלב 1 מחייב: מחזיר תרגום עדכני ומלא של כל המשפטים הדרושים, או מתרגם ושומר אטומית."""
+    """
+    שלב 1 מחייב: מחזיר תרגום עדכני ומלא של כל המשפטים הדרושים, או מתרגם ושומר אטומית.
+    שומר אטומית לדיסק אחרי כל משפט שהושלם (כולל בפרק חלקי), ומשתמש ביחידות תקינות קיימות ללא קריאות חוזרות.
+    """
     _raise_if_cancelled(cancel_event, "תרגום")
     cfg = settings or load_settings()
     st = store or LibraryStore()
@@ -279,8 +443,87 @@ def ensure_translation_for_chapter(
     if not source_sentences:
         raise MissingArtifactError(f"פרק {chapter_index + 1}: אין משפטים בטקסט המקור לתרגום.")
 
+    tp_view = st.reconcile_translation_progress(
+        book_id=book_id,
+        chapter_index=chapter_index,
+        source_sentences=source_sentences,
+        config_hash=status["translation_config_hash"],
+        source_lang=tp["source_lang"],
+        target_lang=tp["target_lang"],
+        source_hash=status["source_hash"],
+        persist=False,
+    )
+    reusable_units: Dict[int, Dict[str, Any]] = {}
+    for k, u_rec in (tp_view.get("units") or {}).items():
+        if isinstance(u_rec, dict) and u_rec.get("status") == "completed" and (u_rec.get("translated_text") or "").strip():
+            reusable_units[int(u_rec["unit_index"])] = u_rec
+
     if progress_cb:
-        progress_cb(f"שלב תרגום (פרק {chapter_index + 1}): מתרגם את כל {len(source_sentences)} המשפטים...")
+        if reusable_units:
+            progress_cb(
+                f"שלב תרגום (פרק {chapter_index + 1}): נמצאו {len(reusable_units)}/{len(source_sentences)} יחידות תקינות, "
+                f"ממשיך מהיחידה הבאה ({tp_view.get('next_unit_id') or 'u1'})..."
+            )
+        else:
+            progress_cb(f"שלב תרגום (פרק {chapter_index + 1}): מתרגם את כל {len(source_sentences)} המשפטים...")
+
+    eff_policy = dict(fallback_policy or {})
+    t_opts = translation_opts or {}
+    for k in ("fallback_to_ai_on_failure", "fallback_secondary_engine"):
+        if k in t_opts and t_opts[k] is not None and k not in eff_policy:
+            eff_policy[k] = t_opts[k]
+
+    def _on_unit_progress(ev: Dict[str, Any]) -> None:
+        ev_type = ev.get("event", "")
+        u_idx = int(ev.get("unit_index", 0))
+        if ev_type == "unit_done":
+            st.save_translation_unit_progress(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                source_sentences=source_sentences,
+                source_hash=status["source_hash"],
+                config_hash=status["translation_config_hash"],
+                source_lang=tp["source_lang"],
+                target_lang=tp["target_lang"],
+                unit_index=u_idx,
+                unit_status="completed",
+                translated_text=str(ev.get("translated_text") or ""),
+                engine=str(ev.get("engine") or tp["engine"]),
+                engine_label=str(ev.get("engine_label") or ""),
+                ai_provider=str(ev.get("ai_provider") or ""),
+                ai_model=str(ev.get("ai_model") or ""),
+                fallback_used=bool(ev.get("fallback_used", False)),
+                job_status="in_progress",
+            )
+        elif ev_type == "unit_failed":
+            st.save_translation_unit_progress(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                source_sentences=source_sentences,
+                source_hash=status["source_hash"],
+                config_hash=status["translation_config_hash"],
+                source_lang=tp["source_lang"],
+                target_lang=tp["target_lang"],
+                unit_index=u_idx,
+                unit_status="failed",
+                engine=str(ev.get("engine") or tp["engine"]),
+                error=str(ev.get("error") or ""),
+                job_status="failed",
+            )
+        elif ev_type == "unit_cancelled":
+            st.save_translation_unit_progress(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                source_sentences=source_sentences,
+                source_hash=status["source_hash"],
+                config_hash=status["translation_config_hash"],
+                source_lang=tp["source_lang"],
+                target_lang=tp["target_lang"],
+                unit_index=u_idx,
+                unit_status="pending",
+                engine=str(ev.get("engine") or tp["engine"]),
+                job_status="cancelled",
+            )
 
     try:
         res = translate_required_sentences(
@@ -293,8 +536,16 @@ def ensure_translation_for_chapter(
             progress_cb=progress_cb,
             chat_fn=chat_fn,
             single_translate_fn=single_translate_fn,
+            fallback_translate_fn=fallback_translate_fn,
+            circuit_breaker=circuit_breaker,
+            fallback_policy=eff_policy or None,
+            request_fn=request_fn,
+            chapter_index=chapter_index,
+            existing_units=reusable_units,
+            unit_progress_cb=_on_unit_progress,
         )
     except TranslationCancelledError as e:
+        st.mark_translation_progress_status(book_id, chapter_index, "cancelled")
         raise PipelineCancelledError(str(e)) from e
 
     if not res.get("is_complete"):
@@ -305,8 +556,13 @@ def ensure_translation_for_chapter(
         "source_hash": status["source_hash"],
         "config_hash": status["translation_config_hash"],
         "translated_hash": compute_source_hash(translated_text),
-        "engine": tp["engine"],
+        "engine": res.get("engine", tp["engine"]),
+        "primary_engine": res.get("primary_engine", tp["engine"]),
+        "fallback_used": bool(res.get("fallback_used", False)),
         "engine_label": res.get("engine_label", tp["engine"]),
+        "ai_provider": res.get("ai_provider", ""),
+        "ai_model": res.get("ai_model", ""),
+        "unit_provenance": res.get("unit_provenance", {}),
         "source_lang": tp["source_lang"],
         "target_lang": tp["target_lang"],
         "source_sentences": res["source_sentences"],
@@ -335,8 +591,13 @@ def ensure_script_for_chapter(
     progress_cb: Optional[Callable[[str], None]] = None,
     chat_fn: Optional[Callable[..., str]] = None,
     wiki_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
+    units_per_batch: int = UNITS_PER_SCRIPT_BATCH,
+    max_chars_per_batch: int = MAX_CHARS_PER_SCRIPT_BATCH,
 ) -> Dict[str, Any]:
-    """שלב 2 מחייב: מוודא קיום תרגום מלא ועדכני תחילה, ומייצר/שומר תסריט AI מלא ועדכני."""
+    """
+    שלב 2 מחייב: מוודא קיום תרגום מלא ועדכני תחילה, ומייצר/שומר תסריט AI מלא ועדכני.
+    שומר כל אצוות תסריט מאומתת לדיסק מיד עם השלמתה וממזג אצוות לפי סדר וללא כפילויות.
+    """
     _raise_if_cancelled(cancel_event, "יצירת תסריט")
     cfg = settings or load_settings()
     st = store or LibraryStore()
@@ -363,8 +624,91 @@ def ensure_script_for_chapter(
     sp = status["script_params"]
     translated_text = trans_rec["translated_text"]
 
+    raw_batches = build_script_batches_spec(
+        translated_text,
+        units_per_batch=units_per_batch,
+        max_chars_per_batch=max_chars_per_batch,
+    )
+    batches_spec: List[Dict[str, Any]] = []
+    for b_idx0, b_units in enumerate(raw_batches):
+        batches_spec.append({
+            "batch_index": b_idx0,
+            "unit_ids": [u["unitId"] for u in b_units],
+            "unit_hashes": {u["unitId"]: compute_unit_source_hash(u["text"]) for u in b_units},
+        })
+
+    sp_view = st.reconcile_script_progress(
+        book_id=book_id,
+        chapter_index=chapter_index,
+        batches_spec=batches_spec,
+        source_hash=status["source_hash"],
+        translation_hash=trans_rec["translated_hash"],
+        config_hash=status["script_config_hash"],
+        mode=sp["mode"],
+        persist=False,
+    )
+    reusable_batches: Dict[int, Dict[str, Any]] = {}
+    for bk, brec in (sp_view.get("batches") or {}).items():
+        if isinstance(brec, dict) and brec.get("status") == "completed" and brec.get("lines"):
+            reusable_batches[int(brec["batch_index"])] = brec
+
     if progress_cb:
-        progress_cb(f"שלב תסריט AI (פרק {chapter_index + 1}): יוצר תסריט מלא ועדכני...")
+        if reusable_batches:
+            progress_cb(
+                f"שלב תסריט AI (פרק {chapter_index + 1}): ממשיך מאצווה {int(sp_view.get('next_batch_index', 0)) + 1}/"
+                f"{len(batches_spec)} (נשמרו {sp_view.get('completed_count', 0)}/{sp_view.get('total_units', 0)} יחידות)..."
+            )
+        else:
+            progress_cb(f"שלב תסריט AI (פרק {chapter_index + 1}): יוצר תסריט מלא ועדכני...")
+
+    def _on_script_batch(ev: Dict[str, Any]) -> None:
+        ev_type = ev.get("event", "")
+        b_idx = int(ev.get("batch_index", 0))
+        if ev_type == "batch_done":
+            st.save_script_batch_progress(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                batches_spec=batches_spec,
+                source_hash=status["source_hash"],
+                translation_hash=trans_rec["translated_hash"],
+                config_hash=status["script_config_hash"],
+                mode=sp["mode"],
+                batch_index=b_idx,
+                batch_status="completed",
+                lines=ev.get("lines"),
+                title=str(ev.get("title") or ""),
+                wiki_articles=ev.get("wiki_articles") or [],
+                provider_label=str(ev.get("provider_label") or ""),
+                job_status="in_progress",
+            )
+        elif ev_type == "batch_failed":
+            st.save_script_batch_progress(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                batches_spec=batches_spec,
+                source_hash=status["source_hash"],
+                translation_hash=trans_rec["translated_hash"],
+                config_hash=status["script_config_hash"],
+                mode=sp["mode"],
+                batch_index=b_idx,
+                batch_status="failed",
+                provider_label=str(ev.get("provider_label") or ""),
+                error=str(ev.get("error") or ""),
+                job_status="failed",
+            )
+        elif ev_type == "batch_cancelled":
+            st.save_script_batch_progress(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                batches_spec=batches_spec,
+                source_hash=status["source_hash"],
+                translation_hash=trans_rec["translated_hash"],
+                config_hash=status["script_config_hash"],
+                mode=sp["mode"],
+                batch_index=b_idx,
+                batch_status="pending",
+                job_status="cancelled",
+            )
 
     try:
         script_data = generate_narration_script(
@@ -379,6 +723,10 @@ def ensure_script_for_chapter(
             progress_cb=progress_cb,
             chat_fn=chat_fn,
             wiki_fetcher=wiki_fetcher,
+            units_per_batch=units_per_batch,
+            max_chars_per_batch=max_chars_per_batch,
+            existing_batches=reusable_batches,
+            batch_progress_cb=_on_script_batch,
         )
     except ScriptCancelledError as e:
         raise PipelineCancelledError(str(e)) from e
@@ -627,11 +975,21 @@ def run_whole_book_script_pipeline(
     chat_fn: Optional[Callable[..., str]] = None,
     single_translate_fn: Optional[Callable[[str, str, str, str], str]] = None,
     wiki_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
+    fallback_translate_fn: Optional[Callable[[str, str, str, str], str]] = None,
+    circuit_breaker: Optional[ProviderCircuitBreaker] = None,
+    fallback_policy: Optional[Dict[str, Any]] = None,
+    request_fn: Optional[Callable[..., Any]] = None,
+    retry_failed_only: bool = False,
+    target_chapters: Optional[List[int]] = None,
+    continue_on_chapter_failure: bool = False,
 ) -> Dict[str, Any]:
     """
     מייצר תרגום מאומת ולאחריו תסריט AI מלא עבור כל פרקי הספר (0..K-1 לפי הסדר),
     ללא תלות בפרק הפעיל המוצג בחלון.
-    שומר כל פרק אטומית לתמיכה בביטול והמשך מהפרק שנעצר.
+    - משמר כל פרק שהושלם אטומית לתמיכה בהמשך/התאוששות מהנקודה שנעצרה
+    - משתף Circuit Breaker למניעת חזרה עיוורת על ספק חסום (418 / NetFree) לאורך עשרות פרקים
+    - תומך בתיקון ממוקד של פרקים שנכשלו בלבד (`retry_failed_only=True`)
+    - תומך ב-'המשך לשאר הפרקים' במצב חלקי מפורש (`status="partial"`) מבלי להכריז על ספר חלקי כהושלם
     """
     cfg = settings or load_settings()
     st = store or LibraryStore()
@@ -641,6 +999,7 @@ def run_whole_book_script_pipeline(
     total = len(chapters)
     current_stage = "validation"
     current_chapter_num = 0
+    breaker = circuit_breaker or ProviderCircuitBreaker()
 
     try:
         _raise_if_cancelled(cancel_event, "בדיקת שלמות ספר")
@@ -650,6 +1009,38 @@ def run_whole_book_script_pipeline(
                 f"הספר '{book_title}' אינו שלם לעיבוד מלא: {cov_check['reason']}"
             )
 
+        existing_job = st.get_whole_book_job(book_id) or {}
+        initial_assess = assess_book_pipeline(
+            book=book,
+            settings=cfg,
+            translation_opts=translation_opts,
+            script_opts=script_opts,
+            store=st,
+        )
+        completed_trans_set = {cs["chapter_index"] for cs in initial_assess["chapters"] if cs["translation_ready"]}
+        completed_script_set = {cs["chapter_index"] for cs in initial_assess["chapters"] if cs["script_ready"]}
+
+        failed_chapters: Dict[str, Dict[str, Any]] = {}
+        if retry_failed_only or target_chapters is not None:
+            for fk, fv in (existing_job.get("failed_chapters") or {}).items():
+                if isinstance(fv, dict):
+                    failed_chapters[str(fk)] = dict(fv)
+
+        if target_chapters is not None:
+            indices_to_run = sorted({int(i) for i in target_chapters if 0 <= int(i) < total})
+        elif retry_failed_only:
+            failed_idxs = {int(k) for k in failed_chapters.keys() if k.isdigit() and 0 <= int(k) < total}
+            incomplete_idxs = {
+                cs["chapter_index"]
+                for cs in initial_assess["chapters"]
+                if not cs["translation_ready"] or not cs["script_ready"]
+            }
+            indices_to_run = sorted(failed_idxs | incomplete_idxs)
+            if not indices_to_run:
+                indices_to_run = []
+        else:
+            indices_to_run = list(range(total))
+
         st.save_whole_book_job(
             book_id,
             {
@@ -657,60 +1048,231 @@ def run_whole_book_script_pipeline(
                 "status": "in_progress",
                 "chapter_count": total,
                 "stage": "translation",
-                "completed_translations": [],
-                "completed_scripts": [],
+                "completed_translations": sorted(completed_trans_set),
+                "completed_scripts": sorted(completed_script_set),
+                "failed_chapters": failed_chapters,
             },
         )
 
-        # שלב 1: תרגום כל הפרקים 0..K-1 לפי הסדר
+        # שלב 1: תרגום כל הפרקים הנדרשים לפי הסדר
         current_stage = "translation"
-        translations: List[Dict[str, Any]] = []
-        for idx, ch in enumerate(chapters):
+        translations_by_idx: Dict[int, Dict[str, Any]] = {}
+        for idx in indices_to_run:
+            ch = chapters[idx]
             current_chapter_num = idx + 1
+            ch_title = ch.get("title", f"פרק {current_chapter_num}")
             _raise_if_cancelled(cancel_event, f"תרגום פרק {current_chapter_num}/{total}")
             if progress_cb:
                 progress_cb(
-                    f"[ספר שלם — שלב 1/2: תרגום] פרק {current_chapter_num} מתוך {total}: {ch.get('title', '')}"
+                    f"[ספר שלם — שלב 1/2: תרגום] פרק {current_chapter_num} מתוך {total}: {ch_title}"
                 )
-            t_rec = ensure_translation_for_chapter(
-                book_id=book_id,
-                chapter_index=idx,
-                source_text=ch.get("text", ""),
-                settings=cfg,
-                translation_opts=translation_opts,
-                store=st,
-                cancel_event=cancel_event,
-                progress_cb=progress_cb,
-                chat_fn=chat_fn,
-                single_translate_fn=single_translate_fn,
-            )
-            translations.append(t_rec)
+            try:
+                t_rec = ensure_translation_for_chapter(
+                    book_id=book_id,
+                    chapter_index=idx,
+                    source_text=ch.get("text", ""),
+                    settings=cfg,
+                    translation_opts=translation_opts,
+                    store=st,
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                    chat_fn=chat_fn,
+                    single_translate_fn=single_translate_fn,
+                    fallback_translate_fn=fallback_translate_fn,
+                    circuit_breaker=breaker,
+                    fallback_policy=fallback_policy,
+                    request_fn=request_fn,
+                )
+                translations_by_idx[idx] = t_rec
+                completed_trans_set.add(idx)
+                failed_chapters.pop(str(idx), None)
+            except PipelineCancelledError:
+                raise
+            except Exception as exc:
+                f_info = _extract_failure_details(
+                    exc,
+                    chapter_index=idx,
+                    chapter_title=ch_title,
+                    stage="translation",
+                    settings=cfg,
+                )
+                failed_chapters[str(idx)] = f_info
+                if not continue_on_chapter_failure:
+                    job_status = "blocked" if f_info["is_blocked"] else "failed"
+                    err_assess = assess_book_pipeline(
+                        book=book,
+                        settings=cfg,
+                        translation_opts=translation_opts,
+                        script_opts=script_opts,
+                        store=st,
+                    )
+                    st.save_whole_book_job(
+                        book_id,
+                        {
+                            "job_type": "whole_book_script",
+                            "status": job_status,
+                            "chapter_count": total,
+                            "stage": "translation",
+                            "stopped_chapter_index": idx,
+                            "failed_or_cancelled_chapter": current_chapter_num,
+                            "unit_index": f_info.get("unit_index"),
+                            "unit_id": f_info.get("unit_id", ""),
+                            "is_blocked": f_info["is_blocked"],
+                            "blocked_provider": f_info["blocked_provider"],
+                            "blocked_filter": f_info["blocked_filter"],
+                            "status_code": f_info["status_code"],
+                            "completed_translations": sorted(completed_trans_set),
+                            "completed_scripts": sorted(completed_script_set),
+                            "units_completed": err_assess["units_completed"],
+                            "units_missing": err_assess["units_missing"],
+                            "units_failed": err_assess["units_failed"],
+                            "failed_chapters": failed_chapters,
+                            "error": f_info["error"],
+                        },
+                    )
+                    return {
+                        "success": False,
+                        "scope": "book",
+                        "status": job_status,
+                        "is_blocked": f_info["is_blocked"],
+                        "error_category": f_info["category"],
+                        "status_code": f_info["status_code"],
+                        "blocked_provider": f_info["blocked_provider"],
+                        "blocked_filter": f_info["blocked_filter"],
+                        "stage": "translation",
+                        "book_id": book_id,
+                        "book_title": book_title,
+                        "chapter_index": idx,
+                        "chapter_number": current_chapter_num,
+                        "chapter_title": ch_title,
+                        "chapter_count": total,
+                        "unit_index": f_info.get("unit_index"),
+                        "unit_id": f_info.get("unit_id", ""),
+                        "completed_translations": sorted(completed_trans_set),
+                        "completed_scripts": sorted(completed_script_set),
+                        "units_completed": err_assess["units_completed"],
+                        "units_missing": err_assess["units_missing"],
+                        "units_failed": err_assess["units_failed"],
+                        "failed_chapters": failed_chapters,
+                        "error": f"כשל בפרק {current_chapter_num}/{total} (translation): {f_info['error']}",
+                    }
+                st.save_whole_book_job(
+                    book_id,
+                    {
+                        "job_type": "whole_book_script",
+                        "status": "in_progress",
+                        "chapter_count": total,
+                        "stage": "translation",
+                        "stopped_chapter_index": idx,
+                        "completed_translations": sorted(completed_trans_set),
+                        "completed_scripts": sorted(completed_script_set),
+                        "failed_chapters": failed_chapters,
+                    },
+                )
 
-        # שלב 2: יצירת תסריט מלא לכל הפרקים 0..K-1 לפי הסדר
+        # שלב 2: יצירת תסריט מלא לכל הפרקים שתרגומם תקין לפי הסדר
         current_stage = "script"
-        scripts: List[Dict[str, Any]] = []
-        for idx, ch in enumerate(chapters):
+        scripts_by_idx: Dict[int, Dict[str, Any]] = {}
+        for idx in indices_to_run:
+            if str(idx) in failed_chapters:
+                continue
+            ch = chapters[idx]
             current_chapter_num = idx + 1
+            ch_title = ch.get("title", f"פרק {current_chapter_num}")
             _raise_if_cancelled(cancel_event, f"תסריט פרק {current_chapter_num}/{total}")
             if progress_cb:
                 progress_cb(
-                    f"[ספר שלם — שלב 2/2: תסריט AI] פרק {current_chapter_num} מתוך {total}: {ch.get('title', '')}"
+                    f"[ספר שלם — שלב 2/2: תסריט AI] פרק {current_chapter_num} מתוך {total}: {ch_title}"
                 )
-            s_rec = ensure_script_for_chapter(
-                book_id=book_id,
-                chapter_index=idx,
-                source_text=ch.get("text", ""),
-                book_title=book_title,
-                settings=cfg,
-                translation_opts=translation_opts,
-                script_opts=script_opts,
-                store=st,
-                cancel_event=cancel_event,
-                progress_cb=progress_cb,
-                chat_fn=chat_fn,
-                wiki_fetcher=wiki_fetcher,
-            )
-            scripts.append(s_rec)
+            try:
+                s_rec = ensure_script_for_chapter(
+                    book_id=book_id,
+                    chapter_index=idx,
+                    source_text=ch.get("text", ""),
+                    book_title=book_title,
+                    settings=cfg,
+                    translation_opts=translation_opts,
+                    script_opts=script_opts,
+                    store=st,
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                    chat_fn=chat_fn,
+                    wiki_fetcher=wiki_fetcher,
+                )
+                scripts_by_idx[idx] = s_rec
+                completed_script_set.add(idx)
+                failed_chapters.pop(str(idx), None)
+            except PipelineCancelledError:
+                raise
+            except Exception as exc:
+                f_info = _extract_failure_details(
+                    exc,
+                    chapter_index=idx,
+                    chapter_title=ch_title,
+                    stage="script",
+                    settings=cfg,
+                )
+                failed_chapters[str(idx)] = f_info
+                if not continue_on_chapter_failure:
+                    err_assess = assess_book_pipeline(
+                        book=book,
+                        settings=cfg,
+                        translation_opts=translation_opts,
+                        script_opts=script_opts,
+                        store=st,
+                    )
+                    st.save_whole_book_job(
+                        book_id,
+                        {
+                            "job_type": "whole_book_script",
+                            "status": "blocked" if f_info["is_blocked"] else "failed",
+                            "chapter_count": total,
+                            "stage": "script",
+                            "stopped_chapter_index": idx,
+                            "failed_or_cancelled_chapter": current_chapter_num,
+                            "unit_index": f_info.get("unit_index"),
+                            "unit_id": f_info.get("unit_id", ""),
+                            "batch_index": f_info.get("batch_index"),
+                            "is_blocked": f_info["is_blocked"],
+                            "blocked_provider": f_info["blocked_provider"],
+                            "blocked_filter": f_info["blocked_filter"],
+                            "status_code": f_info["status_code"],
+                            "completed_translations": sorted(completed_trans_set),
+                            "completed_scripts": sorted(completed_script_set),
+                            "units_completed": err_assess["units_completed"],
+                            "units_missing": err_assess["units_missing"],
+                            "units_failed": err_assess["units_failed"],
+                            "failed_chapters": failed_chapters,
+                            "error": f_info["error"],
+                        },
+                    )
+                    return {
+                        "success": False,
+                        "scope": "book",
+                        "status": "blocked" if f_info["is_blocked"] else "failed",
+                        "is_blocked": f_info["is_blocked"],
+                        "error_category": f_info["category"],
+                        "status_code": f_info["status_code"],
+                        "blocked_provider": f_info["blocked_provider"],
+                        "blocked_filter": f_info["blocked_filter"],
+                        "stage": "script",
+                        "book_id": book_id,
+                        "book_title": book_title,
+                        "chapter_index": idx,
+                        "chapter_number": current_chapter_num,
+                        "chapter_title": ch_title,
+                        "chapter_count": total,
+                        "unit_index": f_info.get("unit_index"),
+                        "unit_id": f_info.get("unit_id", ""),
+                        "batch_index": f_info.get("batch_index"),
+                        "completed_translations": sorted(completed_trans_set),
+                        "completed_scripts": sorted(completed_script_set),
+                        "units_completed": err_assess["units_completed"],
+                        "units_missing": err_assess["units_missing"],
+                        "units_failed": err_assess["units_failed"],
+                        "failed_chapters": failed_chapters,
+                        "error": f"כשל בפרק {current_chapter_num}/{total} (script): {f_info['error']}",
+                    }
 
         # אימות סופי שכל פרקי הספר מכוסים ומאומתים
         final_assess = assess_book_pipeline(
@@ -720,8 +1282,56 @@ def run_whole_book_script_pipeline(
             script_opts=script_opts,
             store=st,
         )
-        if not final_assess["all_translations_ready"] or not final_assess["all_scripts_ready"]:
-            raise IncompleteArtifactError("לא כל פרקי הספר הושלמו ואומתו כתקינים.")
+        all_t = [cs["translation_record"] for cs in final_assess["chapters"] if cs["translation_record"]]
+        all_s = [cs["script_record"] for cs in final_assess["chapters"] if cs["script_record"]]
+        final_completed_t = [cs["chapter_index"] for cs in final_assess["chapters"] if cs["translation_ready"]]
+        final_completed_s = [cs["chapter_index"] for cs in final_assess["chapters"] if cs["script_ready"]]
+
+        if failed_chapters or not final_assess["all_translations_ready"] or not final_assess["all_scripts_ready"]:
+            needs_attention = sorted(
+                {int(k) for k in failed_chapters.keys() if k.isdigit()}
+                | {
+                    cs["chapter_index"]
+                    for cs in final_assess["chapters"]
+                    if not cs["translation_ready"] or not cs["script_ready"]
+                }
+            )
+            human_nums = ", ".join(str(i + 1) for i in needs_attention[:25])
+            if len(needs_attention) > 25:
+                human_nums += f" (+{len(needs_attention) - 25} נוספים)"
+            partial_msg = (
+                f"העיבוד הסתיים במצב חלקי בלבד (לא הושלם): {len(final_completed_s)}/{total} פרקים מוכנים. "
+                f"פרקים טעוני טיפול: [{human_nums}]. לא ניתן לייצא שמע לכל הספר עד להשלמתם."
+            )
+            st.save_whole_book_job(
+                book_id,
+                {
+                    "job_type": "whole_book_script",
+                    "status": "partial",
+                    "chapter_count": total,
+                    "stage": "partial",
+                    "completed_translations": final_completed_t,
+                    "completed_scripts": final_completed_s,
+                    "failed_chapters": failed_chapters,
+                    "needs_attention_chapters": needs_attention,
+                    "error": partial_msg,
+                },
+            )
+            return {
+                "success": False,
+                "scope": "book",
+                "status": "partial",
+                "is_partial": True,
+                "stage": "partial",
+                "book_id": book_id,
+                "book_title": book_title,
+                "chapter_count": total,
+                "completed_translations": final_completed_t,
+                "completed_scripts": final_completed_s,
+                "needs_attention_chapters": needs_attention,
+                "failed_chapters": failed_chapters,
+                "error": partial_msg,
+            }
 
         st.save_whole_book_job(
             book_id,
@@ -732,6 +1342,8 @@ def run_whole_book_script_pipeline(
                 "stage": "completed",
                 "completed_translations": list(range(total)),
                 "completed_scripts": list(range(total)),
+                "failed_chapters": {},
+                "needs_attention_chapters": [],
             },
         )
         return {
@@ -743,11 +1355,20 @@ def run_whole_book_script_pipeline(
             "book_title": book_title,
             "chapter_count": total,
             "chapters_processed": list(range(total)),
-            "translations": translations,
-            "scripts": scripts,
+            "translations": all_t,
+            "scripts": all_s,
         }
 
     except PipelineCancelledError as e:
+        cur_assess = assess_book_pipeline(
+            book=book,
+            settings=cfg,
+            translation_opts=translation_opts,
+            script_opts=script_opts,
+            store=st,
+        )
+        done_t = [cs["chapter_index"] for cs in cur_assess["chapters"] if cs["translation_ready"]]
+        done_s = [cs["chapter_index"] for cs in cur_assess["chapters"] if cs["script_ready"]]
         st.save_whole_book_job(
             book_id,
             {
@@ -755,7 +1376,10 @@ def run_whole_book_script_pipeline(
                 "status": "cancelled",
                 "chapter_count": total,
                 "stage": current_stage,
+                "stopped_chapter_index": max(0, current_chapter_num - 1),
                 "failed_or_cancelled_chapter": current_chapter_num,
+                "completed_translations": done_t,
+                "completed_scripts": done_s,
                 "error": str(e),
             },
         )
@@ -764,30 +1388,59 @@ def run_whole_book_script_pipeline(
             "scope": "book",
             "status": "cancelled",
             "stage": current_stage,
+            "book_id": book_id,
+            "book_title": book_title,
             "chapter_number": current_chapter_num,
             "chapter_count": total,
+            "completed_translations": done_t,
+            "completed_scripts": done_s,
             "error": str(e),
         }
     except Exception as e:
+        f_info = _extract_failure_details(
+            e,
+            chapter_index=max(0, current_chapter_num - 1),
+            chapter_title="",
+            stage=current_stage,
+            settings=cfg,
+        )
         st.save_whole_book_job(
             book_id,
             {
                 "job_type": "whole_book_script",
-                "status": "failed",
+                "status": "blocked" if f_info["is_blocked"] else "failed",
                 "chapter_count": total,
                 "stage": current_stage,
+                "stopped_chapter_index": max(0, current_chapter_num - 1),
                 "failed_or_cancelled_chapter": current_chapter_num,
-                "error": str(e),
+                "unit_index": f_info.get("unit_index"),
+                "unit_id": f_info.get("unit_id", ""),
+                "batch_index": f_info.get("batch_index"),
+                "is_blocked": f_info["is_blocked"],
+                "blocked_provider": f_info["blocked_provider"],
+                "blocked_filter": f_info["blocked_filter"],
+                "status_code": f_info["status_code"],
+                "error": f_info["error"],
             },
         )
         return {
             "success": False,
             "scope": "book",
-            "status": "failed",
+            "status": "blocked" if f_info["is_blocked"] else "failed",
+            "is_blocked": f_info["is_blocked"],
+            "error_category": f_info["category"],
+            "status_code": f_info["status_code"],
+            "blocked_provider": f_info["blocked_provider"],
+            "blocked_filter": f_info["blocked_filter"],
             "stage": current_stage,
+            "book_id": book_id,
+            "book_title": book_title,
             "chapter_number": current_chapter_num,
             "chapter_count": total,
-            "error": f"כשל בפרק {current_chapter_num}/{total} ({current_stage}): {e}",
+            "unit_index": f_info.get("unit_index"),
+            "unit_id": f_info.get("unit_id", ""),
+            "batch_index": f_info.get("batch_index"),
+            "error": f"כשל בפרק {current_chapter_num}/{total} ({current_stage}): {f_info['error']}",
         }
 
 
@@ -809,12 +1462,16 @@ def run_whole_book_export_pipeline(
     mp3_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
     wav_synth_fn: Optional[Callable[[str, str, float], bytes]] = None,
     mp3_merge_fn: Optional[Callable[[List[str], str], str]] = None,
+    fallback_translate_fn: Optional[Callable[[str, str, str, str], str]] = None,
+    circuit_breaker: Optional[ProviderCircuitBreaker] = None,
+    fallback_policy: Optional[Dict[str, Any]] = None,
+    request_fn: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
     """
     מייצא ספר שלם (כל פרקי הספר 0..K-1 לפי הסדר, ללא תלות בפרק הפעיל):
-      1. שלב 1: משלים ומאמת תרגום של כל 0..K-1 הפרקים
+      1. שלב 1: משלים ומאמת תרגום של כל 0..K-1 הפרקים (עם Circuit Breaker ומדיניות התאוששות)
       2. שלב 2: משלים ומאמת תסריט AI מלא ועדכני של כל 0..K-1 הפרקים
-      3. שער קשיח: 0 קריאות TTS אם פרק אחד חסר/ישן/חלקי
+      3. שער קשיח: 0 קריאות TTS אם פרק אחד חסר/ישן/חלקי/טעון-טיפול
       4. שלב 3: מסנתז פרק-פרק למטמון בדיסק (מחדש רק פרקים חסרים/שהתיישנו, זיכרון חסום)
       5. שלב 4: אורז תוצר סופי אטומי ('unified_wav' / 'unified_mp3' / 'zip' / 'folder' + manifest.json)
     """
@@ -824,6 +1481,7 @@ def run_whole_book_export_pipeline(
     book_title = (book or {}).get("title", "")
     chapters = list((book or {}).get("chapters") or [])
     total = len(chapters)
+    breaker = circuit_breaker or ProviderCircuitBreaker()
 
     eff_tts = dict(tts_opts or {})
     if package_mode == "unified_wav":
@@ -837,6 +1495,7 @@ def run_whole_book_export_pipeline(
 
     current_stage = "validation"
     current_chapter_num = 0
+    failed_chapters: Dict[str, Dict[str, Any]] = {}
 
     try:
         _raise_if_cancelled(cancel_event, "בדיקת שלמות ספר")
@@ -866,6 +1525,10 @@ def run_whole_book_export_pipeline(
                 progress_cb=progress_cb,
                 chat_fn=chat_fn,
                 single_translate_fn=single_translate_fn,
+                fallback_translate_fn=fallback_translate_fn,
+                circuit_breaker=breaker,
+                fallback_policy=fallback_policy,
+                request_fn=request_fn,
             )
 
         # שלב 2: תסריט כל הפרקים 0..K-1
@@ -998,6 +1661,10 @@ def run_whole_book_export_pipeline(
                 "status": "completed",
                 "chapter_count": total,
                 "stage": "completed",
+                "completed_translations": list(range(total)),
+                "completed_scripts": list(range(total)),
+                "failed_chapters": {},
+                "needs_attention_chapters": [],
                 "output_path": pkg["output_path"],
                 "package_mode": package_mode,
             },
@@ -1018,6 +1685,16 @@ def run_whole_book_export_pipeline(
         }
 
     except PipelineCancelledError as e:
+        cur_assess = assess_book_pipeline(
+            book=book,
+            settings=cfg,
+            translation_opts=translation_opts,
+            script_opts=script_opts,
+            tts_opts=eff_tts,
+            store=st,
+        )
+        done_t = [cs["chapter_index"] for cs in cur_assess["chapters"] if cs["translation_ready"]]
+        done_s = [cs["chapter_index"] for cs in cur_assess["chapters"] if cs["script_ready"]]
         st.save_whole_book_job(
             book_id,
             {
@@ -1025,7 +1702,10 @@ def run_whole_book_export_pipeline(
                 "status": "cancelled",
                 "chapter_count": total,
                 "stage": current_stage,
+                "stopped_chapter_index": max(0, current_chapter_num - 1),
                 "failed_or_cancelled_chapter": current_chapter_num,
+                "completed_translations": done_t,
+                "completed_scripts": done_s,
                 "error": str(e),
             },
         )
@@ -1034,28 +1714,86 @@ def run_whole_book_export_pipeline(
             "scope": "book",
             "status": "cancelled",
             "stage": current_stage,
+            "book_id": book_id,
+            "book_title": book_title,
             "chapter_number": current_chapter_num,
             "chapter_count": total,
+            "completed_translations": done_t,
+            "completed_scripts": done_s,
             "error": str(e),
         }
     except Exception as e:
+        err_idx = max(0, current_chapter_num - 1)
+        ch_t = chapters[err_idx].get("title", "") if 0 <= err_idx < total else ""
+        f_info = _extract_failure_details(
+            e,
+            chapter_index=err_idx,
+            chapter_title=ch_t,
+            stage=current_stage,
+            settings=cfg,
+        )
+        if 0 <= err_idx < total and current_stage in ("translation", "script"):
+            failed_chapters[str(err_idx)] = f_info
+        cur_assess = assess_book_pipeline(
+            book=book,
+            settings=cfg,
+            translation_opts=translation_opts,
+            script_opts=script_opts,
+            tts_opts=eff_tts,
+            store=st,
+        )
+        done_t = [cs["chapter_index"] for cs in cur_assess["chapters"] if cs["translation_ready"]]
+        done_s = [cs["chapter_index"] for cs in cur_assess["chapters"] if cs["script_ready"]]
+        job_status = "blocked" if f_info["is_blocked"] else "failed"
         st.save_whole_book_job(
             book_id,
             {
                 "job_type": "whole_book_export",
-                "status": "failed",
+                "status": job_status,
                 "chapter_count": total,
                 "stage": current_stage,
+                "stopped_chapter_index": err_idx,
                 "failed_or_cancelled_chapter": current_chapter_num,
-                "error": str(e),
+                "unit_index": f_info.get("unit_index"),
+                "unit_id": f_info.get("unit_id", ""),
+                "batch_index": f_info.get("batch_index"),
+                "is_blocked": f_info["is_blocked"],
+                "blocked_provider": f_info["blocked_provider"],
+                "blocked_filter": f_info["blocked_filter"],
+                "status_code": f_info["status_code"],
+                "completed_translations": done_t,
+                "completed_scripts": done_s,
+                "units_completed": cur_assess["units_completed"],
+                "units_missing": cur_assess["units_missing"],
+                "units_failed": cur_assess["units_failed"],
+                "failed_chapters": failed_chapters,
+                "error": f_info["error"],
             },
         )
         return {
             "success": False,
             "scope": "book",
-            "status": "failed",
+            "status": job_status,
+            "is_blocked": f_info["is_blocked"],
+            "error_category": f_info["category"],
+            "status_code": f_info["status_code"],
+            "blocked_provider": f_info["blocked_provider"],
+            "blocked_filter": f_info["blocked_filter"],
             "stage": current_stage,
+            "book_id": book_id,
+            "book_title": book_title,
+            "chapter_index": err_idx,
             "chapter_number": current_chapter_num,
+            "chapter_title": ch_t,
             "chapter_count": total,
-            "error": f"כשל בפרק {current_chapter_num}/{total} ({current_stage}): {e}",
+            "unit_index": f_info.get("unit_index"),
+            "unit_id": f_info.get("unit_id", ""),
+            "batch_index": f_info.get("batch_index"),
+            "completed_translations": done_t,
+            "completed_scripts": done_s,
+            "units_completed": cur_assess["units_completed"],
+            "units_missing": cur_assess["units_missing"],
+            "units_failed": cur_assess["units_failed"],
+            "failed_chapters": failed_chapters,
+            "error": f"כשל בפרק {current_chapter_num}/{total} ({current_stage}): {f_info['error']}",
         }

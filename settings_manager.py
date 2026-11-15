@@ -97,6 +97,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "target_lang": "he",
         "libretranslate_url": "https://libretranslate.com/translate",
         "libretranslate_api_key": "",
+        "fallback_to_ai_on_failure": False,
+        "fallback_secondary_engine": "",
     },
     "narration": {
         "teacher_voice": "edge_avri",

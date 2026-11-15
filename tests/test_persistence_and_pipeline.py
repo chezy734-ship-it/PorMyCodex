@@ -364,8 +364,10 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             mp3_merge_fn=_mock_mp3_merge,
         )
         self.assertTrue(res2["success"], res2.get("error"))
-        self.assertEqual(len(trans_calls), 4)
+        self.assertEqual(len(trans_calls), 3)  # רק המשפט שנערך (Alpha) מתורגם מחדש; Beta נשמר
         self.assertEqual(len(script_calls), 2)
+        arts_after_edit = self.store.get_chapter_artifacts("b_stale", 0)
+        self.assertGreaterEqual(len(arts_after_edit.get("translation_history") or []), 1)
 
         # שינוי ב: הגדרות ספק/מודל AI לתסריט השתנו -> התסריט הישן נפסל!
         settings_mod = deepcopy(settings)
@@ -396,10 +398,10 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             mp3_merge_fn=_mock_mp3_merge,
         )
         self.assertTrue(res3["success"], res3.get("error"))
-        self.assertEqual(len(trans_calls), 4)   # התרגום לא דרש הרצה מיותרת
+        self.assertEqual(len(trans_calls), 3)   # התרגום לא דרש הרצה מיותרת
         self.assertEqual(len(script_calls), 3)  # התסריט נוצר מחדש למודל החדש
 
-        # שינוי ג: שפת יעד/מנוע תרגום השתנו -> גם התרגום וגם התסריט נפסלים ומחודשים
+        # שינוי ג: שפת יעד השתנתה -> גם התרגום וגם התסריט נפסלים ומחודשים
         res4 = run_enforced_export_pipeline(
             book_id="b_stale",
             chapter_index=0,
@@ -414,7 +416,7 @@ print(json.dumps({{'restored': True, 'books': len(book_ids), 'lines': len(status
             mp3_merge_fn=_mock_mp3_merge,
         )
         self.assertTrue(res4["success"], res4.get("error"))
-        self.assertEqual(len(trans_calls), 6)
+        self.assertEqual(len(trans_calls), 5)
         self.assertEqual(len(script_calls), 4)
 
     def test_05_long_chapter_script_is_not_truncated(self):

@@ -565,6 +565,8 @@ class SettingsDialog(QDialog):
         self.settings["translation"]["engine"] = self.combo_trans_engine.currentData()
         self.settings["translation"]["libretranslate_url"] = self.txt_libre_url.text().strip()
         self.settings["translation"]["libretranslate_api_key"] = self.txt_libre_key.text().strip()
+        self.settings["translation"]["fallback_secondary_engine"] = self.combo_fallback_secondary.currentData() or ""
+        self.settings["translation"]["fallback_to_ai_on_failure"] = self.chk_fallback_ai.isChecked()
         self.settings["narration"]["teacher_voice"] = self.combo_teacher_voice.currentData()
         self.settings["narration"]["student_voice"] = self.combo_student_voice.currentData()
         self.settings["narration"]["narrator_voice"] = self.combo_narrator_voice.currentData()
@@ -578,8 +580,9 @@ class TranslateDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("🌐 תרגום פרק (AI או מנוע חינמי)")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(480, 320)
+        self.resize(520, 360)
         self.settings = settings or load_settings()
+        t_cfg = self.settings.get("translation", {})
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -590,7 +593,7 @@ class TranslateDialog(QDialog):
         self.combo_engine = QComboBox()
         for eid, elabel in TRANSLATION_ENGINES:
             self.combo_engine.addItem(elabel, eid)
-        default_engine = self.settings.get("translation", {}).get("engine", "google_free")
+        default_engine = t_cfg.get("engine", "google_free")
         idx = self.combo_engine.findData(default_engine)
         if idx >= 0:
             self.combo_engine.setCurrentIndex(idx)
@@ -602,10 +605,16 @@ class TranslateDialog(QDialog):
             self.combo_src.addItem(label, code)
             if code != "auto":
                 self.combo_tgt.addItem(label, code)
-        self.combo_src.setCurrentIndex(self.combo_src.findData("auto"))
-        self.combo_tgt.setCurrentIndex(self.combo_tgt.findData("he"))
+        self.combo_src.setCurrentIndex(max(0, self.combo_src.findData(t_cfg.get("source_lang", "auto"))))
+        self.combo_tgt.setCurrentIndex(max(0, self.combo_tgt.findData(t_cfg.get("target_lang", "he"))))
         form.addRow("שפת מקור:", self.combo_src)
         form.addRow("שפת יעד:", self.combo_tgt)
+
+        self.chk_fallback_ai = QCheckBox(
+            "אם התרגום החינמי נכשל/נחסם, נסה את ספק ה-AI שנבחר (עשוי לצרוך מכסה/תשלום)"
+        )
+        self.chk_fallback_ai.setChecked(bool(t_cfg.get("fallback_to_ai_on_failure", False)))
+        form.addRow("גיבוי התאוששות:", self.chk_fallback_ai)
 
         layout.addLayout(form)
 
@@ -636,6 +645,7 @@ class TranslateDialog(QDialog):
             "source_lang": self.combo_src.currentData(),
             "target_lang": self.combo_tgt.currentData(),
             "replace_reader": self.radio_replace.isChecked(),
+            "fallback_to_ai_on_failure": self.chk_fallback_ai.isChecked(),
         }
 
 
@@ -652,7 +662,7 @@ class ScriptStudioDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("🎬 יצירת תסריט AI (פרק נוכחי / הספר כולו)")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.resize(560, 500)
+        self.resize(580, 560)
         self.settings = settings or load_settings()
 
         layout = QVBoxLayout(self)
@@ -678,6 +688,13 @@ class ScriptStudioDialog(QDialog):
             self.radio_scope_chapter.setChecked(True)
         scope_lay.addWidget(self.radio_scope_chapter)
         scope_lay.addWidget(self.radio_scope_book)
+
+        t_cfg = self.settings.get("translation", {})
+        self.chk_fallback_ai = QCheckBox(
+            "אם התרגום החינמי נכשל/נחסם, נסה את ספק ה-AI שנבחר (עשוי לצרוך מכסה/תשלום)"
+        )
+        self.chk_fallback_ai.setChecked(bool(t_cfg.get("fallback_to_ai_on_failure", False)))
+        scope_lay.addWidget(self.chk_fallback_ai)
         layout.addWidget(grp_scope)
 
         grp_mode = QGroupBox("סגנון התסריט")
@@ -727,6 +744,7 @@ class ScriptStudioDialog(QDialog):
             "instruction": self.txt_instruction.toPlainText().strip(),
             "use_wikipedia": self.chk_wikipedia.isChecked(),
             "wiki_terms": self.txt_wiki_terms.text().strip(),
+            "fallback_to_ai_on_failure": self.chk_fallback_ai.isChecked(),
         }
 
 
@@ -898,6 +916,13 @@ class ExportPipelineDialog(QDialog):
         lang_row.addWidget(QLabel("יעד:"))
         lang_row.addWidget(self.combo_tgt, 1)
         form_t.addRow("שפות:", lang_row)
+
+        self.chk_fallback_ai = QCheckBox(
+            "אם התרגום החינמי נכשל/נחסם, נסה את ספק ה-AI שנבחר (עשוי לצרוך מכסה/תשלום)"
+        )
+        self.chk_fallback_ai.setChecked(bool(t_cfg.get("fallback_to_ai_on_failure", False)))
+        form_t.addRow("גיבוי התאוששות:", self.chk_fallback_ai)
+
         layout.addWidget(grp_trans)
 
         # שלב 2: הגדרות תסריט
@@ -1016,9 +1041,14 @@ class ExportPipelineDialog(QDialog):
                 return
 
             self.lbl_stage1_status.setStyleSheet("color: #34d399; font-size: 12px;" if b_status["all_translations_ready"] else "color: #fbbf24; font-size: 12px;")
-            self.lbl_stage1_status.setText(
-                f"שלב 1 (תרגום ספר מלא): מוכנים {b_status['translations_ready']} מתוך {total} פרקים (היתר יתורגמו לפי הסדר לפני יצירת תסריט)."
+            t_msg = (
+                f"שלב 1 (תרגום ספר מלא): מוכנים {b_status['translations_ready']} מתוך {total} פרקים "
+                f"(יחידות תקינות שמורות: {b_status.get('units_completed', 0)}/{b_status.get('total_translation_units', 0)})."
             )
+            rp = b_status.get("resume_point")
+            if rp and not b_status["all_translations_ready"]:
+                t_msg += f" נקודת המשך: פרק {rp.get('chapter_number', 1)} יחידה {rp.get('unit_id', 'u1')}."
+            self.lbl_stage1_status.setText(t_msg)
             self.lbl_stage2_status.setStyleSheet("color: #34d399; font-size: 12px;" if b_status["all_scripts_ready"] else "color: #fbbf24; font-size: 12px;")
             self.lbl_stage2_status.setText(
                 f"שלב 2–3 (תסריט ו-TTS): תסריטים מוכנים {b_status['scripts_ready']}/{total} | שמע במטמון {b_status['tts_ready']}/{total}."
@@ -1038,6 +1068,13 @@ class ExportPipelineDialog(QDialog):
         if status["translation_ready"]:
             self.lbl_stage1_status.setStyleSheet("color: #34d399; font-size: 12px;")
             self.lbl_stage1_status.setText("✅ שלב 1 (תרגום כל המשפטים): עדכני ושלם בתיקיית המשתמש.")
+        elif status.get("has_partial_translation"):
+            tp = status.get("translation_progress") or {}
+            self.lbl_stage1_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+            self.lbl_stage1_status.setText(
+                f"⚠️ שלב 1 (תרגום חלקי שמור): נשמרו {tp.get('completed_count', 0)}/{tp.get('total_units', 0)} יחידות תקינות "
+                f"— המשך מיחידה {tp.get('next_unit_id', 'u1')} לפני יצירת תסריט."
+            )
         else:
             self.lbl_stage1_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
             self.lbl_stage1_status.setText(f"⚠️ שלב 1 (תרגום): {status['translation_reason']} — יבוצע לפני יצירת התסריט.")
@@ -1045,6 +1082,13 @@ class ExportPipelineDialog(QDialog):
         if status["script_ready"]:
             self.lbl_stage2_status.setStyleSheet("color: #34d399; font-size: 12px;")
             self.lbl_stage2_status.setText("✅ שלב 2 (תסריט AI מלא): עדכני ותואם לתרגום ולהגדרות.")
+        elif status.get("has_partial_script"):
+            sp = status.get("script_progress") or {}
+            self.lbl_stage2_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
+            self.lbl_stage2_status.setText(
+                f"⚠️ שלב 2 (תסריט חלקי באצוות): נשמרו {sp.get('completed_count', 0)}/{sp.get('total_units', 0)} יחידות תסריט "
+                f"— יושלם מהאצווה הבאה לפני ה-TTS."
+            )
         else:
             self.lbl_stage2_status.setStyleSheet("color: #fbbf24; font-size: 12px;")
             self.lbl_stage2_status.setText(f"⚠️ שלב 2 (תסריט): {status['script_reason']} — ייווצר מחדש לפני ה-TTS.")
@@ -1081,6 +1125,7 @@ class ExportPipelineDialog(QDialog):
                 "engine": self.combo_engine.currentData(),
                 "source_lang": self.combo_src.currentData(),
                 "target_lang": self.combo_tgt.currentData(),
+                "fallback_to_ai_on_failure": self.chk_fallback_ai.isChecked(),
             },
             "script_opts": {
                 "mode": "educational" if self.radio_edu.isChecked() else "dramatic",
@@ -1094,3 +1139,165 @@ class ExportPipelineDialog(QDialog):
                 "speed": self.default_speed,
             },
         }
+
+
+class BookRecoveryDialog(QDialog):
+    """
+    דיאלוג התאוששות אינטראקטיבי בעת חסימת ספק תרגום (כגון NetFree / HTTP 418) או עצירת משימת ספר שלם.
+    מציג מצב שמור מדויק ומציע:
+      - 'נסה שוב' (retry)
+      - 'החלף ספק והמשך' (switch_and_resume) בלי לבטל פרקים תקינים שכבר הושלמו
+      - 'המשך מטמון / פרקים שנכשלו בלבד' (resume_failed_only)
+      - 'המשך להכנת שאר הפרקים (סמן פרק כטעון טיפול)' (continue_other_chapters) -> מצב partial ללא יצוא שמע
+    """
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        book_title: str = "",
+        chapter_number: int = 1,
+        chapter_count: int = 1,
+        unit_index: Optional[int] = None,
+        unit_id: str = "",
+        stage: str = "translation",
+        error_summary: str = "",
+        is_blocked: bool = False,
+        blocked_provider: str = "",
+        blocked_filter: str = "",
+        settings: Optional[Dict[str, Any]] = None,
+        completed_count: int = 0,
+        units_completed: int = 0,
+        units_missing: int = 0,
+        units_failed: int = 0,
+        failed_chapters: Optional[Dict[str, Any]] = None,
+        allow_continue_other_chapters: bool = True,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("🛠️ התאוששות והמשך עיבוד ספר")
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.resize(640, 500)
+        self.settings = settings or load_settings()
+        self.action_choice = "cancel"
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        unit_label = ""
+        if unit_id:
+            unit_label = f" | יחידה/משפט: <b>{unit_id}</b>"
+        elif unit_index is not None:
+            unit_label = f" | משפט/יחידה: <b>{int(unit_index) + 1}</b>"
+
+        if is_blocked:
+            filter_info = f" ({blocked_filter})" if blocked_filter else ""
+            header_txt = (
+                f"⛔ <b>הספק החינמי '{blocked_provider or 'המנוע הנבחר'}' חסום{filter_info}</b><br>"
+                f"המשימה נעצרה בפרק <b>{chapter_number} מתוך {chapter_count}</b> בשלב <b>{stage}</b>{unit_label}.<br>"
+                "<i>גוף HTML גולמי של דף החסימה אינו נשמר ואינו מוצג כאן.</i>"
+            )
+            bg = "#450a0a"
+            fg = "#fecaca"
+        else:
+            header_txt = (
+                f"⚠️ <b>עיבוד הספר '{book_title}' נעצר בפרק {chapter_number} מתוך {chapter_count}</b> "
+                f"(שלב: <b>{stage}</b>{unit_label})."
+            )
+            bg = "#451a03"
+            fg = "#fde68a"
+
+        self.lbl_diagnosis = QLabel(header_txt)
+        self.lbl_diagnosis.setWordWrap(True)
+        self.lbl_diagnosis.setStyleSheet(f"background-color: {bg}; color: {fg}; padding: 12px; border-radius: 8px;")
+        layout.addWidget(self.lbl_diagnosis)
+
+        clean_err = error_summary or ""
+        if "<html" in clean_err.lower() or "<!doctype" in clean_err.lower():
+            clean_err = "התקבל דף חסימה HTML במקום תרגום תקין (ספק חסום — ראה אפשרויות המשך למטה)."
+        self.lbl_error_detail = QLabel(clean_err)
+        self.lbl_error_detail.setWordWrap(True)
+        self.lbl_error_detail.setStyleSheet("color: #e2e8f0; font-size: 12px;")
+        layout.addWidget(self.lbl_error_detail)
+
+        failed_cnt = len(failed_chapters or {})
+        preserved_txt = (
+            f"💾 <b>נשמרו אטומית {completed_count} פרקים שלמים</b> — פרקים ויחידות שכבר הושלמו לא ייווצרו מחדש "
+            "גם לאחר החלפת ספק התרגום או הפעלה מחדש של התוכנה."
+        )
+        if units_completed or units_missing or units_failed:
+            preserved_txt += (
+                f"<br>📊 פירוט יחידות: הושלמו ותקינות <b>{units_completed}</b> | "
+                f"חסרות/ממתינות <b>{units_missing}</b> | נכשלו <b>{units_failed}</b>."
+            )
+        if failed_cnt:
+            nums = ", ".join(str(int(k) + 1) for k in sorted((failed_chapters or {}).keys(), key=lambda x: int(x) if str(x).isdigit() else 9999)[:12])
+            preserved_txt += f"<br>📌 פרקים טעוני טיפול כעת: <b>{nums}</b>"
+        self.lbl_preserved = QLabel(preserved_txt)
+        self.lbl_preserved.setWordWrap(True)
+        self.lbl_preserved.setStyleSheet("background-color: #0f172a; color: #34d399; padding: 10px; border-radius: 8px;")
+        layout.addWidget(self.lbl_preserved)
+
+        grp_switch = QGroupBox("החלפת ספק / אישור מדיניות Fallback להמשך")
+        sw_lay = QFormLayout(grp_switch)
+        t_cfg = self.settings.get("translation", {})
+
+        self.combo_recovery_engine = QComboBox()
+        for eid, elabel in TRANSLATION_ENGINES:
+            self.combo_recovery_engine.addItem(elabel, eid)
+        # אם המנוע הנוכחי נחסם — הצע כברירת מחדל בדיאלוג ההחלפה מנוע אחר (למשל AI אם מוגדר)
+        cur_eng = t_cfg.get("engine", "google_free")
+        default_pick = "ai" if (is_blocked and cur_eng == "google_free") else cur_eng
+        idx = self.combo_recovery_engine.findData(default_pick)
+        if idx >= 0:
+            self.combo_recovery_engine.setCurrentIndex(idx)
+        sw_lay.addRow("ספק תרגום להמשך:", self.combo_recovery_engine)
+
+        self.chk_recovery_ai_fallback = QCheckBox(
+            "אשר מעבר לספק ה-AI שנבחר אם החינמי נכשל/נחסם (עשוי לצרוך מכסה/תשלום)"
+        )
+        self.chk_recovery_ai_fallback.setChecked(bool(t_cfg.get("fallback_to_ai_on_failure", False)))
+        sw_lay.addRow("מדיניות AI:", self.chk_recovery_ai_fallback)
+        layout.addWidget(grp_switch)
+
+        btn_col = QVBoxLayout()
+        row1 = QHBoxLayout()
+
+        self.btn_switch_provider = QPushButton("🔀 החלף ספק והמשך מנקודת העצירה")
+        self.btn_switch_provider.setObjectName("primaryBtn")
+        self.btn_switch_provider.clicked.connect(lambda: self._pick("switch_and_resume"))
+        row1.addWidget(self.btn_switch_provider)
+
+        self.btn_resume_cache = QPushButton("▶️ המשך מנקודת העצירה (יחידות/פרקים חסרים)")
+        self.btn_resume_cache.clicked.connect(lambda: self._pick("resume_failed_only"))
+        row1.addWidget(self.btn_resume_cache)
+
+        self.btn_retry = QPushButton("🔄 נסה שוב")
+        self.btn_retry.clicked.connect(lambda: self._pick("retry"))
+        row1.addWidget(self.btn_retry)
+        btn_col.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.btn_continue_partial = QPushButton("⏭️ המשך להכנת שאר הפרקים (סמן פרק כטעון טיפול)")
+        self.btn_continue_partial.setVisible(bool(allow_continue_other_chapters))
+        self.btn_continue_partial.clicked.connect(lambda: self._pick("continue_other_chapters"))
+        row2.addWidget(self.btn_continue_partial)
+
+        row2.addStretch()
+        self.btn_close = QPushButton("⏸️ השהה (המשך מאוחר יותר)")
+        self.btn_close.clicked.connect(self.reject)
+        row2.addWidget(self.btn_close)
+        btn_col.addLayout(row2)
+
+        layout.addLayout(btn_col)
+
+    def _pick(self, action: str):
+        self.action_choice = action
+        self.accept()
+
+    def get_recovery_decision(self) -> Dict[str, Any]:
+        return {
+            "action": self.action_choice,
+            "engine": self.combo_recovery_engine.currentData(),
+            "fallback_to_ai_on_failure": self.chk_recovery_ai_fallback.isChecked(),
+        }
+
