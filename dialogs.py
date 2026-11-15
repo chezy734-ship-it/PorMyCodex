@@ -266,6 +266,22 @@ class SettingsDialog(QDialog):
         self.txt_libre_key.setPlaceholderText("אופציונלי")
         form_t.addRow("מפתח LibreTranslate:", self.txt_libre_key)
 
+        self.combo_fallback_secondary = QComboBox()
+        self.combo_fallback_secondary.addItem("ללא שירות גיבוי משני", "")
+        self.combo_fallback_secondary.addItem("LibreTranslate (מוגדר למעלה)", "libretranslate")
+        self.combo_fallback_secondary.addItem("ספק ה-AI שנבחר (אם אושר למטה)", "ai")
+        fb_sec = str(t_cfg.get("fallback_secondary_engine", "") or "")
+        fb_idx = self.combo_fallback_secondary.findData(fb_sec)
+        if fb_idx >= 0:
+            self.combo_fallback_secondary.setCurrentIndex(fb_idx)
+        form_t.addRow("שירות תרגום משני:", self.combo_fallback_secondary)
+
+        self.chk_fallback_ai = QCheckBox(
+            "אם התרגום החינמי נכשל/נחסם, נסה את ספק ה-AI שנבחר (עשוי לצרוך מכסה/תשלום)"
+        )
+        self.chk_fallback_ai.setChecked(bool(t_cfg.get("fallback_to_ai_on_failure", False)))
+        form_t.addRow("מדיניות התאוששות:", self.chk_fallback_ai)
+
         trans_layout.addWidget(grp_trans)
 
         grp_voices = QGroupBox("קולות להקראת תסריט רב-קולי (מורה ותלמיד)")
