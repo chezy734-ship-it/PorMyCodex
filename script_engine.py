@@ -6,9 +6,10 @@
 - תומך בהעשרת ידע מוויקיפדיה, ביטול מיידי (גם באמצע Retry/Backoff), ואימות שלמות מלא
 """
 
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Tuple
 from settings_manager import load_settings, get_active_provider_config
 from ai_providers import (
+    AICallError,
     AICancelledError,
     chat_completion,
     extract_json_object,
@@ -240,16 +241,17 @@ def generate_narration_script(
                 f"יוצר תסריט AI (חלק {batch_num} מתוך {total_batches}, {len(batch_units)} משפטים)..."
             )
 
-        user_prompt = (
-            f"שם הספר: {book_title or 'ללא שם'}\n"
-            f"מצב תסריט: {'לימודי (מורה ותלמיד)' if mode == 'educational' else 'דרמטי (קריינות)'}\n"
-            f"חלק {batch_num} מתוך {total_batches}\n"
-            "יחידות המקור:\n"
-            + "\n".join(f"[{u['unitId']}] {u['text']}" for u in batch_units)
-            + (wiki_section if batch_num == 1 else "")
-        )
-
-        try:
+        def _call_and_parse_subbatch(sub_units: List[Dict[str, str]], label_suffix: str = "") -> Dict[str, Any]:
+            sub_ids = [u["unitId"] for u in sub_units]
+            sub_set = set(sub_ids)
+            user_prompt = (
+                f"שם הספר: {book_title or 'ללא שם'}\n"
+                f"מצב תסריט: {'לימודי (מורה ותלמיד)' if mode == 'educational' else 'דרמטי (קריינות)'}\n"
+                f"חלק {batch_num} מתוך {total_batches}{label_suffix}\n"
+                "יחידות המקור:\n"
+                + "\n".join(f"[{u['unitId']}] {u['text']}" for u in sub_units)
+                + (wiki_section if batch_num == 1 and not label_suffix else "")
+            )
             raw_response = _call_chat(
                 caller,
                 provider_id=pid,
@@ -268,44 +270,17 @@ def generate_narration_script(
                 progress_cb=progress_cb,
                 stage=f"יצירת תסריט AI (חלק {batch_num}/{total_batches})",
             )
-        except AICancelledError as e:
-            if batch_progress_cb is not None:
-                batch_progress_cb({
-                    "event": "batch_cancelled",
-                    "batch_index": b_idx0,
-                    "unit_id": first_uid,
-                })
-            raise ScriptCancelledError(str(e)) from e
-        except Exception as exc:
-            setattr(exc, "batch_index", b_idx0)
-            setattr(exc, "unit_id", first_uid)
-            if batch_progress_cb is not None:
-                batch_progress_cb({
-                    "event": "batch_failed",
-                    "batch_index": b_idx0,
-                    "unit_id": first_uid,
-                    "error": str(exc),
-                    "provider_label": current_prov_label,
-                })
-            raise
-
-        _check_cancelled(cancel_event)
-
-        try:
+            _check_cancelled(cancel_event)
             parsed = extract_json_object(raw_response)
-            b_title = str(parsed.get("title") or "").strip()
-            if not script_title and b_title:
-                script_title = b_title
-
+            b_title_local = str(parsed.get("title") or "").strip()
             raw_lines = parsed.get("lines", [])
             if not isinstance(raw_lines, list) or not raw_lines:
                 raise RuntimeError(
                     f"שלב 'יצירת תסריט AI': המודל לא החזיר שורות תסריט תקינות עבור חלק {batch_num} מתוך {total_batches}."
                 )
 
-            batch_valid_lines: List[Dict[str, Any]] = []
-            batch_covered = set()
-
+            sub_valid_lines: List[Dict[str, Any]] = []
+            sub_covered = set()
             for idx, line in enumerate(raw_lines):
                 if not isinstance(line, dict):
                     continue
@@ -316,14 +291,12 @@ def generate_narration_script(
                 if role not in ("teacher", "student", "narrator"):
                     role = "narrator"
                 uid = str(line.get("unitId") or "").strip()
-                if uid and uid in all_unit_ids_set and uid not in expected_set:
-                    # יחידה השייכת לאצווה אחרת (כפילות בין אצוות) — מדלגים כדי למנוע שכפול שורות
+                if uid and uid in all_unit_ids_set and uid not in sub_set:
                     continue
-                if not uid or uid not in expected_set:
-                    uid = expected_ids[min(idx, len(expected_ids) - 1)]
-                batch_covered.add(uid)
-                covered_units.add(uid)
-                batch_valid_lines.append({
+                if not uid or uid not in sub_set:
+                    uid = sub_ids[min(idx, len(sub_ids) - 1)]
+                sub_covered.add(uid)
+                sub_valid_lines.append({
                     "unitId": uid,
                     "speakerRole": role,
                     "speakerLabel": SPEAKER_DISPLAY.get(role, "🎙️ מספר"),
@@ -332,20 +305,115 @@ def generate_narration_script(
                     "needsReview": bool(line.get("needsReview", False)),
                 })
 
-            if not batch_valid_lines:
+            if not sub_valid_lines:
                 raise RuntimeError(f"שלב 'יצירת תסריט AI': התסריט שהתקבל בחלק {batch_num} ריק.")
 
-            missing_in_batch = [uid for uid in expected_ids if uid not in batch_covered]
-            if missing_in_batch and len(batch_valid_lines) >= len(batch_units):
-                for uid in missing_in_batch:
-                    batch_covered.add(uid)
-                    covered_units.add(uid)
+            missing = [uid for uid in sub_ids if uid not in sub_covered]
+            if missing and len(sub_valid_lines) >= len(sub_units):
+                for uid in missing:
+                    sub_covered.add(uid)
+                missing = []
 
-            still_missing = [uid for uid in expected_ids if uid not in batch_covered]
-            if still_missing:
-                raise RuntimeError(
-                    f"שלב 'יצירת תסריט AI': המודל החזיר תסריט חלקי בחלק {batch_num} (חסרות יחידות: {', '.join(still_missing[:5])})."
+            return {
+                "title": b_title_local,
+                "lines": sub_valid_lines,
+                "covered": sub_covered,
+                "missing": missing,
+            }
+
+        def _run_adaptive_subbatch(sub_units: List[Dict[str, str]], depth: int = 0) -> Tuple[str, List[Dict[str, Any]]]:
+            _check_cancelled(cancel_event)
+            try:
+                res_sub = _call_and_parse_subbatch(
+                    sub_units,
+                    label_suffix=f" (תת-מקטע {len(sub_units)} יח')" if depth > 0 else "",
                 )
+            except AICancelledError:
+                raise
+            except ScriptCancelledError:
+                raise
+            except Exception as err:
+                cat = str(getattr(err, "category", "") or "").lower()
+                is_hard = bool(
+                    getattr(err, "is_blocked", False)
+                    or cat in ("blocked", "auth", "model_not_found")
+                )
+                # תקלת timeout/רשת מפוצלת רק באצוות גדולות (>=6 יחידות), כדי שמקטע קטן שנכשל ידווח ככשל אמיתי
+                min_split_size = 6 if cat in ("timeout", "network", "quota", "server") else 2
+                if is_hard or len(sub_units) < min_split_size or depth >= 4:
+                    raise
+                mid = len(sub_units) // 2
+                if progress_cb:
+                    progress_cb(
+                        f"תסריט AI (חלק {batch_num}/{total_batches}): מפצל מקטע של {len(sub_units)} יחידות לתתי-מקטעים קטנים יותר..."
+                    )
+                t1, l1 = _run_adaptive_subbatch(sub_units[:mid], depth=depth + 1)
+                t2, l2 = _run_adaptive_subbatch(sub_units[mid:], depth=depth + 1)
+                return (t1 or t2), (l1 + l2)
+
+            missing = res_sub["missing"]
+            lines_out = list(res_sub["lines"])
+            b_title_out = res_sub["title"]
+            if not missing:
+                return b_title_out, lines_out
+
+            # אם נותרו רק מעט יחידות חסרות — נשלים אותן ממוקדת או נפצל לחצי
+            if len(missing) < len(sub_units):
+                missing_units = [u for u in sub_units if u["unitId"] in set(missing)]
+                if progress_cb:
+                    progress_cb(
+                        f"תסריט AI (חלק {batch_num}/{total_batches}): משלים {len(missing_units)} יחידות שחסרו במענה..."
+                    )
+                try:
+                    t_rec, l_rec = _run_adaptive_subbatch(missing_units, depth=depth + 1)
+                    if not b_title_out and t_rec:
+                        b_title_out = t_rec
+                    # מיזוג לפי סדר היחידות המקורי
+                    by_uid: Dict[str, List[Dict[str, Any]]] = {}
+                    for ln in lines_out + l_rec:
+                        by_uid.setdefault(ln["unitId"], []).append(ln)
+                    merged: List[Dict[str, Any]] = []
+                    for u in sub_units:
+                        merged.extend(by_uid.get(u["unitId"], []))
+                    if all(u["unitId"] in by_uid for u in sub_units):
+                        return b_title_out, merged
+                except (AICancelledError, ScriptCancelledError):
+                    raise
+                except Exception:
+                    pass
+
+            if len(sub_units) > 1 and depth < 4:
+                mid = len(sub_units) // 2
+                t1, l1 = _run_adaptive_subbatch(sub_units[:mid], depth=depth + 1)
+                t2, l2 = _run_adaptive_subbatch(sub_units[mid:], depth=depth + 1)
+                return (t1 or t2), (l1 + l2)
+
+            raise RuntimeError(
+                f"שלב 'יצירת תסריט AI': המודל החזיר תסריט חלקי בחלק {batch_num} (חסרות יחידות: {', '.join(missing[:5])})."
+            )
+
+        try:
+            b_title, batch_valid_lines = _run_adaptive_subbatch(batch_units, depth=0)
+            if not script_title and b_title:
+                script_title = b_title
+            for ln in batch_valid_lines:
+                covered_units.add(ln["unitId"])
+        except AICancelledError as e:
+            if batch_progress_cb is not None:
+                batch_progress_cb({
+                    "event": "batch_cancelled",
+                    "batch_index": b_idx0,
+                    "unit_id": first_uid,
+                })
+            raise ScriptCancelledError(str(e)) from e
+        except ScriptCancelledError:
+            if batch_progress_cb is not None:
+                batch_progress_cb({
+                    "event": "batch_cancelled",
+                    "batch_index": b_idx0,
+                    "unit_id": first_uid,
+                })
+            raise
         except Exception as exc:
             setattr(exc, "batch_index", b_idx0)
             setattr(exc, "unit_id", first_uid)

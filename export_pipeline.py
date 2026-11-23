@@ -255,13 +255,14 @@ def assess_book_pipeline(
     script_opts: Optional[Dict[str, Any]] = None,
     tts_opts: Optional[Dict[str, Any]] = None,
     store: Optional[LibraryStore] = None,
+    allow_partial_pdf: bool = False,
 ) -> Dict[str, Any]:
     """מאבחן מוכנות ועדכניות עבור כל פרקי הספר (0..K-1) כולל בדיקת כיסוי PDF והתקדמות ברמת יחידות."""
     cfg = settings or load_settings()
     st = store or LibraryStore()
     bid = (book or {}).get("id", "")
     chapters = (book or {}).get("chapters") or []
-    cov_check = validate_book_completeness(book)
+    cov_check = validate_book_completeness(book, allow_partial_pdf=allow_partial_pdf)
 
     chapter_statuses: List[Dict[str, Any]] = []
     t_ready_cnt = 0
@@ -475,6 +476,21 @@ def ensure_translation_for_chapter(
 
     def _on_unit_progress(ev: Dict[str, Any]) -> None:
         ev_type = ev.get("event", "")
+        if ev_type == "batch_done":
+            items = list(ev.get("items") or [])
+            if items:
+                st.save_translation_units_batch(
+                    book_id=book_id,
+                    chapter_index=chapter_index,
+                    source_sentences=source_sentences,
+                    source_hash=status["source_hash"],
+                    config_hash=status["translation_config_hash"],
+                    source_lang=tp["source_lang"],
+                    target_lang=tp["target_lang"],
+                    items=items,
+                    job_status="in_progress",
+                )
+            return
         u_idx = int(ev.get("unit_index", 0))
         if ev_type == "unit_done":
             st.save_translation_unit_progress(
@@ -525,28 +541,65 @@ def ensure_translation_for_chapter(
                 job_status="cancelled",
             )
 
-    try:
-        res = translate_required_sentences(
-            sentences=source_sentences,
-            engine=tp["engine"],
-            source_lang=tp["source_lang"],
-            target_lang=tp["target_lang"],
-            settings=cfg,
-            cancel_event=cancel_event,
-            progress_cb=progress_cb,
-            chat_fn=chat_fn,
-            single_translate_fn=single_translate_fn,
-            fallback_translate_fn=fallback_translate_fn,
-            circuit_breaker=circuit_breaker,
-            fallback_policy=eff_policy or None,
-            request_fn=request_fn,
-            chapter_index=chapter_index,
-            existing_units=reusable_units,
-            unit_progress_cb=_on_unit_progress,
-        )
-    except TranslationCancelledError as e:
-        st.mark_translation_progress_status(book_id, chapter_index, "cancelled")
-        raise PipelineCancelledError(str(e)) from e
+    same_lang_bypass = bool(
+        t_opts.get("bypass_same_language")
+        or (tp["source_lang"] != "auto" and tp["source_lang"] == tp["target_lang"])
+    )
+    if same_lang_bypass:
+        if progress_cb:
+            progress_cb(
+                f"שלב תרגום (פרק {chapter_index + 1}): שפת המקור והיעד זהות ({tp['target_lang']}) — משמר מקטע ישירות..."
+            )
+        clean_sents = [(s or "").strip() for s in source_sentences if (s or "").strip()]
+        res = {
+            "translated_text": "\n".join(clean_sents),
+            "engine": "identity",
+            "primary_engine": tp["engine"],
+            "fallback_used": False,
+            "engine_label": "שפת מקור זהה (ללא תרגום חיצוני)",
+            "ai_provider": "",
+            "ai_model": "",
+            "unit_provenance": {
+                str(i): {
+                    "engine": "identity",
+                    "engine_label": "שפת מקור זהה",
+                    "ai_provider": "",
+                    "ai_model": "",
+                    "fallback_used": False,
+                }
+                for i in range(len(clean_sents))
+            },
+            "source_sentences": clean_sents,
+            "translated_sentences": clean_sents,
+            "source_paragraphs": clean_sents,
+            "target_paragraphs": clean_sents,
+            "sentence_count_source": len(clean_sents),
+            "sentence_count_translated": len(clean_sents),
+            "is_complete": True,
+        }
+    else:
+        try:
+            res = translate_required_sentences(
+                sentences=source_sentences,
+                engine=tp["engine"],
+                source_lang=tp["source_lang"],
+                target_lang=tp["target_lang"],
+                settings=cfg,
+                cancel_event=cancel_event,
+                progress_cb=progress_cb,
+                chat_fn=chat_fn,
+                single_translate_fn=single_translate_fn,
+                fallback_translate_fn=fallback_translate_fn,
+                circuit_breaker=circuit_breaker,
+                fallback_policy=eff_policy or None,
+                request_fn=request_fn,
+                chapter_index=chapter_index,
+                existing_units=reusable_units,
+                unit_progress_cb=_on_unit_progress,
+            )
+        except TranslationCancelledError as e:
+            st.mark_translation_progress_status(book_id, chapter_index, "cancelled")
+            raise PipelineCancelledError(str(e)) from e
 
     if not res.get("is_complete"):
         raise IncompleteArtifactError(f"פרק {chapter_index + 1}: התרגום הסתיים במצב חלקי ונדחה.")
@@ -982,6 +1035,7 @@ def run_whole_book_script_pipeline(
     retry_failed_only: bool = False,
     target_chapters: Optional[List[int]] = None,
     continue_on_chapter_failure: bool = False,
+    allow_partial_pdf: bool = False,
 ) -> Dict[str, Any]:
     """
     מייצר תרגום מאומת ולאחריו תסריט AI מלא עבור כל פרקי הספר (0..K-1 לפי הסדר),
@@ -1003,7 +1057,7 @@ def run_whole_book_script_pipeline(
 
     try:
         _raise_if_cancelled(cancel_event, "בדיקת שלמות ספר")
-        cov_check = validate_book_completeness(book)
+        cov_check = validate_book_completeness(book, allow_partial_pdf=allow_partial_pdf)
         if not cov_check["is_complete"]:
             raise IncompleteArtifactError(
                 f"הספר '{book_title}' אינו שלם לעיבוד מלא: {cov_check['reason']}"
@@ -1016,6 +1070,7 @@ def run_whole_book_script_pipeline(
             translation_opts=translation_opts,
             script_opts=script_opts,
             store=st,
+            allow_partial_pdf=allow_partial_pdf,
         )
         completed_trans_set = {cs["chapter_index"] for cs in initial_assess["chapters"] if cs["translation_ready"]}
         completed_script_set = {cs["chapter_index"] for cs in initial_assess["chapters"] if cs["script_ready"]}
@@ -1466,12 +1521,14 @@ def run_whole_book_export_pipeline(
     circuit_breaker: Optional[ProviderCircuitBreaker] = None,
     fallback_policy: Optional[Dict[str, Any]] = None,
     request_fn: Optional[Callable[..., Any]] = None,
+    target_chapters: Optional[List[int]] = None,
+    allow_partial_pdf: bool = False,
 ) -> Dict[str, Any]:
     """
-    מייצא ספר שלם (כל פרקי הספר 0..K-1 לפי הסדר, ללא תלות בפרק הפעיל):
-      1. שלב 1: משלים ומאמת תרגום של כל 0..K-1 הפרקים (עם Circuit Breaker ומדיניות התאוששות)
-      2. שלב 2: משלים ומאמת תסריט AI מלא ועדכני של כל 0..K-1 הפרקים
-      3. שער קשיח: 0 קריאות TTS אם פרק אחד חסר/ישן/חלקי/טעון-טיפול
+    מייצא ספר שלם (כל פרקי הספר 0..K-1 לפי הסדר, או טווח מקטעים נבחר):
+      1. שלב 1: משלים ומאמת תרגום של כל הפרקים המבוקשים (עם Circuit Breaker ומדיניות התאוששות)
+      2. שלב 2: משלים ומאמת תסריט AI מלא ועדכני של כל הפרקים המבוקשים
+      3. שער קשיח: 0 קריאות TTS אם פרק נדרש חסר/ישן/חלקי/טעון-טיפול
       4. שלב 3: מסנתז פרק-פרק למטמון בדיסק (מחדש רק פרקים חסרים/שהתיישנו, זיכרון חסום)
       5. שלב 4: אורז תוצר סופי אטומי ('unified_wav' / 'unified_mp3' / 'zip' / 'folder' + manifest.json)
     """
@@ -1482,6 +1539,15 @@ def run_whole_book_export_pipeline(
     chapters = list((book or {}).get("chapters") or [])
     total = len(chapters)
     breaker = circuit_breaker or ProviderCircuitBreaker()
+
+    if target_chapters is not None:
+        indices_to_run = sorted({int(i) for i in target_chapters if 0 <= int(i) < total})
+        if not indices_to_run:
+            raise IncompleteArtifactError("לא נבחרו מקטעים חוקיים ליצוא.")
+    else:
+        indices_to_run = list(range(total))
+    selected_set = set(indices_to_run)
+    scope_label = "book" if len(indices_to_run) == total else "range"
 
     eff_tts = dict(tts_opts or {})
     if package_mode == "unified_wav":
@@ -1499,20 +1565,21 @@ def run_whole_book_export_pipeline(
 
     try:
         _raise_if_cancelled(cancel_event, "בדיקת שלמות ספר")
-        cov_check = validate_book_completeness(book)
+        cov_check = validate_book_completeness(book, allow_partial_pdf=allow_partial_pdf)
         if not cov_check["is_complete"]:
             raise IncompleteArtifactError(
                 f"הספר '{book_title}' אינו שלם ליצוא ספר מלא: {cov_check['reason']}"
             )
 
-        # שלב 1: תרגום כל הפרקים 0..K-1
+        # שלב 1: תרגום כל הפרקים/מקטעים המבוקשים
         current_stage = "translation"
-        for idx, ch in enumerate(chapters):
+        for idx in indices_to_run:
+            ch = chapters[idx]
             current_chapter_num = idx + 1
             _raise_if_cancelled(cancel_event, f"תרגום פרק {current_chapter_num}/{total}")
             if progress_cb:
                 progress_cb(
-                    f"[שלב 1/4: תרגום ספר מלא] פרק {current_chapter_num} מתוך {total}: {ch.get('title', '')}"
+                    f"[שלב 1/4: תרגום] מקטע {current_chapter_num} מתוך {total}: {ch.get('title', '')}"
                 )
             ensure_translation_for_chapter(
                 book_id=book_id,
@@ -1531,14 +1598,15 @@ def run_whole_book_export_pipeline(
                 request_fn=request_fn,
             )
 
-        # שלב 2: תסריט כל הפרקים 0..K-1
+        # שלב 2: תסריט כל הפרקים/מקטעים המבוקשים
         current_stage = "script"
-        for idx, ch in enumerate(chapters):
+        for idx in indices_to_run:
+            ch = chapters[idx]
             current_chapter_num = idx + 1
             _raise_if_cancelled(cancel_event, f"תסריט פרק {current_chapter_num}/{total}")
             if progress_cb:
                 progress_cb(
-                    f"[שלב 2/4: תסריט ספר מלא] פרק {current_chapter_num} מתוך {total}: {ch.get('title', '')}"
+                    f"[שלב 2/4: תסריט] מקטע {current_chapter_num} מתוך {total}: {ch.get('title', '')}"
                 )
             ensure_script_for_chapter(
                 book_id=book_id,
@@ -1555,7 +1623,7 @@ def run_whole_book_export_pipeline(
                 wiki_fetcher=wiki_fetcher,
             )
 
-        # שער קשיח לפני TTS: חובה שכל 0..K-1 תרגומי ותסריטי הספר יהיו שלמים ומאומתים!
+        # שער קשיח לפני TTS: חובה שכל תרגומי ותסריטי הטווח המבוקש יהיו שלמים ומאומתים!
         pre_tts_check = assess_book_pipeline(
             book=book,
             settings=cfg,
@@ -1563,16 +1631,25 @@ def run_whole_book_export_pipeline(
             script_opts=script_opts,
             tts_opts=eff_tts,
             store=st,
+            allow_partial_pdf=allow_partial_pdf,
         )
-        if not pre_tts_check["all_translations_ready"] or not pre_tts_check["all_scripts_ready"]:
-            raise MissingArtifactError("עצירה לפני TTS: לא כל תרגומי ותסריטי הספר מאומתים ועדכניים.")
+        missing_selected = [
+            cs["chapter_index"]
+            for cs in pre_tts_check["chapters"]
+            if cs["chapter_index"] in selected_set and (not cs["translation_ready"] or not cs["script_ready"])
+        ]
+        if missing_selected:
+            raise MissingArtifactError("עצירה לפני TTS: לא כל תרגומי ותסריטי המקטעים המבוקשים מאומתים ועדכניים.")
 
         # שלב 3: סינתזת TTS פרק-פרק למטמון בדיסק (ללא שמירת כל הספר בזיכרון)
         current_stage = "tts_export"
         chapter_audio_entries: List[Dict[str, Any]] = []
         ch_ext = "wav" if eff_tts["output_format"] == "wav" or eff_tts.get("default_voice") == "sapi5" else "mp3"
 
-        for idx, ch_status in enumerate(pre_tts_check["chapters"]):
+        for ch_status in pre_tts_check["chapters"]:
+            idx = ch_status["chapter_index"]
+            if idx not in selected_set:
+                continue
             current_chapter_num = idx + 1
             _raise_if_cancelled(cancel_event, f"TTS פרק {current_chapter_num}/{total}")
             ch_title = chapters[idx].get("title", f"פרק {current_chapter_num}")
@@ -1583,12 +1660,12 @@ def run_whole_book_export_pipeline(
                 cache_path = ch_status["tts_record"]["audio_path"]
                 if progress_cb:
                     progress_cb(
-                        f"[שלב 3/4: שמע פרק {current_chapter_num}/{total}] משתמש במטמון קיים של '{ch_title}'..."
+                        f"[שלב 3/4: שמע מקטע {current_chapter_num}/{total}] משתמש במטמון קיים של '{ch_title}'..."
                     )
             else:
                 if progress_cb:
                     progress_cb(
-                        f"[שלב 3/4: TTS ספר מלא] מסנתז פרק {current_chapter_num} מתוך {total}: {ch_title}"
+                        f"[שלב 3/4: TTS] מסנתז מקטע {current_chapter_num} מתוך {total}: {ch_title}"
                     )
                 cache_path = get_chapter_audio_cache_path(book_id, idx, ch_ext)
                 script_lines = [line["text"] for line in script_rec["lines"]]
@@ -1634,11 +1711,11 @@ def run_whole_book_export_pipeline(
                 "line_count": len(script_rec["lines"]),
             })
 
-        # שלב 4: אריזת תוצר סופי של הספר כולו לפי הסדר
+        # שלב 4: אריזת תוצר סופי לפי הסדר
         current_stage = "packaging"
         _raise_if_cancelled(cancel_event, "אריזת שמע הספר כולו")
         if progress_cb:
-            progress_cb(f"[שלב 4/4: אריזה סופית] יוצר תוצר שמע לכל {total} הפרקים...")
+            progress_cb(f"[שלב 4/4: אריזה סופית] יוצר תוצר שמע עבור {len(chapter_audio_entries)} מקטעים...")
 
         try:
             pkg = package_book_audio(
@@ -1654,29 +1731,43 @@ def run_whole_book_export_pipeline(
         except ExportCancelledError as e:
             raise PipelineCancelledError(str(e)) from e
 
+        post_assess = assess_book_pipeline(
+            book=book,
+            settings=cfg,
+            translation_opts=translation_opts,
+            script_opts=script_opts,
+            tts_opts=eff_tts,
+            store=st,
+            allow_partial_pdf=allow_partial_pdf,
+        )
+        done_t = [cs["chapter_index"] for cs in post_assess["chapters"] if cs["translation_ready"]]
+        done_s = [cs["chapter_index"] for cs in post_assess["chapters"] if cs["script_ready"]]
+        all_done = bool(post_assess["all_translations_ready"] and post_assess["all_scripts_ready"] and len(done_t) == total)
+
         st.save_whole_book_job(
             book_id,
             {
                 "job_type": "whole_book_export",
-                "status": "completed",
+                "status": "completed" if all_done else "partial",
                 "chapter_count": total,
-                "stage": "completed",
-                "completed_translations": list(range(total)),
-                "completed_scripts": list(range(total)),
+                "stage": "completed" if all_done else "partial",
+                "completed_translations": done_t,
+                "completed_scripts": done_s,
                 "failed_chapters": {},
-                "needs_attention_chapters": [],
+                "needs_attention_chapters": [i for i in range(total) if i not in set(done_s)],
                 "output_path": pkg["output_path"],
                 "package_mode": package_mode,
             },
         )
         return {
             "success": True,
-            "scope": "book",
+            "scope": scope_label,
             "status": "completed",
             "stage": "completed",
             "book_id": book_id,
             "book_title": book_title,
             "chapter_count": total,
+            "selected_count": len(chapter_audio_entries),
             "chapters_processed": [e["chapter_index"] for e in chapter_audio_entries],
             "output_path": pkg["output_path"],
             "package_mode": pkg["package_mode"],

@@ -333,11 +333,25 @@ def export_to_mp3(
                         progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
                     voice_name = _voice_id_to_edge_name(v_id)
                     part_file = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
-                    communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
-                    await communicate.save(part_file)
-                    _check_cancelled(cancel_event)
-                    if not os.path.exists(part_file) or os.path.getsize(part_file) <= 0:
-                        raise RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
+                    last_err: Optional[Exception] = None
+                    for attempt in range(3):
+                        _check_cancelled(cancel_event)
+                        try:
+                            communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
+                            await communicate.save(part_file)
+                            _check_cancelled(cancel_event)
+                            if os.path.exists(part_file) and os.path.getsize(part_file) > 0:
+                                last_err = None
+                                break
+                            last_err = RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
+                        except ExportCancelledError:
+                            raise
+                        except Exception as exc:
+                            last_err = exc
+                            if attempt < 2:
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                    if last_err is not None:
+                        raise RuntimeError(f"כשל Edge-TTS בחלק {i}/{total}: {last_err}") from last_err
                     part_paths.append(part_file)
 
             asyncio.run(synthesize_all())
@@ -422,8 +436,9 @@ def export_to_wav_offline(
                 part_file = os.path.join(temp_dir, f"seg_{i:04d}.wav")
                 part_paths.append(part_file)
                 engine.save_to_file(text_chunk, part_file)
-            engine.runAndWait()
-            _check_cancelled(cancel_event)
+                if i % 5 == 0 or i == total:
+                    engine.runAndWait()
+                    _check_cancelled(cancel_event)
 
             for i, pw in enumerate(part_paths, 1):
                 if not os.path.exists(pw) or os.path.getsize(pw) <= 44:

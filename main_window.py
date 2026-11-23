@@ -20,13 +20,15 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QSlider, QProgressBar,
     QListWidget, QListWidgetItem, QTextBrowser, QFileDialog,
     QMessageBox, QToolBar, QStatusBar, QFrame, QInputDialog,
-    QProgressDialog
+    QProgressDialog, QCheckBox
 )
 from PyQt6.QtGui import QAction, QFont, QKeySequence, QShortcut
 
 from book_loader import (
     SAMPLE_BOOKS,
     load_file_content,
+    resegment_book,
+    segment_text_smartly,
     split_into_sentences,
     validate_book_completeness,
 )
@@ -55,6 +57,7 @@ from dialogs import (
     WikiSearchDialog,
     ExportPipelineDialog,
     BookRecoveryDialog,
+    SegmentBookDialog,
 )
 
 
@@ -202,12 +205,14 @@ class MainWindow(QMainWindow):
         self._export_progress_dlg: Optional[QProgressDialog] = None
         self._last_whole_book_script_params: Optional[Dict[str, Any]] = None
         self._last_whole_book_export_params: Optional[Dict[str, Any]] = None
+        self._auto_advancing_chapter: bool = False
 
         # Audio Engine
         self.audio = AudioEngine()
         self.audio.voice_type = prog.get("voice_type", "edge_avri") or "edge_avri"
         self.audio.speed = float(prog.get("speed", 1.0) or 1.0)
         self.audio.sentence_changed.connect(self.on_sentence_changed)
+        self.audio.chapter_completed.connect(self._on_chapter_audio_completed)
         self.audio.state_changed.connect(self.on_playback_state_changed)
         self.audio.error_occurred.connect(self.on_audio_error)
 
@@ -264,6 +269,11 @@ class MainWindow(QMainWindow):
         paste_action.setToolTip("הדבק טקסט חופשי לקריאה")
         paste_action.triggered.connect(self.paste_custom_text)
         toolbar.addAction(paste_action)
+
+        self.action_resegment_book = QAction("✂️ פיצול מקטעים", self)
+        self.action_resegment_book.setToolTip("פצל מחדש את הספר למקטעים נוחים לפי גודל ונושא")
+        self.action_resegment_book.triggered.connect(self.open_resegment_dialog)
+        toolbar.addAction(self.action_resegment_book)
 
         settings_action = QAction("⚙️ הגדרות AI ומודלים", self)
         settings_action.setToolTip("בחר חברת AI, הזן מפתח API ושאב מודלים זמינים")
@@ -481,13 +491,18 @@ class MainWindow(QMainWindow):
         player_layout.addWidget(self.btn_next)
 
         self.lbl_progress = QLabel("משפט 0 מתוך 0")
-        self.lbl_progress.setFixedWidth(145)
+        self.lbl_progress.setFixedWidth(185)
         player_layout.addWidget(self.lbl_progress)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedHeight(8)
         self.progress_bar.setValue(0)
         player_layout.addWidget(self.progress_bar, 1)
+
+        self.chk_continuous_book = QCheckBox("🔁 רציף לכל הספר")
+        self.chk_continuous_book.setToolTip("עבור אוטומטית למקטע/פרק הבא בסיום ההקראה כדי להקריא את הספר כולו ברצף")
+        self.chk_continuous_book.setChecked(True)
+        player_layout.addWidget(self.chk_continuous_book)
 
         player_layout.addWidget(QLabel("קול:"))
         self.combo_voice = QComboBox()
@@ -686,7 +701,8 @@ class MainWindow(QMainWindow):
 
         self.render_text()
         self.update_progress_display()
-        self.audio.stop()
+        if not self._auto_advancing_chapter:
+            self.audio.stop()
         self._persist_progress_only()
         self._refresh_resume_banner()
 
@@ -776,11 +792,44 @@ class MainWindow(QMainWindow):
     def update_progress_display(self):
         total = len(self.sentences)
         current = self.active_sentence_index + 1 if total > 0 else 0
-        self.lbl_progress.setText(f"משפט {current} מתוך {total}")
+        ch_total = len((self.books[self.current_book_index].get("chapters") or [])) if self.books else 0
+        if ch_total > 1:
+            self.lbl_progress.setText(f"מקטע {self.current_chapter_index + 1}/{ch_total} · {current}/{total}")
+        else:
+            self.lbl_progress.setText(f"משפט {current} מתוך {total}")
         if total > 0:
             self.progress_bar.setValue(int((current / total) * 100))
         else:
             self.progress_bar.setValue(0)
+
+    def _on_chapter_audio_completed(self):
+        if not self.books:
+            return
+        if not getattr(self, "chk_continuous_book", None) or not self.chk_continuous_book.isChecked():
+            return
+        book = self.books[self.current_book_index]
+        chapters = book.get("chapters") or []
+        next_idx = self.current_chapter_index + 1
+        if next_idx >= len(chapters):
+            self.statusBar.showMessage(f"הסתיימה הקראת הספר '{book.get('title', '')}' במלואו!", 7000)
+            return
+        self._auto_advancing_chapter = True
+        try:
+            self.chapter_list.setCurrentRow(next_idx)
+            self.active_sentence_index = 0
+            self.render_text()
+            self.update_progress_display()
+            self.statusBar.showMessage(
+                f"ממשיך אוטומטית למקטע {next_idx + 1}/{len(chapters)}: {chapters[next_idx].get('title', '')}",
+                4000,
+            )
+            self.audio.play(
+                self.sentences,
+                0,
+                voice_overrides=self._get_voice_overrides(),
+            )
+        finally:
+            self._auto_advancing_chapter = False
 
     def _get_voice_overrides(self) -> Optional[List[str]]:
         if not self.speaker_roles:
@@ -909,15 +958,38 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage("טעינת הקובץ נכשלה.", 4000)
         QMessageBox.critical(self, "שגיאה בטעינת קובץ", err)
 
+    def open_resegment_dialog(self):
+        if not self.books:
+            QMessageBox.information(self, "אין ספר", "טען ספר או הדבק טקסט לפני פיצול מקטעים.")
+            return
+        book = self.books[self.current_book_index]
+        dlg = SegmentBookDialog(self, book)
+        if not dlg.exec():
+            return
+        opts = dlg.get_options()
+        self.audio.stop()
+        updated = resegment_book(book, preset=opts["preset"], max_chars=opts["max_chars"])
+        self.books[self.current_book_index] = updated
+        self.on_book_selected(self.current_book_index)
+        self._persist_library_and_progress()
+        cnt = len(updated.get("chapters") or [])
+        self.statusBar.showMessage(f"הספר פוצל מחדש ל-{cnt} מקטעים נוחים!", 6000)
+
     def paste_custom_text(self):
         text, ok = QInputDialog.getMultiLineText(self, "הדבקת טקסט", "הדבק כאן טקסט בעברית או באנגלית לקריאה/תרגום:")
         if ok and text.strip():
+            clean = text.strip()
+            chapters = (
+                segment_text_smartly(clean, base_title="מקטע")
+                if len(clean) > 4000
+                else [{"title": "פרק א׳", "text": clean}]
+            )
             new_book = {
-                "id": f"custom_{len(self.books)}_{abs(hash(text.strip())) % 100000}",
+                "id": f"custom_{len(self.books)}_{abs(hash(clean)) % 100000}",
                 "title": f"טקסט מותאם אישית ({len(self.books) + 1})",
                 "author": "הדבקה אישית",
-                "description": "טקסט שהודבק במערכת",
-                "chapters": [{"title": "פרק א׳", "text": text.strip()}]
+                "description": f"טקסט שהודבק במערכת ({len(chapters)} מקטעים)",
+                "chapters": chapters,
             }
             self.books.append(new_book)
             self.load_book_to_ui(len(self.books) - 1)
@@ -1220,13 +1292,15 @@ class MainWindow(QMainWindow):
         scope = opts.get("scope", default_scope)
 
         if scope == "book":
-            self._start_whole_book_script_job(book, opts)
+            t_opts_arg = {"bypass_same_language": True} if opts.get("bypass_same_language") else None
+            self._start_whole_book_script_job(book, opts, translation_opts=t_opts_arg)
             return
 
         source_text = chapter["text"]
         cfg = self.settings
         book_id = book.get("id", "")
         chapter_idx = self.current_chapter_index
+        ch_t_opts = {"bypass_same_language": True} if opts.get("bypass_same_language") else None
 
         def _worker(cancel_ev, prog_cb):
             ensure_translation_for_chapter(
@@ -1234,6 +1308,7 @@ class MainWindow(QMainWindow):
                 chapter_index=chapter_idx,
                 source_text=source_text,
                 settings=cfg,
+                translation_opts=ch_t_opts,
                 store=self.store,
                 cancel_event=cancel_ev,
                 progress_cb=prog_cb,
@@ -1401,10 +1476,15 @@ class MainWindow(QMainWindow):
             self._apply_fallback_policy_preference(bool(script_opts.get("fallback_to_ai_on_failure")))
 
         book_snapshot = deepcopy(book)
+        target_chapters = script_opts.get("target_chapters")
         clean_script_opts = {
-            k: v for k, v in dict(script_opts).items() if k != "fallback_to_ai_on_failure"
+            k: v
+            for k, v in dict(script_opts).items()
+            if k not in ("fallback_to_ai_on_failure", "target_chapters", "bypass_same_language")
         }
         eff_trans_opts = dict(translation_opts or {})
+        if script_opts.get("bypass_same_language"):
+            eff_trans_opts["bypass_same_language"] = True
         self._last_whole_book_script_params = {
             "book_id": book_snapshot.get("id", ""),
             "script_opts": dict(clean_script_opts),
@@ -1412,7 +1492,8 @@ class MainWindow(QMainWindow):
         }
 
         total = len(book_snapshot.get("chapters") or [])
-        self.statusBar.showMessage(f"מייצר תרגום ותסריט לכל הספר ({total} פרקים לפי הסדר)...")
+        run_cnt = len(target_chapters) if target_chapters is not None else total
+        self.statusBar.showMessage(f"מייצר תרגום ותסריט לספר ({run_cnt} מתוך {total} מקטעים לפי הסדר)...")
 
         th = WholeBookScriptThread({
             "book": book_snapshot,
@@ -1421,6 +1502,7 @@ class MainWindow(QMainWindow):
             "script_opts": clean_script_opts,
             "store": self.store,
             "retry_failed_only": bool(retry_failed_only),
+            "target_chapters": target_chapters,
             "continue_on_chapter_failure": bool(continue_on_chapter_failure),
         })
         self._whole_book_script_thread = th
@@ -1865,7 +1947,8 @@ class MainWindow(QMainWindow):
         safe_title = sanitize_filename_part(book.get("title", ""), "audiobook")
 
         if scope == "book":
-            cov_check = validate_book_completeness(book)
+            allow_partial_pdf = bool(opts.get("allow_partial_pdf", False))
+            cov_check = validate_book_completeness(book, allow_partial_pdf=allow_partial_pdf)
             if not cov_check["is_complete"]:
                 QMessageBox.warning(
                     self,
@@ -1935,6 +2018,8 @@ class MainWindow(QMainWindow):
                 "translation_opts": opts["translation_opts"],
                 "script_opts": opts["script_opts"],
                 "tts_opts": opts["tts_opts"],
+                "target_chapters": opts.get("target_chapters"),
+                "allow_partial_pdf": allow_partial_pdf,
             })
             return
         else:
@@ -2008,14 +2093,15 @@ class MainWindow(QMainWindow):
             if isinstance(script_rec, dict) and script_rec.get("lines"):
                 self._on_script_generated(script_rec)
 
-            if scope == "book":
-                ch_cnt = res.get("chapter_count", 0)
-                title_txt = "📚🎧 שמע לכל הספר מוכן להעברה!"
+            if scope in ("book", "range"):
+                ch_cnt = res.get("selected_count") or res.get("chapter_count", 0)
+                scope_txt = "טווח המקטעים שנבחר" if scope == "range" else "הספר כולו"
+                title_txt = "📚🎧 שמע מוכן להעברה!"
                 body_txt = (
-                    f"הושלמו כל השלבים (תרגום ← תסריט ← TTS ← אריזה) לכל {ch_cnt} פרקי הספר '{res.get('book_title', '')}':\n\n"
+                    f"הושלמו כל השלבים (תרגום ← תסריט ← TTS ← אריזה) עבור {ch_cnt} מקטעים ({scope_txt}) של '{res.get('book_title', '')}':\n\n"
                     f"{saved_path}"
                 )
-                self.statusBar.showMessage(f"שמע הספר כולו ({ch_cnt} פרקים) נשמר בהצלחה: {saved_path}", 8000)
+                self.statusBar.showMessage(f"שמע ({ch_cnt} מקטעים) נשמר בהצלחה: {saved_path}", 8000)
             else:
                 title_txt = "🎧 קובץ השמע של הפרק מוכן להעברה!"
                 body_txt = f"יצוא הפרק הנוכחי הושלם בהצלחה (פרק בודד, לא הספר כולו):\n\n{saved_path}"
@@ -2041,7 +2127,7 @@ class MainWindow(QMainWindow):
                 "היצוא בוטל",
                 f"התהליך בוטל בשלב '{res.get('stage', '')}'. לא נוצר קובץ סופי חלקי (יחידות ופרקים קודמים נשמרו להמשך).",
             )
-        elif scope == "book":
+        elif scope in ("book", "range"):
             self.statusBar.showMessage("ייצוא הספר נעצר — התקדמות תקינה נשמרה להתאוששות.", 6000)
             self._handle_whole_book_recovery(res, is_export=True)
         else:

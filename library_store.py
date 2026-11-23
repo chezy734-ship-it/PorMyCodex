@@ -13,11 +13,13 @@
 
 from copy import deepcopy
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 import os
 import sys
 import tempfile
+import threading
 from typing import Any, Dict, List, Optional
 
 from book_loader import split_into_sentences
@@ -103,8 +105,11 @@ def atomic_write_bytes(target_path: str, data: bytes) -> str:
         raise
 
 
-def atomic_write_json(target_path: str, payload: Any) -> str:
-    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+def atomic_write_json(target_path: str, payload: Any, *, compact: bool = False) -> str:
+    if compact:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    else:
+        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     return atomic_write_bytes(target_path, raw)
 
 
@@ -113,12 +118,14 @@ def _sha256_obj(obj: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+@lru_cache(maxsize=4096)
 def compute_source_hash(text: str) -> str:
     norm = (text or "").replace("\r\n", "\n").strip()
     sents = split_into_sentences(norm) if norm else []
     return _sha256_obj({"text": norm, "sentences": sents})
 
 
+@lru_cache(maxsize=32768)
 def compute_unit_source_hash(text: str) -> str:
     norm = (text or "").replace("\r\n", "\n").strip()
     return _sha256_obj({"unit_text": norm})
@@ -211,6 +218,9 @@ class LibraryStore:
 
     def __init__(self, state_path: Optional[str] = None):
         self._explicit_path = os.path.abspath(state_path) if state_path else None
+        self._io_lock = threading.RLock()
+        self._cache_sig: Optional[tuple] = None
+        self._cache_state: Optional[Dict[str, Any]] = None
 
     @property
     def state_path(self) -> str:
@@ -226,18 +236,9 @@ class LibraryStore:
             "whole_book_jobs": {},
         }
 
-    def load_raw_state(self) -> Dict[str, Any]:
-        path = self.state_path
-        if not os.path.exists(path):
+    def _normalize_loaded_state(self, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
             return self._empty_state()
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return self._empty_state()
-        except Exception:
-            return self._empty_state()
-
         state = self._empty_state()
         if isinstance(data.get("books"), list):
             state["books"] = data["books"]
@@ -253,10 +254,45 @@ class LibraryStore:
             state["whole_book_jobs"] = data["whole_book_jobs"]
         return state
 
+    def _read_state_cached(self) -> Dict[str, Any]:
+        with self._io_lock:
+            path = self.state_path
+            if not os.path.exists(path):
+                self._cache_sig = None
+                self._cache_state = None
+                return self._empty_state()
+            try:
+                st = os.stat(path)
+                sig = (path, st.st_mtime_ns, st.st_size)
+                if self._cache_sig == sig and self._cache_state is not None:
+                    return self._cache_state
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                state = self._normalize_loaded_state(data)
+                self._cache_sig = sig
+                self._cache_state = state
+                return state
+            except Exception:
+                self._cache_sig = None
+                self._cache_state = None
+                return self._empty_state()
+
+    def load_raw_state(self) -> Dict[str, Any]:
+        return deepcopy(self._read_state_cached())
+
     def _save_raw_state(self, state: Dict[str, Any]) -> None:
-        state["schema_version"] = SCHEMA_VERSION
-        state["updated_at"] = _now_iso()
-        atomic_write_json(self.state_path, state)
+        with self._io_lock:
+            state["schema_version"] = SCHEMA_VERSION
+            state["updated_at"] = _now_iso()
+            use_compact = len(state.get("chapter_artifacts") or {}) > 4 or len(state.get("books") or []) > 4
+            atomic_write_json(self.state_path, state, compact=use_compact)
+            try:
+                st = os.stat(self.state_path)
+                self._cache_sig = (self.state_path, st.st_mtime_ns, st.st_size)
+                self._cache_state = deepcopy(state)
+            except Exception:
+                self._cache_sig = None
+                self._cache_state = None
 
     def load_library(self, default_books: List[Dict[str, Any]]) -> Dict[str, Any]:
         state = self.load_raw_state()
@@ -621,8 +657,9 @@ class LibraryStore:
             self._save_raw_state(state)
         return view
 
-    def save_translation_unit_progress(
+    def _save_translation_units_internal(
         self,
+        *,
         book_id: str,
         chapter_index: int,
         source_sentences: List[str],
@@ -630,19 +667,10 @@ class LibraryStore:
         config_hash: str,
         source_lang: str,
         target_lang: str,
-        unit_index: int,
-        unit_status: str,
-        *,
-        translated_text: str = "",
-        engine: str = "",
-        engine_label: str = "",
-        ai_provider: str = "",
-        ai_model: str = "",
-        fallback_used: bool = False,
-        error: str = "",
+        unit_updates: List[Dict[str, Any]],
         job_status: str = "in_progress",
     ) -> Dict[str, Any]:
-        """שומר אטומית התקדמות ברמת משפט בודד מבלי לסמן פרק חלקי כמוכן ליצוא."""
+        """שומר אטומית קבוצה של יחידות תרגום בכתיבה אחת לדיסק מבלי לסמן פרק חלקי כמוכן ליצוא."""
         state = self.load_raw_state()
         ck = chapter_key(book_id, chapter_index)
         art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
@@ -656,15 +684,26 @@ class LibraryStore:
             target_lang=target_lang,
             source_hash=source_hash,
         )
-        idx = int(unit_index)
         total = len(source_sentences)
-        if 0 <= idx < total:
+        now_ts = _now_iso()
+        for upd in unit_updates:
+            idx = int(upd.get("unit_index", -1))
+            if not (0 <= idx < total):
+                continue
             key = str(idx)
             sent = source_sentences[idx]
             existing_u = view["units"].get(key) or {}
             hist = list(existing_u.get("previous_versions") or [])
-            now_ts = _now_iso()
-            if unit_status == "completed" and (translated_text or "").strip():
+            unit_status = str(upd.get("unit_status") or "completed")
+            translated_text = str(upd.get("translated_text") or "")
+            engine = str(upd.get("engine") or "")
+            engine_label = str(upd.get("engine_label") or "")
+            ai_provider = str(upd.get("ai_provider") or "")
+            ai_model = str(upd.get("ai_model") or "")
+            fallback_used = bool(upd.get("fallback_used", False))
+            error = str(upd.get("error") or "")
+
+            if unit_status == "completed" and translated_text.strip():
                 view["units"][key] = {
                     "unit_id": f"u{idx + 1}",
                     "unit_index": idx,
@@ -677,7 +716,7 @@ class LibraryStore:
                     "engine_label": engine_label,
                     "ai_provider": ai_provider,
                     "ai_model": ai_model,
-                    "fallback_used": bool(fallback_used),
+                    "fallback_used": fallback_used,
                     "error": "",
                     "previous_versions": hist,
                     "updated_at": now_ts,
@@ -695,7 +734,7 @@ class LibraryStore:
                     "engine_label": engine_label or existing_u.get("engine_label", ""),
                     "ai_provider": ai_provider,
                     "ai_model": ai_model,
-                    "fallback_used": bool(fallback_used),
+                    "fallback_used": fallback_used,
                     "error": error,
                     "previous_versions": hist,
                     "updated_at": now_ts,
@@ -727,10 +766,93 @@ class LibraryStore:
         view["next_unit_index"] = next_idx
         view["next_unit_id"] = f"u{next_idx + 1}" if next_idx < total else ""
         view["status"] = job_status
-        view["updated_at"] = _now_iso()
+        view["updated_at"] = now_ts
         art["translation_progress"] = view
         self._save_raw_state(state)
         return view
+
+    def save_translation_units_batch(
+        self,
+        book_id: str,
+        chapter_index: int,
+        source_sentences: List[str],
+        source_hash: str,
+        config_hash: str,
+        source_lang: str,
+        target_lang: str,
+        items: List[Dict[str, Any]],
+        job_status: str = "in_progress",
+    ) -> Dict[str, Any]:
+        """שומר אטומית אצוות יחידות שהושלמו בכתיבת דיסק אחת לשיפור ביצועים בספרים גדולים."""
+        updates = [
+            {
+                "unit_index": int(it["unit_index"]),
+                "unit_status": it.get("unit_status", "completed"),
+                "translated_text": it.get("translated_text", ""),
+                "engine": it.get("engine", ""),
+                "engine_label": it.get("engine_label", ""),
+                "ai_provider": it.get("ai_provider", ""),
+                "ai_model": it.get("ai_model", ""),
+                "fallback_used": bool(it.get("fallback_used", False)),
+                "error": it.get("error", ""),
+            }
+            for it in (items or [])
+        ]
+        return self._save_translation_units_internal(
+            book_id=book_id,
+            chapter_index=chapter_index,
+            source_sentences=source_sentences,
+            source_hash=source_hash,
+            config_hash=config_hash,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            unit_updates=updates,
+            job_status=job_status,
+        )
+
+    def save_translation_unit_progress(
+        self,
+        book_id: str,
+        chapter_index: int,
+        source_sentences: List[str],
+        source_hash: str,
+        config_hash: str,
+        source_lang: str,
+        target_lang: str,
+        unit_index: int,
+        unit_status: str,
+        *,
+        translated_text: str = "",
+        engine: str = "",
+        engine_label: str = "",
+        ai_provider: str = "",
+        ai_model: str = "",
+        fallback_used: bool = False,
+        error: str = "",
+        job_status: str = "in_progress",
+    ) -> Dict[str, Any]:
+        """שומר אטומית התקדמות ברמת משפט בודד מבלי לסמן פרק חלקי כמוכן ליצוא."""
+        return self._save_translation_units_internal(
+            book_id=book_id,
+            chapter_index=chapter_index,
+            source_sentences=source_sentences,
+            source_hash=source_hash,
+            config_hash=config_hash,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            unit_updates=[{
+                "unit_index": unit_index,
+                "unit_status": unit_status,
+                "translated_text": translated_text,
+                "engine": engine,
+                "engine_label": engine_label,
+                "ai_provider": ai_provider,
+                "ai_model": ai_model,
+                "fallback_used": fallback_used,
+                "error": error,
+            }],
+            job_status=job_status,
+        )
 
     def mark_translation_progress_status(
         self,

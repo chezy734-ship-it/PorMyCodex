@@ -696,7 +696,7 @@ def _run_single_engine_translation(
         if unit_progress_cb is not None:
             unit_progress_cb(ev)
 
-    def _record_unit_ok(i: int, text_val: str) -> None:
+    def _record_unit_ok(i: int, text_val: str, *, emit: bool = True) -> Dict[str, Any]:
         clean_val = text_val.strip()
         translated_list[i] = clean_val
         prov = {
@@ -707,18 +707,29 @@ def _run_single_engine_translation(
             "fallback_used": is_fb,
         }
         provenance_map[str(i)] = prov
-        units_store[i] = {
+        item = {
             "unit_id": f"u{i + 1}",
             "unit_index": i,
             "translated_text": clean_val,
             **prov,
         }
+        units_store[i] = item
+        if emit:
+            _emit_unit({
+                "event": "unit_done",
+                **item,
+            })
+        return item
+
+    def _emit_batch_ok(batch_items: List[Dict[str, Any]]) -> None:
+        if not batch_items or unit_progress_cb is None:
+            return
         _emit_unit({
-            "event": "unit_done",
-            "unit_index": i,
-            "unit_id": f"u{i + 1}",
-            "translated_text": clean_val,
-            **prov,
+            "event": "batch_done",
+            "items": batch_items,
+            "unit_index": batch_items[-1]["unit_index"],
+            "unit_id": batch_items[-1]["unit_id"],
+            "engine": cand_engine,
         })
 
     def _use_fn() -> Optional[Callable[[str, str, str, str], str]]:
@@ -855,10 +866,13 @@ def _run_single_engine_translation(
             except (json.JSONDecodeError, ValueError, KeyError, TypeError):
                 batch_map = {}
 
+            batch_items_done: List[Dict[str, Any]] = []
             for i, orig_sent in batch:
                 try:
                     _check_cancelled(cancel_event)
                 except TranslationCancelledError:
+                    if batch_items_done:
+                        _emit_batch_ok(batch_items_done)
                     _emit_unit({"event": "unit_cancelled", "unit_index": i, "unit_id": f"u{i + 1}", "engine": cand_engine})
                     raise
                 val = (batch_map.get(i) or "").strip()
@@ -866,9 +880,13 @@ def _run_single_engine_translation(
                     try:
                         val = _translate_one(orig_sent)
                     except (TranslationCancelledError, AICancelledError) as ce:
+                        if batch_items_done:
+                            _emit_batch_ok(batch_items_done)
                         _emit_unit({"event": "unit_cancelled", "unit_index": i, "unit_id": f"u{i + 1}", "engine": cand_engine})
                         raise TranslationCancelledError(str(ce)) from ce
                     except Exception as exc:
+                        if batch_items_done:
+                            _emit_batch_ok(batch_items_done)
                         setattr(exc, "unit_index", i)
                         setattr(exc, "unit_id", f"u{i + 1}")
                         _emit_unit({
@@ -880,6 +898,8 @@ def _run_single_engine_translation(
                         })
                         raise
                 if not val:
+                    if batch_items_done:
+                        _emit_batch_ok(batch_items_done)
                     err = AICallError(
                         f"שלב התרגום נכשל במשפט {i + 1} מתוך {total}: התקבל פלט ריק.",
                         stage="תרגום AI",
@@ -896,7 +916,121 @@ def _run_single_engine_translation(
                         "error": str(err),
                     })
                     raise err
-                _record_unit_ok(i, val)
+                batch_items_done.append(_record_unit_ok(i, val, emit=False))
+            _emit_batch_ok(batch_items_done)
+    elif cand_engine in ("google_free", "libretranslate") and direct_fn is None and len(pending_indices) > 1:
+        pending_pairs = [(i, clean_sentences[i]) for i in pending_indices]
+        batches = _build_sentence_batches([s for _, s in pending_pairs], max_items=8, max_chars=1100)
+        # שחזור אינדקסים אמיתיים מתוך pending_pairs
+        indexed_batches: List[List[Tuple[int, str]]] = []
+        cursor = 0
+        for b in batches:
+            indexed_batches.append(pending_pairs[cursor:cursor + len(b)])
+            cursor += len(b)
+
+        def _translate_delimited_batch(batch: List[Tuple[int, str]]) -> Optional[Dict[int, str]]:
+            if len(batch) <= 1:
+                return None
+            joined = "\n".join(f"[[#{pos}#]] {sent}" for pos, (_, sent) in enumerate(batch))
+            raw_joined = (
+                translate_google_free(
+                    joined,
+                    source_lang,
+                    target_lang,
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                    request_fn=request_fn,
+                )
+                if cand_engine == "google_free"
+                else translate_libretranslate(
+                    joined,
+                    source_lang,
+                    target_lang,
+                    url=trans_cfg.get("libretranslate_url", "https://libretranslate.com/translate"),
+                    api_key=trans_cfg.get("libretranslate_api_key", ""),
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                    request_fn=request_fn,
+                )
+            )
+            parts = re.split(r"\[\[#\s*(\d+)\s*#\]\]", raw_joined)
+            if len(parts) < 3:
+                return None
+            parsed_map: Dict[int, str] = {}
+            for p_idx in range(1, len(parts) - 1, 2):
+                pos_str = parts[p_idx].strip()
+                txt_val = (parts[p_idx + 1] or "").strip()
+                if pos_str.isdigit():
+                    pos = int(pos_str)
+                    if 0 <= pos < len(batch) and txt_val:
+                        parsed_map[batch[pos][0]] = txt_val
+            if len(parsed_map) == len(batch):
+                return parsed_map
+            return None
+
+        for b_idx, batch in enumerate(indexed_batches, 1):
+            _check_cancelled(cancel_event)
+            start_num = batch[0][0] + 1
+            end_num = batch[-1][0] + 1
+            if progress_cb:
+                progress_cb(f"מתרגם אצווה {b_idx}/{len(indexed_batches)} (משפטים {start_num}–{end_num} מתוך {total})...")
+
+            batch_map: Optional[Dict[int, str]] = None
+            try:
+                batch_map = _translate_delimited_batch(batch)
+            except (TranslationCancelledError, AICancelledError) as ce:
+                first_idx = batch[0][0]
+                _emit_unit({"event": "unit_cancelled", "unit_index": first_idx, "unit_id": f"u{first_idx + 1}", "engine": cand_engine})
+                raise TranslationCancelledError(str(ce)) from ce
+            except Exception:
+                # במקרה של כשל/אי-התאמה באצווה — יורדים לרזולוציה של משפט-משפט באצווה זו בלבד
+                # כדי לשמור כל משפט תקין לפני נקודת הכשל ולזהות את היחידה המדויקת שנכשלה.
+                batch_map = None
+
+            if batch_map is not None:
+                done_items = [_record_unit_ok(i, batch_map[i], emit=False) for i, _ in batch]
+                _emit_batch_ok(done_items)
+            else:
+                for i, sent in batch:
+                    try:
+                        _check_cancelled(cancel_event)
+                    except TranslationCancelledError:
+                        _emit_unit({"event": "unit_cancelled", "unit_index": i, "unit_id": f"u{i + 1}", "engine": cand_engine})
+                        raise
+                    try:
+                        out = _translate_one(sent)
+                    except (TranslationCancelledError, AICancelledError) as ce:
+                        _emit_unit({"event": "unit_cancelled", "unit_index": i, "unit_id": f"u{i + 1}", "engine": cand_engine})
+                        raise TranslationCancelledError(str(ce)) from ce
+                    except Exception as exc:
+                        setattr(exc, "unit_index", i)
+                        setattr(exc, "unit_id", f"u{i + 1}")
+                        _emit_unit({
+                            "event": "unit_failed",
+                            "unit_index": i,
+                            "unit_id": f"u{i + 1}",
+                            "engine": cand_engine,
+                            "error": _sanitize_error_text(str(exc)),
+                        })
+                        raise
+                    if not out:
+                        err = AICallError(
+                            f"שלב התרגום נכשל במשפט {i + 1} מתוך {total}: התקבל פלט ריק.",
+                            stage="תרגום",
+                            category="invalid_response",
+                            provider_id=cand_engine,
+                        )
+                        setattr(err, "unit_index", i)
+                        setattr(err, "unit_id", f"u{i + 1}")
+                        _emit_unit({
+                            "event": "unit_failed",
+                            "unit_index": i,
+                            "unit_id": f"u{i + 1}",
+                            "engine": cand_engine,
+                            "error": str(err),
+                        })
+                        raise err
+                    _record_unit_ok(i, out)
     else:
         for i in pending_indices:
             sent = clean_sentences[i]

@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -711,6 +712,42 @@ class ScriptStudioDialog(QDialog):
         )
         self.chk_fallback_ai.setChecked(bool(t_cfg.get("fallback_to_ai_on_failure", False)))
         scope_lay.addWidget(self.chk_fallback_ai)
+
+        # בחירת טווח מקטעים לעיבוד מבוקר בספרים גדולים
+        self.chk_custom_range = QCheckBox("עבד טווח מקטעים מסוים בלבד (מומלץ בספרים ענקיים)")
+        self.chk_custom_range.setEnabled(default_scope == "book" and chapter_count > 1)
+        scope_lay.addWidget(self.chk_custom_range)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("ממקטע:"))
+        self.spin_from = QSpinBox()
+        self.spin_from.setRange(1, max(1, chapter_count))
+        self.spin_from.setValue(1)
+        range_row.addWidget(self.spin_from)
+        range_row.addWidget(QLabel("עד מקטע:"))
+        self.spin_to = QSpinBox()
+        self.spin_to.setRange(1, max(1, chapter_count))
+        self.spin_to.setValue(max(1, chapter_count))
+        range_row.addWidget(self.spin_to)
+        range_row.addStretch()
+        scope_lay.addLayout(range_row)
+
+        def _sync_range_enabled():
+            is_bk = self.radio_scope_book.isChecked() and chapter_count > 1
+            self.chk_custom_range.setEnabled(is_bk)
+            use_r = is_bk and self.chk_custom_range.isChecked()
+            self.spin_from.setEnabled(use_r)
+            self.spin_to.setEnabled(use_r)
+
+        self.radio_scope_book.toggled.connect(_sync_range_enabled)
+        self.chk_custom_range.toggled.connect(_sync_range_enabled)
+        _sync_range_enabled()
+
+        self.chk_skip_same_lang_trans = QCheckBox(
+            "הטקסט כבר בעברית — דלג על תרגום חיצוני ועבור ישירות לתסריט/הקראה"
+        )
+        scope_lay.addWidget(self.chk_skip_same_lang_trans)
+
         layout.addWidget(grp_scope)
 
         grp_mode = QGroupBox("סגנון התסריט")
@@ -754,8 +791,16 @@ class ScriptStudioDialog(QDialog):
         layout.addLayout(btn_row)
 
     def get_options(self) -> Dict[str, Any]:
+        scope = "book" if self.radio_scope_book.isChecked() else "chapter"
+        target_chapters = None
+        if scope == "book" and self.chk_custom_range.isChecked():
+            a = min(self.spin_from.value(), self.spin_to.value())
+            b = max(self.spin_from.value(), self.spin_to.value())
+            target_chapters = list(range(a - 1, b))
         return {
-            "scope": "book" if self.radio_scope_book.isChecked() else "chapter",
+            "scope": scope,
+            "target_chapters": target_chapters,
+            "bypass_same_language": self.chk_skip_same_lang_trans.isChecked(),
             "mode": "educational" if self.radio_edu.isChecked() else "dramatic",
             "instruction": self.txt_instruction.toPlainText().strip(),
             "use_wikipedia": self.chk_wikipedia.isChecked(),
@@ -900,6 +945,36 @@ class ExportPipelineDialog(QDialog):
         self.radio_scope_chapter.toggled.connect(self._on_scope_changed)
         sc_lay.addWidget(self.radio_scope_chapter)
         sc_lay.addWidget(self.radio_scope_book)
+
+        # בחירת טווח מקטעים בספר שלם + אישור המשך ל-PDF עם עמודים ריקים/סרוקים
+        self.chk_custom_range = QCheckBox("עבד וייצא טווח מקטעים מסוים בלבד (מתוך כל מקטעי הספר)")
+        self.chk_custom_range.toggled.connect(self._on_range_toggled)
+        sc_lay.addWidget(self.chk_custom_range)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("ממקטע:"))
+        self.spin_from = QSpinBox()
+        self.spin_from.setRange(1, max(1, ch_count))
+        self.spin_from.setValue(1)
+        self.spin_from.valueChanged.connect(self._refresh_readiness)
+        range_row.addWidget(self.spin_from)
+        range_row.addWidget(QLabel("עד מקטע:"))
+        self.spin_to = QSpinBox()
+        self.spin_to.setRange(1, max(1, ch_count))
+        self.spin_to.setValue(max(1, ch_count))
+        self.spin_to.valueChanged.connect(self._refresh_readiness)
+        range_row.addWidget(self.spin_to)
+        range_row.addStretch()
+        sc_lay.addLayout(range_row)
+
+        cov = (self.book or {}).get("pdf_coverage") or {}
+        has_partial_pdf = isinstance(cov, dict) and cov.get("source_type") == "pdf" and not cov.get("is_complete_extraction", True)
+        self.chk_allow_partial_pdf = QCheckBox("כלול עמודי טקסט זמינים גם אם קיימים עמודי תמונה/ריקים ב-PDF")
+        self.chk_allow_partial_pdf.setVisible(bool(has_partial_pdf))
+        self.chk_allow_partial_pdf.setChecked(False)
+        self.chk_allow_partial_pdf.toggled.connect(self._refresh_readiness)
+        sc_lay.addWidget(self.chk_allow_partial_pdf)
+
         layout.addWidget(grp_scope)
 
         # שלב 1: הגדרות תרגום
@@ -1013,6 +1088,19 @@ class ExportPipelineDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._populate_format_options()
+        self._sync_range_controls()
+        self._refresh_readiness()
+
+    def _sync_range_controls(self):
+        ch_count = len((self.book or {}).get("chapters") or [])
+        is_book = self.radio_scope_book.isChecked() and ch_count > 1
+        self.chk_custom_range.setEnabled(is_book)
+        use_r = is_book and self.chk_custom_range.isChecked()
+        self.spin_from.setEnabled(use_r)
+        self.spin_to.setEnabled(use_r)
+
+    def _on_range_toggled(self):
+        self._sync_range_controls()
         self._refresh_readiness()
 
     def _populate_format_options(self):
@@ -1033,6 +1121,7 @@ class ExportPipelineDialog(QDialog):
 
     def _on_scope_changed(self):
         self._populate_format_options()
+        self._sync_range_controls()
         self._refresh_readiness()
 
     def _refresh_readiness(self):
@@ -1047,6 +1136,7 @@ class ExportPipelineDialog(QDialog):
                 script_opts=opts["script_opts"],
                 tts_opts=opts["tts_opts"],
                 store=self.store,
+                allow_partial_pdf=opts.get("allow_partial_pdf", False),
             )
             total = b_status["chapter_count"]
             if not b_status["book_complete"]:
@@ -1134,8 +1224,16 @@ class ExportPipelineDialog(QDialog):
         if audio_fmt == "wav" and str(voice).startswith("edge"):
             voice = "sapi5"
 
+        target_chapters = None
+        if scope == "book" and self.chk_custom_range.isChecked():
+            a = min(self.spin_from.value(), self.spin_to.value())
+            b = max(self.spin_from.value(), self.spin_to.value())
+            target_chapters = list(range(a - 1, b))
+
         return {
             "scope": scope,
+            "target_chapters": target_chapters,
+            "allow_partial_pdf": bool(self.chk_allow_partial_pdf.isChecked()),
             "package_mode": package_mode,
             "translation_opts": {
                 "engine": self.combo_engine.currentData(),
@@ -1316,4 +1414,112 @@ class BookRecoveryDialog(QDialog):
             "engine": self.combo_recovery_engine.currentData(),
             "fallback_to_ai_on_failure": self.chk_recovery_ai_fallback.isChecked(),
         }
+
+
+class SegmentBookDialog(QDialog):
+    """
+    דיאלוג פיצול מקטעים חכם לפי הצורך והעניין:
+    מאפשר חלוקה מחדש של ספר ארוך למקטעים נוחיים לפי גודל יעד, כותרות וגבולות פסקאות.
+    """
+
+    def __init__(self, parent=None, book: Optional[Dict[str, Any]] = None):
+        super().__init__(parent)
+        from book_loader import SEGMENT_PRESETS
+
+        self.setWindowTitle("✂️ פיצול ספר למקטעים לפי הצורך והעניין")
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.resize(520, 380)
+        self.book = book or {}
+        chapters = list(self.book.get("chapters") or [])
+        total_chars = sum(len(ch.get("text") or "") for ch in chapters)
+        cur_preset = self.book.get("segment_preset", "balanced")
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        lbl_info = QLabel(
+            f"ספר: <b>{self.book.get('title', 'ללא שם')}</b><br>"
+            f"מצב נוכחי: <b>{len(chapters)}</b> מקטעים/פרקים | סה\"כ <b>{total_chars:,}</b> תווים."
+        )
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet("background-color: #1e293b; padding: 10px 12px; border-radius: 8px; color: #fbbf24;")
+        layout.addWidget(lbl_info)
+
+        grp_mode = QGroupBox("בחר אופן פיצול מקטעים")
+        m_lay = QVBoxLayout(grp_mode)
+
+        self.radio_compact = QRadioButton(SEGMENT_PRESETS["compact"]["label"])
+        self.radio_balanced = QRadioButton(SEGMENT_PRESETS["balanced"]["label"])
+        self.radio_chapter = QRadioButton(SEGMENT_PRESETS["chapter"]["label"])
+        self.radio_custom = QRadioButton("מותאם אישית (מספר תווים מרבי למקטע):")
+
+        if cur_preset == "compact":
+            self.radio_compact.setChecked(True)
+        elif cur_preset == "chapter":
+            self.radio_chapter.setChecked(True)
+        elif cur_preset == "custom":
+            self.radio_custom.setChecked(True)
+        else:
+            self.radio_balanced.setChecked(True)
+
+        m_lay.addWidget(self.radio_compact)
+        m_lay.addWidget(self.radio_balanced)
+        m_lay.addWidget(self.radio_chapter)
+        m_lay.addWidget(self.radio_custom)
+
+        custom_row = QHBoxLayout()
+        custom_row.addWidget(QLabel("גודל מקטע (תווים):"))
+        self.spin_chars = QSpinBox()
+        self.spin_chars.setRange(800, 25000)
+        self.spin_chars.setSingleStep(500)
+        self.spin_chars.setValue(int(self.book.get("segment_max_chars") or 5000))
+        self.spin_chars.setEnabled(self.radio_custom.isChecked())
+        self.radio_custom.toggled.connect(self.spin_chars.setEnabled)
+        custom_row.addWidget(self.spin_chars)
+        custom_row.addStretch()
+        m_lay.addLayout(custom_row)
+
+        layout.addWidget(grp_mode)
+
+        self.lbl_preview = QLabel("")
+        self.lbl_preview.setWordWrap(True)
+        self.lbl_preview.setStyleSheet("color: #34d399; font-size: 12px;")
+        layout.addWidget(self.lbl_preview)
+
+        for rb in (self.radio_compact, self.radio_balanced, self.radio_chapter, self.radio_custom):
+            rb.toggled.connect(self._update_preview)
+        self.spin_chars.valueChanged.connect(self._update_preview)
+        self._update_preview()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("ביטול")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_apply = QPushButton("✂️ פצל מקטעים עכשיו")
+        btn_apply.setObjectName("primaryBtn")
+        btn_apply.clicked.connect(self.accept)
+        btn_row.addWidget(btn_apply)
+        layout.addLayout(btn_row)
+
+    def _update_preview(self):
+        from book_loader import SEGMENT_PRESETS
+
+        opts = self.get_options()
+        max_ch = opts["max_chars"] or SEGMENT_PRESETS[opts["preset"]]["max_chars"]
+        total_chars = sum(len(ch.get("text") or "") for ch in (self.book.get("chapters") or []))
+        est = max(1, (total_chars + max_ch - 1) // max_ch)
+        self.lbl_preview.setText(
+            f"הפיצול יזהה כותרות וגבולות פסקאות (הערכה: כ־{est} מקטעים נוחים לעיבוד, תרגום והקראה רציפה)."
+        )
+
+    def get_options(self) -> Dict[str, Any]:
+        if self.radio_compact.isChecked():
+            return {"preset": "compact", "max_chars": None}
+        if self.radio_chapter.isChecked():
+            return {"preset": "chapter", "max_chars": None}
+        if self.radio_custom.isChecked():
+            return {"preset": "custom", "max_chars": int(self.spin_chars.value())}
+        return {"preset": "balanced", "max_chars": None}
 
