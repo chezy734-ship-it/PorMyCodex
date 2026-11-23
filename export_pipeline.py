@@ -169,19 +169,8 @@ def assess_chapter_pipeline(
 
     # אבחון יחידות הדרגתי (קריאה בלבד) להצגת יחידות שהושלמו/חסרות/נכשלו ונקודת המשך מדויקת
     src_sentences = split_into_sentences(source_text or "") if (source_text or "").strip() else []
-    tp_view = (
-        st.reconcile_translation_progress(
-            book_id=book_id,
-            chapter_index=chapter_index,
-            source_sentences=src_sentences,
-            config_hash=trans_cfg_hash,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            source_hash=src_hash,
-            persist=False,
-        )
-        if src_sentences
-        else {
+    if not src_sentences:
+        tp_view = {
             "total_units": 0,
             "completed_count": 0,
             "missing_count": 0,
@@ -191,7 +180,41 @@ def assess_chapter_pipeline(
             "next_unit_id": "",
             "status": "pending",
         }
-    )
+    elif t_ready and t_rec:
+        tot_u = len(src_sentences)
+        tp_view = {
+            "total_units": tot_u,
+            "completed_count": tot_u,
+            "missing_count": 0,
+            "failed_count": 0,
+            "outdated_count": 0,
+            "next_unit_index": tot_u,
+            "next_unit_id": "",
+            "status": "completed",
+        }
+    elif not artifacts.get("translation_progress") and not artifacts.get("translation"):
+        tot_u = len(src_sentences)
+        tp_view = {
+            "total_units": tot_u,
+            "completed_count": 0,
+            "missing_count": tot_u,
+            "failed_count": 0,
+            "outdated_count": 0,
+            "next_unit_index": 0,
+            "next_unit_id": "u1",
+            "status": "pending",
+        }
+    else:
+        tp_view = st.reconcile_translation_progress(
+            book_id=book_id,
+            chapter_index=chapter_index,
+            source_sentences=src_sentences,
+            config_hash=trans_cfg_hash,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            source_hash=src_hash,
+            persist=False,
+        )
 
     raw_sp = artifacts.get("script_progress") if isinstance(artifacts.get("script_progress"), dict) else {}
     sp_summary = {

@@ -391,8 +391,103 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
         self.assertTrue(pcfg["adaptive_slowdown"])
         dlg.close()
 
+    def test_06_rapid_ui_clicks_and_audio_playback_stop_never_crash(self):
+        from audio_engine import AudioEngine
+
+        # 1. בדיקת AudioEngine תחת play/stop/play מהירים עם worker איטי (ללא QThread Destroyed abort!)
+        release_evt = threading.Event()
+        audio = AudioEngine()
+
+        def slow_play_sentence(_self, text, voice_type, prefetched_path=None):
+            release_evt.wait(0.8)
+            return False
+
+        with mock.patch("audio_engine.PlaybackWorker._play_sentence", slow_play_sentence):
+            for _ in range(5):
+                audio.play(["משפט ראשון.", "משפט שני.", "משפט שלישי."], start_index=0)
+                self.app.processEvents()
+                audio.stop()
+                self.app.processEvents()
+            release_evt.set()
+            audio.shutdown(wait_ms=1000)
+
+        # 2. לחיצות מהירות על כל כפתורי הניווט/קול/מהירות/פונט/פרקים בספר עם 40 פרקים + מצב ספר ריק
+        chapters = [
+            {"title": f"פרק {i}", "text": f"משפט א בפרק {i}. משפט ב בפרק {i}. משפט ג בפרק {i}."}
+            for i in range(1, 41)
+        ]
+        win = MainWindow()
+        win.books = [
+            {"id": "stress_bk1", "title": "ספר עומס 1", "chapters": chapters},
+            {"id": "stress_bk2", "title": "ספר ריק", "chapters": []},
+        ]
+        win.load_book_to_ui(0)
+        win.show()
+        self.app.processEvents()
+
+        # סימולציה של לחיצות אינטנסיביות על פרקים, משפטים, סליידר מהירות, פונט, קול ורשימת ספרים
+        for ch_idx in (0, 5, 19, 39, 12, 0):
+            win.chapter_list.setCurrentRow(ch_idx)
+            win.btn_next.click()
+            win.btn_next.click()
+            win.btn_prev.click()
+            win.change_font_size(2)
+            win.change_font_size(-2)
+        for spd in range(80, 190, 10):
+            win.slider_speed.setValue(spd)
+        for v_i in range(win.combo_voice.count()):
+            win.combo_voice.setCurrentIndex(v_i)
+
+        # מעבר לספר ללא פרקים — לחיצות על פקדים אינן קורסות ב-IndexError
+        win.book_list.setCurrentRow(1)
+        self.app.processEvents()
+        win.btn_next.click()
+        win.btn_prev.click()
+        win.toggle_play()
+        win.restore_original_chapter_text()
+        with mock.patch("main_window.QMessageBox.information"):
+            win.trigger_companion("explain")
+            win.open_wikipedia_dialog()
+            win.open_translate_dialog()
+            win.open_script_studio(False)  # מדמה QAction.triggered(bool=False)
+            win.export_audio_dialog(False)
+
+        self.app.processEvents()
+        win.close()
+
+    def test_07_closing_settings_dialog_during_slow_discovery_never_aborts_qthread(self):
+        import dialogs
+
+        release_evt = threading.Event()
+        started_evt = threading.Event()
+
+        def hung_discover(provider_id, api_key, base_url, cancel_event=None):
+            started_evt.set()
+            # מדמה socket רשת שלא חוזר מיד גם אחרי cancel_event (למשל timeout רשת)
+            release_evt.wait(1.2)
+            return {"models": ["gemini-2.5-flash"], "pages_fetched": 1}
+
+        settings = deepcopy(DEFAULT_SETTINGS)
+        settings["providers"]["gemini"]["api_key"] = "AIzaSlowSocketKey123456"
+        dlg = SettingsDialog(None, settings, discovery_fn=hung_discover, debounce_ms=20)
+        dlg.show()
+        self.app.processEvents()
+        self.assertTrue(started_evt.wait(2.0), "Discovery thread did not start")
+
+        # סגירת הדיאלוג והשמדתו בזמן שה-QThread עדיין רץ — אסור לקרוס ב-QThread abort!
+        dlg.reject()
+        dlg.close()
+        dlg.deleteLater()
+        self.app.processEvents()
+
+        # משחררים את ה-socket ומאפשרים ל-keeper לנקות את ה-thread בצורה נקייה
+        release_evt.set()
+        ok_clean = self._pump_events_until(lambda: len(dialogs._LIVE_DISCOVERY_THREADS) == 0, timeout_sec=3.0)
+        self.assertTrue(ok_clean, "Retired discovery thread was not cleaned up cleanly after finishing")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 

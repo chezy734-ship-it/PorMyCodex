@@ -48,6 +48,32 @@ from settings_manager import (
 )
 from translator_engine import LANGUAGE_OPTIONS, TRANSLATION_ENGINES
 
+_DISCOVERY_KEEPER_LOCK = threading.Lock()
+_LIVE_DISCOVERY_THREADS: List["ModelDiscoveryThread"] = []
+
+
+def _keep_discovery_thread_until_finished(th: "ModelDiscoveryThread") -> None:
+    """שומר הפניה חזקה ל-QThread שעדיין רץ ברשת עד סיומו האמיתי כדי למנוע קריסת QThread abort."""
+    try:
+        if not th.isRunning():
+            return
+    except RuntimeError:
+        return
+
+    with _DISCOVERY_KEEPER_LOCK:
+        if th not in _LIVE_DISCOVERY_THREADS:
+            _LIVE_DISCOVERY_THREADS.append(th)
+
+    def _release(t=th):
+        with _DISCOVERY_KEEPER_LOCK:
+            if t in _LIVE_DISCOVERY_THREADS:
+                _LIVE_DISCOVERY_THREADS.remove(t)
+
+    try:
+        th.finished.connect(_release)
+    except Exception:
+        pass
+
 
 class ModelDiscoveryThread(QThread):
     finished_ok = pyqtSignal(int, str, list, dict)
@@ -376,9 +402,17 @@ class SettingsDialog(QDialog):
             th = self._discovery_thread
             self._discovery_thread = None
             th.cancel()
-            if th.isRunning():
-                self._retired_threads.append(th)
-                th.finished.connect(lambda t=th: self._cleanup_retired_thread(t))
+            for sig in (th.finished_ok, th.failed):
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
+            try:
+                if th.isRunning():
+                    self._retired_threads.append(th)
+                    th.finished.connect(lambda t=th: self._cleanup_retired_thread(t))
+            except RuntimeError:
+                pass
 
     def _cleanup_retired_thread(self, th: ModelDiscoveryThread):
         if th in self._retired_threads:
@@ -541,7 +575,7 @@ class SettingsDialog(QDialog):
             key,
             base_url,
             discovery_fn=self._discovery_fn,
-            parent=self,
+            parent=None,
         )
         self._discovery_thread = th
         th.finished_ok.connect(self._on_discovery_ok)
@@ -600,9 +634,20 @@ class SettingsDialog(QDialog):
         self._auto_discover_timer.stop()
         self._cancel_inflight_discovery()
         for th in list(self._retired_threads):
-            th.cancel()
-            if th.isRunning():
-                th.wait(1200)
+            try:
+                th.cancel()
+                for sig in (th.finished_ok, th.failed):
+                    try:
+                        sig.disconnect()
+                    except Exception:
+                        pass
+                if th.isRunning():
+                    th.wait(300)
+                if th.isRunning():
+                    # שמירה ברמת מודול עד שה-socket יסתיים — לעולם לא משמידים QThread פעיל!
+                    _keep_discovery_thread_until_finished(th)
+            except RuntimeError:
+                pass
         self._retired_threads.clear()
 
     def done(self, r: int):
@@ -1098,9 +1143,14 @@ class ExportPipelineDialog(QDialog):
         mode_row.addWidget(self.radio_dramatic)
         form_s.addLayout(mode_row)
 
+        self._readiness_timer = QTimer(self)
+        self._readiness_timer.setSingleShot(True)
+        self._readiness_timer.setInterval(180)
+        self._readiness_timer.timeout.connect(self._refresh_readiness)
+
         self.txt_instruction = QLineEdit()
         self.txt_instruction.setPlaceholderText("הנחיה נוספת לתסריט (אופציונלי)")
-        self.txt_instruction.textChanged.connect(self._refresh_readiness)
+        self.txt_instruction.textChanged.connect(self._schedule_refresh_readiness)
         form_s.addWidget(self.txt_instruction)
 
         wiki_row = QHBoxLayout()
@@ -1110,7 +1160,7 @@ class ExportPipelineDialog(QDialog):
         self.txt_wiki_terms.setPlaceholderText("מושגים מופרדים בפסיק (ריק = אוטומטי)")
         self.txt_wiki_terms.setEnabled(False)
         self.chk_wiki.toggled.connect(self.txt_wiki_terms.setEnabled)
-        self.txt_wiki_terms.textChanged.connect(self._refresh_readiness)
+        self.txt_wiki_terms.textChanged.connect(self._schedule_refresh_readiness)
         wiki_row.addWidget(self.chk_wiki)
         wiki_row.addWidget(self.txt_wiki_terms, 1)
         form_s.addLayout(wiki_row)
@@ -1194,7 +1244,20 @@ class ExportPipelineDialog(QDialog):
         self._sync_range_controls()
         self._refresh_readiness()
 
+    def _schedule_refresh_readiness(self, *_args):
+        if hasattr(self, "_readiness_timer"):
+            self._readiness_timer.start()
+        else:
+            self._refresh_readiness()
+
     def _refresh_readiness(self):
+        try:
+            self._refresh_readiness_inner()
+        except Exception as exc:
+            self.lbl_stage1_status.setStyleSheet("color: #f87171; font-size: 12px;")
+            self.lbl_stage1_status.setText(f"⚠️ לא ניתן היה לבדוק מוכנות כרגע: {exc}")
+
+    def _refresh_readiness_inner(self):
         from export_pipeline import assess_book_pipeline, assess_chapter_pipeline
 
         opts = self.get_options()

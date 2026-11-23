@@ -14,7 +14,11 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
+import time
 from typing import Dict, Any
+
+_SETTINGS_LOCK = threading.RLock()
 
 
 def get_settings_dir() -> str:
@@ -162,55 +166,68 @@ def _deep_merge(defaults: Dict[str, Any], loaded: Dict[str, Any]) -> Dict[str, A
 
 
 def load_settings() -> Dict[str, Any]:
-    path = get_settings_path()
-    loaded: Dict[str, Any] = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-        except Exception:
-            loaded = {}
-    merged = _deep_merge(DEFAULT_SETTINGS, loaded)
+    with _SETTINGS_LOCK:
+        path = get_settings_path()
+        loaded: Dict[str, Any] = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except Exception:
+                loaded = {}
+        merged = _deep_merge(DEFAULT_SETTINGS, loaded)
 
-    # מיגרציה חד-פעמית משמות מודלים לא קיימים מגרסה ישנה (לעולם לא דורס מודל תקף כמו gemini-2.5-flash)
-    gem_conf = merged["providers"].get("gemini", {})
-    if gem_conf.get("model") in ("gemini-3.8-flash", "gemini-3.8-pro"):
-        gem_conf["model"] = "gemini-2.5-flash" if gem_conf.get("model") == "gemini-3.8-flash" else "gemini-2.5-pro"
+        # מיגרציה חד-פעמית משמות מודלים לא קיימים מגרסה ישנה (לעולם לא דורס מודל תקף כמו gemini-2.5-flash)
+        gem_conf = merged["providers"].get("gemini", {})
+        if gem_conf.get("model") in ("gemini-3.8-flash", "gemini-3.8-pro"):
+            gem_conf["model"] = "gemini-2.5-flash" if gem_conf.get("model") == "gemini-3.8-flash" else "gemini-2.5-pro"
 
-    # הסרת שמות מודלים מומצאים מרשימות גילוי שמורות אם נשארו מגרסה ישנה
-    disc = gem_conf.get("discovered_models") or []
-    if disc:
-        gem_conf["discovered_models"] = [m for m in disc if m not in ("gemini-3.8-flash", "gemini-3.8-pro")]
+        # הסרת שמות מודלים מומצאים מרשימות גילוי שמורות אם נשארו מגרסה ישנה
+        disc = gem_conf.get("discovered_models") or []
+        if disc:
+            gem_conf["discovered_models"] = [m for m in disc if m not in ("gemini-3.8-flash", "gemini-3.8-pro")]
 
-    # מילוי מפתחות ממשתני סביבה רק אם לא הוזן מפתח בהגדרות
-    for pid, env_name in ENV_KEY_MAP.items():
-        pconf = merged["providers"].get(pid, {})
-        if not pconf.get("api_key") and os.environ.get(env_name):
-            pconf["api_key"] = os.environ.get(env_name, "").strip()
+        # מילוי מפתחות ממשתני סביבה רק אם לא הוזן מפתח בהגדרות
+        for pid, env_name in ENV_KEY_MAP.items():
+            pconf = merged["providers"].get(pid, {})
+            if not pconf.get("api_key") and os.environ.get(env_name):
+                pconf["api_key"] = os.environ.get(env_name, "").strip()
 
-    return merged
+        return merged
 
 
 def save_settings(settings: Dict[str, Any]) -> None:
-    path = get_settings_path()
-    clean = _deep_merge(DEFAULT_SETTINGS, settings)
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    raw = json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8")
-    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_settings_", suffix=".part")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
+    with _SETTINGS_LOCK:
+        path = get_settings_path()
+        clean = _deep_merge(DEFAULT_SETTINGS, settings)
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        raw = json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8")
+        fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_settings_", suffix=".part")
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            backoff = (0.025, 0.05, 0.08, 0.12, 0.18, 0.25)
+            for attempt in range(len(backoff) + 1):
+                try:
+                    os.replace(tmp_path, path)
+                    return
+                except OSError as exc:
+                    winerr = getattr(exc, "winerror", None)
+                    retryable = isinstance(exc, PermissionError) or winerr in (5, 32, 33) or getattr(exc, "errno", None) in (13, 16)
+                    if attempt < len(backoff) and retryable:
+                        time.sleep(backoff[attempt])
+                        continue
+                    raise
         except Exception:
-            pass
-        raise
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
 
 
 def get_active_provider_config(settings: Dict[str, Any] = None) -> Dict[str, Any]:

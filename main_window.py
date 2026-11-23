@@ -14,7 +14,7 @@ import html
 import json
 import threading
 from typing import List, Dict, Any, Optional, Callable
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QComboBox, QSlider, QProgressBar,
@@ -61,12 +61,67 @@ from dialogs import (
 )
 
 
+_WINDOW_THREAD_LOCK = threading.Lock()
+_RETIRED_WINDOW_THREADS: List[QThread] = []
+
+
+def _retire_window_thread(th: Optional[QThread], *, cancel: bool = False, wait_ms: int = 200) -> None:
+    """
+    שומר הפניה חזקה לכל QThread שעדיין רץ עד סיומו האמיתי כדי למנוע קריסת C++
+    ('QThread: Destroyed while thread is still running').
+    """
+    if th is None:
+        return
+    if cancel and hasattr(th, "cancel"):
+        try:
+            th.cancel()
+        except Exception:
+            pass
+    try:
+        if th.isRunning():
+            th.wait(max(0, int(wait_ms)))
+    except Exception:
+        pass
+    try:
+        still_running = th.isRunning()
+    except Exception:
+        still_running = False
+    if still_running:
+        with _WINDOW_THREAD_LOCK:
+            if th not in _RETIRED_WINDOW_THREADS:
+                _RETIRED_WINDOW_THREADS.append(th)
+
+        def _drop(t=th):
+            with _WINDOW_THREAD_LOCK:
+                if t in _RETIRED_WINDOW_THREADS:
+                    _RETIRED_WINDOW_THREADS.remove(t)
+
+        try:
+            th.finished.connect(_drop)
+        except Exception:
+            pass
+
+
+def _safe_close_progress_dialog(dlg: Optional[QProgressDialog]) -> None:
+    """סוגר QProgressDialog בלי לגרום ל-signal 'canceled' לירות בזמן סיום תקין."""
+    if dlg is None:
+        return
+    try:
+        dlg.canceled.disconnect()
+    except Exception:
+        pass
+    try:
+        dlg.close()
+    except Exception:
+        pass
+
+
 class PipelineExportThread(QThread):
     progress = pyqtSignal(str)
     finished_result = pyqtSignal(dict)
 
     def __init__(self, pipeline_kwargs: Dict[str, Any], scope: str = "chapter"):
-        super().__init__()
+        super().__init__(None)
         self.scope = scope
         self.cancel_event = threading.Event()
         self.pipeline_kwargs = dict(pipeline_kwargs)
@@ -77,11 +132,20 @@ class PipelineExportThread(QThread):
         self.cancel_event.set()
 
     def run(self):
-        if self.scope == "book":
-            res = run_whole_book_export_pipeline(**self.pipeline_kwargs)
-        else:
-            res = run_enforced_export_pipeline(**self.pipeline_kwargs)
-        self.finished_result.emit(res)
+        try:
+            if self.scope == "book":
+                res = run_whole_book_export_pipeline(**self.pipeline_kwargs)
+            else:
+                res = run_enforced_export_pipeline(**self.pipeline_kwargs)
+            self.finished_result.emit(res)
+        except Exception as exc:
+            self.finished_result.emit({
+                "success": False,
+                "status": "cancelled" if self.cancel_event.is_set() else "failed",
+                "scope": self.scope,
+                "stage": "export",
+                "error": str(exc),
+            })
 
 
 class WholeBookScriptThread(QThread):
@@ -89,7 +153,7 @@ class WholeBookScriptThread(QThread):
     finished_result = pyqtSignal(dict)
 
     def __init__(self, pipeline_kwargs: Dict[str, Any]):
-        super().__init__()
+        super().__init__(None)
         self.cancel_event = threading.Event()
         self.pipeline_kwargs = dict(pipeline_kwargs)
         self.pipeline_kwargs["cancel_event"] = self.cancel_event
@@ -99,8 +163,17 @@ class WholeBookScriptThread(QThread):
         self.cancel_event.set()
 
     def run(self):
-        res = run_whole_book_script_pipeline(**self.pipeline_kwargs)
-        self.finished_result.emit(res)
+        try:
+            res = run_whole_book_script_pipeline(**self.pipeline_kwargs)
+            self.finished_result.emit(res)
+        except Exception as exc:
+            self.finished_result.emit({
+                "success": False,
+                "status": "cancelled" if self.cancel_event.is_set() else "failed",
+                "scope": "book",
+                "stage": "script",
+                "error": str(exc),
+            })
 
 
 class FileLoadThread(QThread):
@@ -206,6 +279,15 @@ class MainWindow(QMainWindow):
         self._last_whole_book_script_params: Optional[Dict[str, Any]] = None
         self._last_whole_book_export_params: Optional[Dict[str, Any]] = None
         self._auto_advancing_chapter: bool = False
+        self._selecting_book: bool = False
+        self._resume_banner_cache_key: Optional[tuple] = None
+        self._progress_dirty: bool = False
+
+        # טיימר Debounce לשמירת התקדמות קריאה (מונע כתיבות דיסק חוסמות בכל לחיצה/גרירת סליידר)
+        self._progress_save_timer = QTimer(self)
+        self._progress_save_timer.setSingleShot(True)
+        self._progress_save_timer.setInterval(450)
+        self._progress_save_timer.timeout.connect(self._flush_progress_save)
 
         # Audio Engine
         self.audio = AudioEngine()
@@ -300,12 +382,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction(vocalize_action)
 
         script_action = QAction("🎬 תסריט AI", self)
-        script_action.triggered.connect(self.open_script_studio)
+        script_action.triggered.connect(lambda _checked=False: self.open_script_studio())
         toolbar.addAction(script_action)
 
         self.action_script_whole_book = QAction("📚🎬 תסריט לכל הספר", self)
         self.action_script_whole_book.setToolTip("צור תרגום ותסריט AI מלאים לכל פרקי הספר לפי הסדר")
-        self.action_script_whole_book.triggered.connect(self.open_whole_book_script_dialog)
+        self.action_script_whole_book.triggered.connect(lambda _checked=False: self.open_whole_book_script_dialog())
         toolbar.addAction(self.action_script_whole_book)
 
         translate_action = QAction("🌐 תרגום", self)
@@ -314,17 +396,17 @@ class MainWindow(QMainWindow):
 
         export_audio_action = QAction("🎧 ייצא שמע", self)
         export_audio_action.setToolTip("ייצא קובץ שמע MP3 / WAV או ספר שלם להעברה")
-        export_audio_action.triggered.connect(lambda: self.export_audio_dialog())
+        export_audio_action.triggered.connect(lambda _checked=False: self.export_audio_dialog())
         toolbar.addAction(export_audio_action)
 
         self.action_export_whole_book = QAction("📚🎧 שמע לכל הספר", self)
         self.action_export_whole_book.setToolTip("ייצא את כל פרקי הספר לשמע (ZIP / תיקייה / WAV / MP3 מאוחד)")
-        self.action_export_whole_book.triggered.connect(self.export_whole_book_audio_dialog)
+        self.action_export_whole_book.triggered.connect(lambda _checked=False: self.export_whole_book_audio_dialog())
         toolbar.addAction(self.action_export_whole_book)
 
         self.action_resume_book = QAction("🔄 המשך מטמון", self)
         self.action_resume_book.setToolTip("המשך עיבוד ספר שנעצר / תקן פרקים שנכשלו בלי ליצור מחדש פרקים תקינים")
-        self.action_resume_book.triggered.connect(self.resume_whole_book_job)
+        self.action_resume_book.triggered.connect(lambda _checked=False: self.resume_whole_book_job())
         toolbar.addAction(self.action_resume_book)
 
         toolbar.addSeparator()
@@ -538,57 +620,95 @@ class MainWindow(QMainWindow):
         icon = "🟢" if has_key else "🟡"
         self.btn_ai_badge.setText(f"⚙️ {icon} {get_provider_label(pid)} | {model} (שינוי)")
 
-    def _refresh_resume_banner(self):
+    def _get_current_book(self) -> Optional[Dict[str, Any]]:
+        if not self.books:
+            return None
+        if not (0 <= self.current_book_index < len(self.books)):
+            self.current_book_index = 0
+        return self.books[self.current_book_index]
+
+    def _get_current_book_and_chapter(self):
+        book = self._get_current_book()
+        if not book:
+            return None, None
+        chapters = book.get("chapters") or []
+        if not chapters:
+            return book, None
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            self.current_chapter_index = 0
+        return book, chapters[self.current_chapter_index]
+
+    def _refresh_resume_banner(self, force: bool = False):
         if not hasattr(self, "resume_banner_frame"):
             return
-        if not self.books or not (0 <= self.current_book_index < len(self.books)):
+        book = self._get_current_book()
+        if not book:
             self.resume_banner_frame.setVisible(False)
+            self._resume_banner_cache_key = None
             return
-        book = self.books[self.current_book_index]
-        book_id = book.get("id", "")
-        job = self.store.get_whole_book_job(book_id) or {}
-        assess = assess_book_pipeline(book=book, settings=self.settings, store=self.store)
-        total = assess["chapter_count"]
-        t_ready = assess["translations_ready"]
-        s_ready = assess["scripts_ready"]
-        u_done = assess.get("units_completed", 0)
-        u_tot = assess.get("total_translation_units", 0)
-        rp = assess.get("resume_point") or {}
-        job_status = job.get("status", "")
-        has_failed = bool(job.get("failed_chapters"))
-        is_stopped_job = job_status in ("failed", "blocked", "cancelled", "partial", "in_progress")
-        show = bool(
-            (assess.get("has_resumable_progress") or is_stopped_job or has_failed)
-            and not (assess.get("all_translations_ready") and assess.get("all_scripts_ready") and not has_failed)
-        )
-        if not show:
-            self.resume_banner_frame.setVisible(False)
-            return
+        try:
+            book_id = book.get("id", "")
+            chapters = book.get("chapters") or []
+            pconf = get_active_provider_config(self.settings)
+            t_cfg = self.settings.get("translation", {})
+            cache_key = (
+                book_id,
+                len(chapters),
+                self.store.get_state_signature(),
+                pconf.get("provider_id"),
+                pconf.get("model"),
+                t_cfg.get("source_lang"),
+                t_cfg.get("target_lang"),
+            )
+            if not force and self._resume_banner_cache_key == cache_key:
+                return
+            self._resume_banner_cache_key = cache_key
 
-        if is_stopped_job and job_status == "blocked":
-            ch_n = job.get("failed_or_cancelled_chapter") or rp.get("chapter_number", 1)
-            uid = job.get("unit_id") or rp.get("unit_id") or ""
-            u_txt = f" ({uid})" if uid else ""
-            msg = (
-                f"⛔ <b>נמצאה התקדמות שמורה שנעצרה עקב חסימה</b> בפרק {ch_n}/{total}{u_txt} — "
-                f"נשמרו אטומית <b>{u_done}/{u_tot}</b> יחידות תקינות ({t_ready}/{total} פרקים)."
+            job = self.store.get_whole_book_job(book_id) or {}
+            assess = assess_book_pipeline(book=book, settings=self.settings, store=self.store)
+            total = assess["chapter_count"]
+            t_ready = assess["translations_ready"]
+            s_ready = assess["scripts_ready"]
+            u_done = assess.get("units_completed", 0)
+            u_tot = assess.get("total_translation_units", 0)
+            rp = assess.get("resume_point") or {}
+            job_status = job.get("status", "")
+            has_failed = bool(job.get("failed_chapters"))
+            is_stopped_job = job_status in ("failed", "blocked", "cancelled", "partial", "in_progress")
+            show = bool(
+                (assess.get("has_resumable_progress") or is_stopped_job or has_failed)
+                and not (assess.get("all_translations_ready") and assess.get("all_scripts_ready") and not has_failed)
             )
-        else:
-            rp_txt = ""
-            if rp:
-                rp_txt = f" | נקודת המשך: פרק {rp.get('chapter_number', 1)}/{total} ({rp.get('unit_id', 'u1')})"
-            msg = (
-                f"💾 <b>נמצאה התקדמות שמורה לספר:</b> תרגומים {t_ready}/{total} | תסריטים {s_ready}/{total} | "
-                f"יחידות תקינות {u_done}/{u_tot}{rp_txt}."
-            )
-        self.lbl_resume_banner.setText(msg)
-        self.resume_banner_frame.setVisible(True)
+            if not show:
+                self.resume_banner_frame.setVisible(False)
+                return
+
+            if is_stopped_job and job_status == "blocked":
+                ch_n = job.get("failed_or_cancelled_chapter") or rp.get("chapter_number", 1)
+                uid = job.get("unit_id") or rp.get("unit_id") or ""
+                u_txt = f" ({uid})" if uid else ""
+                msg = (
+                    f"⛔ <b>נמצאה התקדמות שמורה שנעצרה עקב חסימה</b> בפרק {ch_n}/{total}{u_txt} — "
+                    f"נשמרו אטומית <b>{u_done}/{u_tot}</b> יחידות תקינות ({t_ready}/{total} פרקים)."
+                )
+            else:
+                rp_txt = ""
+                if rp:
+                    rp_txt = f" | נקודת המשך: פרק {rp.get('chapter_number', 1)}/{total} ({rp.get('unit_id', 'u1')})"
+                msg = (
+                    f"💾 <b>נמצאה התקדמות שמורה לספר:</b> תרגומים {t_ready}/{total} | תסריטים {s_ready}/{total} | "
+                    f"יחידות תקינות {u_done}/{u_tot}{rp_txt}."
+                )
+            self.lbl_resume_banner.setText(msg)
+            self.resume_banner_frame.setVisible(True)
+        except Exception:
+            self.resume_banner_frame.setVisible(False)
 
     def _restore_initial_position(self, book_idx: int, chapter_idx: int, sentence_idx: int):
         self.load_book_to_ui(book_idx)
-        if not self.books:
+        book = self._get_current_book()
+        if not book:
             return
-        book = self.books[self.current_book_index]
         chapters = book.get("chapters") or []
         if 0 <= chapter_idx < len(chapters):
             self.chapter_list.setCurrentRow(chapter_idx)
@@ -596,41 +716,68 @@ class MainWindow(QMainWindow):
             self.active_sentence_index = max(0, min(len(self.sentences) - 1, sentence_idx))
             self.render_text()
             self.update_progress_display()
-        self._refresh_resume_banner()
+        self._refresh_resume_banner(force=True)
 
     def _persist_library_and_progress(self):
         if getattr(self, "_restoring_state", False) or not self.books:
             return
-        book = self.books[self.current_book_index]
-        self.store.save_books_and_progress(
-            self.books,
-            {
-                "active_book_id": book.get("id", ""),
-                "active_chapter_index": self.current_chapter_index,
-                "active_sentence_index": self.active_sentence_index,
-                "font_size": self.font_size,
-                "voice_type": self.combo_voice.currentData() or self.audio.voice_type,
-                "speed": self.audio.speed,
-            },
-        )
+        if hasattr(self, "_progress_save_timer"):
+            self._progress_save_timer.stop()
+        self._progress_dirty = False
+        book = self._get_current_book()
+        if not book:
+            return
+        try:
+            self.store.save_books_and_progress(
+                self.books,
+                {
+                    "active_book_id": book.get("id", ""),
+                    "active_chapter_index": self.current_chapter_index,
+                    "active_sentence_index": self.active_sentence_index,
+                    "font_size": self.font_size,
+                    "voice_type": self.combo_voice.currentData() or self.audio.voice_type,
+                    "speed": self.audio.speed,
+                },
+            )
+        except Exception:
+            pass
 
-    def _persist_progress_only(self):
+    def _flush_progress_save(self):
+        if getattr(self, "_restoring_state", False) or not self.books:
+            self._progress_dirty = False
+            return
+        book = self._get_current_book()
+        if not book:
+            self._progress_dirty = False
+            return
+        self._progress_dirty = False
+        try:
+            self.store.update_reading_progress(
+                book_id=book.get("id", ""),
+                chapter_index=self.current_chapter_index,
+                sentence_index=self.active_sentence_index,
+                font_size=self.font_size,
+                voice_type=self.combo_voice.currentData() or self.audio.voice_type,
+                speed=self.audio.speed,
+            )
+        except Exception:
+            pass
+
+    def _persist_progress_only(self, *, immediate: bool = False):
         if getattr(self, "_restoring_state", False) or not self.books:
             return
-        book = self.books[self.current_book_index]
-        self.store.update_reading_progress(
-            book_id=book.get("id", ""),
-            chapter_index=self.current_chapter_index,
-            sentence_index=self.active_sentence_index,
-            font_size=self.font_size,
-            voice_type=self.combo_voice.currentData() or self.audio.voice_type,
-            speed=self.audio.speed,
-        )
+        self._progress_dirty = True
+        if immediate or not hasattr(self, "_progress_save_timer"):
+            if hasattr(self, "_progress_save_timer"):
+                self._progress_save_timer.stop()
+            self._flush_progress_save()
+        else:
+            self._progress_save_timer.start()
 
     def load_book_to_ui(self, book_idx: int):
         self.book_list.clear()
         for b in self.books:
-            self.book_list.addItem(QListWidgetItem(f"📖 {b['title']}"))
+            self.book_list.addItem(QListWidgetItem(f"📖 {b.get('title', 'ספר')}"))
         if 0 <= book_idx < len(self.books):
             self.book_list.setCurrentRow(book_idx)
 
@@ -638,25 +785,44 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.books):
             return
         self.current_book_index = row
+        self.current_chapter_index = 0
         book = self.books[row]
-        self.chapter_list.clear()
-        for idx, ch in enumerate(book["chapters"]):
-            self.chapter_list.addItem(f"{idx+1}. {ch['title']}")
-        if book["chapters"]:
-            self.chapter_list.setCurrentRow(0)
-        self._refresh_resume_banner()
+        chapters = book.get("chapters") or []
+        self._selecting_book = True
+        try:
+            self.chapter_list.clear()
+            for idx, ch in enumerate(chapters):
+                self.chapter_list.addItem(f"{idx+1}. {ch.get('title', f'פרק {idx+1}')}")
+            if chapters:
+                self.chapter_list.setCurrentRow(0)
+            else:
+                self.sentences = []
+                self.speaker_roles = []
+                self.speaker_labels = []
+                self.current_script_data = None
+                self.active_sentence_index = 0
+                self.lbl_current_title.setText(book.get("title", ""))
+                self.render_text()
+                self.update_progress_display()
+        finally:
+            self._selecting_book = False
+        self._refresh_resume_banner(force=True)
 
     def on_chapter_selected(self, row: int):
         if row < 0:
             return
-        book = self.books[self.current_book_index]
-        if row >= len(book["chapters"]):
+        book = self._get_current_book()
+        if not book:
+            return
+        chapters = book.get("chapters") or []
+        if row >= len(chapters):
             return
         self.current_chapter_index = row
-        chapter = book["chapters"][row]
+        chapter = chapters[row]
+        ch_text = chapter.get("text", "") or ""
 
-        self.lbl_current_title.setText(f"{book['title']} — {chapter['title']}")
-        self.sentences = split_into_sentences(chapter["text"])
+        self.lbl_current_title.setText(f"{book.get('title', '')} — {chapter.get('title', f'פרק {row + 1}')}")
+        self.sentences = split_into_sentences(ch_text)
         self.speaker_roles = []
         self.speaker_labels = []
         self.current_script_data = None
@@ -664,55 +830,60 @@ class MainWindow(QMainWindow):
         self.btn_export_script.setVisible(False)
         self.active_sentence_index = 0
 
-        # טעינת התקדמות קריאה שמורה לפרק (אם איננה במצב שחזור ראשוני שמגדיר אינדקס ספציפי)
-        raw_state = self.store.load_raw_state()
-        saved_pos = (raw_state.get("reading_progress", {}).get("chapter_positions", {}) or {}).get(
-            f"{book.get('id', '')}::{row}"
-        )
-        if isinstance(saved_pos, int) and 0 <= saved_pos < len(self.sentences):
-            self.active_sentence_index = saved_pos
+        # טעינת התקדמות קריאה שמורה לפרק בקריאה קלה (ללא deepcopy של כל הספרייה)
+        try:
+            prog = self.store.get_reading_progress()
+            saved_pos = (prog.get("chapter_positions") or {}).get(f"{book.get('id', '')}::{row}")
+            if isinstance(saved_pos, int) and 0 <= saved_pos < len(self.sentences):
+                self.active_sentence_index = saved_pos
+        except Exception:
+            pass
 
         # אם קיימים תוצרים עדכניים ושאינם ישנים לפרק זה (תסריט / תרגום), מסמנים זאת למשתמש
-        status = assess_chapter_pipeline(
-            book_id=book.get("id", ""),
-            chapter_index=row,
-            source_text=chapter["text"],
-            settings=self.settings,
-            store=self.store,
-        )
-        if status["script_ready"] and status["script_record"]:
-            s_rec = status["script_record"]
-            lines = s_rec.get("lines", [])
-            self.current_script_data = s_rec
-            self.sentences = [line["text"] for line in lines]
-            self.speaker_roles = [line["speakerRole"] for line in lines]
-            self.speaker_labels = [
-                f"{line['speakerLabel']} [{line['style']}]" if line.get("style") else line["speakerLabel"]
-                for line in lines
-            ]
-            self.active_sentence_index = min(self.active_sentence_index, max(0, len(self.sentences) - 1))
-            self.btn_restore_original.setVisible(True)
-            self.btn_export_script.setVisible(True)
-        elif status["translation_ready"] and status["translation_record"]:
-            t_rec = status["translation_record"]
-            self.sentences = list(t_rec.get("translated_sentences") or split_into_sentences(t_rec.get("translated_text", "")))
-            self.active_sentence_index = min(self.active_sentence_index, max(0, len(self.sentences) - 1))
-            self.btn_restore_original.setVisible(True)
+        try:
+            status = assess_chapter_pipeline(
+                book_id=book.get("id", ""),
+                chapter_index=row,
+                source_text=ch_text,
+                settings=self.settings,
+                store=self.store,
+            )
+            if status["script_ready"] and status["script_record"]:
+                s_rec = status["script_record"]
+                lines = [ln for ln in (s_rec.get("lines") or []) if isinstance(ln, dict)]
+                if lines:
+                    self.current_script_data = s_rec
+                    self.sentences = [line.get("text", "") for line in lines]
+                    self.speaker_roles = [line.get("speakerRole", "") for line in lines]
+                    self.speaker_labels = [
+                        f"{line.get('speakerLabel', '')} [{line['style']}]" if line.get("style") else line.get("speakerLabel", "")
+                        for line in lines
+                    ]
+                    self.active_sentence_index = min(self.active_sentence_index, max(0, len(self.sentences) - 1))
+                    self.btn_restore_original.setVisible(True)
+                    self.btn_export_script.setVisible(True)
+            elif status["translation_ready"] and status["translation_record"]:
+                t_rec = status["translation_record"]
+                self.sentences = list(t_rec.get("translated_sentences") or split_into_sentences(t_rec.get("translated_text", "")))
+                self.active_sentence_index = min(self.active_sentence_index, max(0, len(self.sentences) - 1))
+                self.btn_restore_original.setVisible(True)
+        except Exception:
+            pass
 
         self.render_text()
         self.update_progress_display()
         if not self._auto_advancing_chapter:
             self.audio.stop()
         self._persist_progress_only()
-        self._refresh_resume_banner()
+        if not self._selecting_book:
+            self._refresh_resume_banner()
 
     def restore_original_chapter_text(self):
-        if not self.books:
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
             return
-        book = self.books[self.current_book_index]
-        chapter = book["chapters"][self.current_chapter_index]
         self.audio.stop()
-        self.sentences = split_into_sentences(chapter["text"])
+        self.sentences = split_into_sentences(chapter.get("text", "") or "")
         self.speaker_roles = []
         self.speaker_labels = []
         self.current_script_data = None
@@ -784,15 +955,20 @@ class MainWindow(QMainWindow):
         self.text_browser.scrollToAnchor("active_sent")
 
     def on_sentence_changed(self, idx: int):
-        self.active_sentence_index = idx
+        if not self.sentences:
+            return
+        self.active_sentence_index = max(0, min(len(self.sentences) - 1, int(idx)))
         self.render_text()
         self.update_progress_display()
         self._persist_progress_only()
 
     def update_progress_display(self):
         total = len(self.sentences)
+        if total > 0:
+            self.active_sentence_index = max(0, min(total - 1, self.active_sentence_index))
         current = self.active_sentence_index + 1 if total > 0 else 0
-        ch_total = len((self.books[self.current_book_index].get("chapters") or [])) if self.books else 0
+        book = self._get_current_book()
+        ch_total = len((book.get("chapters") or [])) if book else 0
         if ch_total > 1:
             self.lbl_progress.setText(f"מקטע {self.current_chapter_index + 1}/{ch_total} · {current}/{total}")
         else:
@@ -803,11 +979,11 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(0)
 
     def _on_chapter_audio_completed(self):
-        if not self.books:
+        book = self._get_current_book()
+        if not book:
             return
         if not getattr(self, "chk_continuous_book", None) or not self.chk_continuous_book.isChecked():
             return
-        book = self.books[self.current_book_index]
         chapters = book.get("chapters") or []
         next_idx = self.current_chapter_index + 1
         if next_idx >= len(chapters):
@@ -823,11 +999,12 @@ class MainWindow(QMainWindow):
                 f"ממשיך אוטומטית למקטע {next_idx + 1}/{len(chapters)}: {chapters[next_idx].get('title', '')}",
                 4000,
             )
-            self.audio.play(
-                self.sentences,
-                0,
-                voice_overrides=self._get_voice_overrides(),
-            )
+            if self.sentences:
+                self.audio.play(
+                    self.sentences,
+                    0,
+                    voice_overrides=self._get_voice_overrides(),
+                )
         finally:
             self._auto_advancing_chapter = False
 
@@ -849,10 +1026,13 @@ class MainWindow(QMainWindow):
         return overrides
 
     def toggle_play(self):
+        if not self.sentences:
+            self.statusBar.showMessage("אין טקסט להקראה בפרק הנוכחי.", 3000)
+            return
         if self.audio.is_playing():
             self.audio.pause()
         else:
-            if self.audio.worker and self.audio.worker._is_paused:
+            if self.audio.worker and self.audio.worker.isRunning() and self.audio.worker._is_paused:
                 self.audio.resume()
             else:
                 self.audio.play(
@@ -888,10 +1068,10 @@ class MainWindow(QMainWindow):
             self.audio.play(self.sentences, new_idx, voice_overrides=self._get_voice_overrides())
 
     def on_voice_changed(self):
-        voice_id = self.combo_voice.currentData()
+        voice_id = self.combo_voice.currentData() or "edge_avri"
         self.audio.voice_type = voice_id
         self._persist_progress_only()
-        if self.audio.is_playing():
+        if self.audio.is_playing() and self.sentences:
             self.audio.play(self.sentences, self.active_sentence_index, voice_overrides=self._get_voice_overrides())
 
     def on_speed_changed(self, val: int):
@@ -923,6 +1103,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "טעינה בתהליך", "קובץ אחר עדיין נטען ברקע, אנא המתן רגע.")
             return
 
+        _retire_window_thread(self._file_thread, wait_ms=100)
         self.audio.stop()
         self.statusBar.showMessage("מתחיל טעינת קובץ גדול ברקע...")
         self._file_thread = FileLoadThread(file_path)
@@ -959,10 +1140,10 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "שגיאה בטעינת קובץ", err)
 
     def open_resegment_dialog(self):
-        if not self.books:
+        book = self._get_current_book()
+        if not book:
             QMessageBox.information(self, "אין ספר", "טען ספר או הדבק טקסט לפני פיצול מקטעים.")
             return
-        book = self.books[self.current_book_index]
         dlg = SegmentBookDialog(self, book)
         if not dlg.exec():
             return
@@ -1002,13 +1183,12 @@ class MainWindow(QMainWindow):
             self.settings = load_settings()
             self._refresh_provider_badge()
             # בדיקת התיישנות תוצרים פעילים בעקבות שינוי הגדרות
-            if self.books:
-                book = self.books[self.current_book_index]
-                chapter = book["chapters"][self.current_chapter_index]
+            book, chapter = self._get_current_book_and_chapter()
+            if book and chapter:
                 status = assess_chapter_pipeline(
                     book_id=book.get("id", ""),
                     chapter_index=self.current_chapter_index,
-                    source_text=chapter["text"],
+                    source_text=chapter.get("text", "") or "",
                     settings=self.settings,
                     store=self.store,
                 )
@@ -1016,24 +1196,21 @@ class MainWindow(QMainWindow):
                     self.current_script_data = None
                     self.speaker_roles = []
                     self.speaker_labels = []
-                    self.sentences = split_into_sentences(chapter["text"])
+                    self.sentences = split_into_sentences(chapter.get("text", "") or "")
                     self.btn_export_script.setVisible(False)
                     self.btn_restore_original.setVisible(False)
                     self.render_text()
                     self.update_progress_display()
-                    self._refresh_resume_banner()
+                    self._refresh_resume_banner(force=True)
                     self.statusBar.showMessage("ההגדרות נשמרו; התסריט הקודם התיישן ולא ישמש ליצוא.", 6000)
                     return
-            self._refresh_resume_banner()
+            self._refresh_resume_banner(force=True)
             self.statusBar.showMessage("הגדרות ה-AI, המודלים, התרגום והקולות נשמרו!", 4000)
 
     # --- Background Worker Helper (עם התקדמות וביטול מיידי) ---
     def _close_task_progress(self):
         if self._task_progress_dlg:
-            try:
-                self._task_progress_dlg.close()
-            except Exception:
-                pass
+            _safe_close_progress_dialog(self._task_progress_dlg)
             self._task_progress_dlg = None
 
     def _run_background_task(
@@ -1048,6 +1225,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "פעולה רצה", "משימת AI/תרגום אחרת עדיין רצה ברקע, אנא המתן לסיומה.")
             return
 
+        _retire_window_thread(self._task_thread, wait_ms=100)
         self.statusBar.showMessage(status_msg)
         th = TaskWorkerThread(fn)
         self._task_thread = th
@@ -1108,13 +1286,12 @@ class MainWindow(QMainWindow):
 
     # --- AI Vocalization & Companion ---
     def vocalize_current_chapter(self):
-        if not self.books:
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
             return
-        chapter_text = (
-            "\n".join(self.sentences)
-            if self.sentences
-            else self.books[self.current_book_index]["chapters"][self.current_chapter_index]["text"]
-        )
+        chapter_text = "\n".join(self.sentences) if self.sentences else (chapter.get("text", "") or "")
+        if not chapter_text.strip():
+            return
         cfg = self.settings
 
         self._run_background_task(
@@ -1144,12 +1321,15 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(f"הניקוד הושלם ({res.get('source', '')})!", 5000)
 
     def trigger_companion(self, mode: str):
-        book = self.books[self.current_book_index]
-        chapter = book["chapters"][self.current_chapter_index]
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
+            QMessageBox.information(self, "אין ספר", "טען ספר או פרק לפני הפעלת העוזר הספרותי.")
+            return
+        safe_idx = max(0, min(len(self.sentences) - 1, self.active_sentence_index)) if self.sentences else 0
         target_text = (
-            self.sentences[self.active_sentence_index]
+            self.sentences[safe_idx]
             if mode == "explain" and self.sentences
-            else "\n".join(self.sentences[:120]) or chapter["text"]
+            else "\n".join(self.sentences[:120]) or (chapter.get("text", "") or "")
         )
 
         titles = {
@@ -1181,16 +1361,17 @@ class MainWindow(QMainWindow):
 
     # --- Wikipedia Search & AI Knowledge Grounding ---
     def open_wikipedia_dialog(self):
-        if not self.books:
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
+            QMessageBox.information(self, "אין ספר", "טען ספר או פרק לפני חיפוש בוויקיפדיה.")
             return
-        book = self.books[self.current_book_index]
         active_sentence = ""
         if self.sentences and 0 <= self.active_sentence_index < len(self.sentences):
             active_sentence = self.sentences[self.active_sentence_index]
         chapter_context = (
             active_sentence
             or "\n".join(self.sentences[:60])
-            or book["chapters"][self.current_chapter_index]["text"][:2500]
+            or (chapter.get("text", "") or "")[:2500]
         )
 
         dlg = WikiSearchDialog(self, self.settings)
@@ -1269,13 +1450,13 @@ class MainWindow(QMainWindow):
         self.open_script_studio(forced_scope="book")
 
     def open_script_studio(self, forced_scope: Optional[str] = None):
-        if not self.books:
+        if not isinstance(forced_scope, str):
+            forced_scope = None
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
+            QMessageBox.information(self, "אין ספר", "אין פרק פעיל ליצירת תסריט.")
             return
-        book = self.books[self.current_book_index]
         chapters = book.get("chapters") or []
-        if not chapters:
-            return
-        chapter = chapters[self.current_chapter_index]
         default_scope = forced_scope or (self.combo_scope.currentData() or "chapter")
 
         dlg = ScriptStudioDialog(
@@ -1495,6 +1676,7 @@ class MainWindow(QMainWindow):
         run_cnt = len(target_chapters) if target_chapters is not None else total
         self.statusBar.showMessage(f"מייצר תרגום ותסריט לספר ({run_cnt} מתוך {total} מקטעים לפי הסדר)...")
 
+        _retire_window_thread(self._whole_book_script_thread, wait_ms=100)
         th = WholeBookScriptThread({
             "book": book_snapshot,
             "settings": deepcopy(self.settings),
@@ -1540,6 +1722,7 @@ class MainWindow(QMainWindow):
             "tts_opts": dict(job_kwargs.get("tts_opts") or {}),
         }
 
+        _retire_window_thread(self._export_thread, wait_ms=100)
         self.statusBar.showMessage(f"מפעיל יצוא מלא לכל הספר ({total_ch} פרקים לפי הסדר)...")
         self._export_thread = PipelineExportThread(
             {
@@ -1721,10 +1904,10 @@ class MainWindow(QMainWindow):
 
     def _on_whole_book_script_finished(self, res: dict):
         if self._whole_book_script_progress_dlg:
-            self._whole_book_script_progress_dlg.close()
+            _safe_close_progress_dialog(self._whole_book_script_progress_dlg)
             self._whole_book_script_progress_dlg = None
 
-        self._refresh_resume_banner()
+        self._refresh_resume_banner(force=True)
 
         if res.get("success") and res.get("status") == "completed":
             scripts = res.get("scripts") or []
@@ -1860,12 +2043,15 @@ class MainWindow(QMainWindow):
         )
 
     def open_translate_dialog(self):
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
+            QMessageBox.information(self, "אין ספר", "אין פרק פעיל לתרגום.")
+            return
         dlg = TranslateDialog(self, self.settings)
         if not dlg.exec():
             return
         opts = dlg.get_options()
         self._apply_fallback_policy_preference(opts.get("fallback_to_ai_on_failure"))
-        book = self.books[self.current_book_index]
         self._run_chapter_translation_job(book, self.current_chapter_index, opts)
 
     def _on_translation_done(self, res: dict, replace_reader: bool):
@@ -1898,7 +2084,7 @@ class MainWindow(QMainWindow):
             self.companion_widget.setVisible(True)
             self.comp_text.setMarkdown("\n\n".join(md_blocks))
             self.statusBar.showMessage(f"התרגום הושלם ונשמר ({engine_label}).", 5000)
-        self._refresh_resume_banner()
+        self._refresh_resume_banner(force=True)
 
     # --- Enforced Audiobook Export Pipeline (פרק נוכחי / הספר כולו) ---
     def export_whole_book_audio_dialog(self):
@@ -1908,7 +2094,10 @@ class MainWindow(QMainWindow):
         self.export_audio_dialog(forced_scope="book")
 
     def export_audio_dialog(self, forced_scope: Optional[str] = None):
-        if not self.books:
+        if not isinstance(forced_scope, str):
+            forced_scope = None
+        book, chapter = self._get_current_book_and_chapter()
+        if not book or not chapter:
             QMessageBox.information(self, "אין ספר", "אין ספר פעיל לייצוא שמע.")
             return
 
@@ -1916,12 +2105,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "ייצוא בתהליך", "ייצוא שמע קודם עדיין רץ ברקע, אנא המתן לסיומו.")
             return
 
-        book = self.books[self.current_book_index]
-        chapters = book.get("chapters") or []
-        if not chapters:
-            return
-        chapter = chapters[self.current_chapter_index]
-        source_text = chapter["text"]
+        source_text = chapter.get("text", "") or ""
         book_id = book.get("id", "")
         chapter_idx = self.current_chapter_index
         default_scope = forced_scope or (self.combo_scope.currentData() or "chapter")
@@ -2042,6 +2226,7 @@ class MainWindow(QMainWindow):
             elif fmt == "mp3" and not target_path.lower().endswith(".mp3"):
                 target_path = f"{os.path.splitext(target_path)[0]}.mp3"
 
+            _retire_window_thread(self._export_thread, wait_ms=100)
             self.statusBar.showMessage(f"מפעיל צינור יצוא מלא לפרק {chapter_idx + 1}...")
             self._export_thread = PipelineExportThread(
                 {
@@ -2081,10 +2266,10 @@ class MainWindow(QMainWindow):
 
     def _on_pipeline_finished(self, res: dict):
         if self._export_progress_dlg:
-            self._export_progress_dlg.close()
+            _safe_close_progress_dialog(self._export_progress_dlg)
             self._export_progress_dlg = None
 
-        self._refresh_resume_banner()
+        self._refresh_resume_banner(force=True)
 
         scope = res.get("scope", "chapter")
         if res.get("success") and res.get("status") == "completed":
@@ -2142,19 +2327,25 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            if hasattr(self, "_progress_save_timer"):
+                self._progress_save_timer.stop()
             self._persist_library_and_progress()
-            self.audio.stop()
-            if self._file_thread and self._file_thread.isRunning():
-                self._file_thread.wait(800)
-            if self._task_thread and self._task_thread.isRunning():
-                self._task_thread.cancel()
-                self._task_thread.wait(1000)
-            if self._whole_book_script_thread and self._whole_book_script_thread.isRunning():
-                self._whole_book_script_thread.cancel()
-                self._whole_book_script_thread.wait(1200)
-            if self._export_thread and self._export_thread.isRunning():
-                self._export_thread.cancel()
-                self._export_thread.wait(1200)
+            self.audio.shutdown(wait_ms=1000)
+            _safe_close_progress_dialog(self._task_progress_dlg)
+            self._task_progress_dlg = None
+            _safe_close_progress_dialog(self._whole_book_script_progress_dlg)
+            self._whole_book_script_progress_dlg = None
+            _safe_close_progress_dialog(self._export_progress_dlg)
+            self._export_progress_dlg = None
+
+            _retire_window_thread(self._file_thread, cancel=False, wait_ms=600)
+            self._file_thread = None
+            _retire_window_thread(self._task_thread, cancel=True, wait_ms=800)
+            self._task_thread = None
+            _retire_window_thread(self._whole_book_script_thread, cancel=True, wait_ms=900)
+            self._whole_book_script_thread = None
+            _retire_window_thread(self._export_thread, cancel=True, wait_ms=900)
+            self._export_thread = None
         except Exception:
             pass
         super().closeEvent(event)

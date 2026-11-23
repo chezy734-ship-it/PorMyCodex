@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from book_loader import split_into_sentences
@@ -78,8 +79,20 @@ def get_chapter_audio_cache_path(book_id: str, chapter_index: int, ext: str = "w
     return os.path.join(get_audio_cache_dir(), f"{safe_bid}__ch{int(chapter_index):04d}.{clean_ext}")
 
 
+def _is_retryable_replace_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        winerr = getattr(exc, "winerror", None)
+        if winerr in (5, 32, 33):  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+            return True
+        if getattr(exc, "errno", None) in (13, 16, 26):
+            return True
+    return False
+
+
 def atomic_write_bytes(target_path: str, data: bytes) -> str:
-    """כותב בייטים בצורה אטומית (Temp file באותה תיקייה + fsync + os.replace)."""
+    """כותב בייטים בצורה אטומית (Temp file באותה תיקייה + fsync + os.replace עם retry בטוח ל-Windows)."""
     abs_target = os.path.abspath(target_path)
     parent = os.path.dirname(abs_target)
     os.makedirs(parent, exist_ok=True)
@@ -94,7 +107,20 @@ def atomic_write_bytes(target_path: str, data: bytes) -> str:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, abs_target)
+        backoff_delays = (0.025, 0.05, 0.08, 0.12, 0.16, 0.22, 0.30, 0.40)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(len(backoff_delays) + 1):
+            try:
+                os.replace(tmp_path, abs_target)
+                return abs_target
+            except OSError as exc:
+                last_exc = exc
+                if attempt < len(backoff_delays) and _is_retryable_replace_error(exc):
+                    time.sleep(backoff_delays[attempt])
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
         return abs_target
     except Exception:
         try:
@@ -277,8 +303,30 @@ class LibraryStore:
                 self._cache_state = None
                 return self._empty_state()
 
+    def get_state_signature(self) -> Optional[tuple]:
+        with self._io_lock:
+            path = self.state_path
+            try:
+                if not os.path.exists(path):
+                    return None
+                st = os.stat(path)
+                return (path, st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+
+    def get_reading_progress(self) -> Dict[str, Any]:
+        with self._io_lock:
+            state = self._read_state_cached()
+            prog = deepcopy(DEFAULT_PROGRESS)
+            if isinstance(state.get("reading_progress"), dict):
+                prog.update(deepcopy(state["reading_progress"]))
+            if not isinstance(prog.get("chapter_positions"), dict):
+                prog["chapter_positions"] = {}
+            return prog
+
     def load_raw_state(self) -> Dict[str, Any]:
-        return deepcopy(self._read_state_cached())
+        with self._io_lock:
+            return deepcopy(self._read_state_cached())
 
     def _save_raw_state(self, state: Dict[str, Any]) -> None:
         with self._io_lock:
@@ -323,13 +371,14 @@ class LibraryStore:
         books: List[Dict[str, Any]],
         progress: Dict[str, Any],
     ) -> None:
-        state = self.load_raw_state()
-        state["books"] = deepcopy(books)
-        merged_prog = deepcopy(DEFAULT_PROGRESS)
-        merged_prog.update(state.get("reading_progress") or {})
-        merged_prog.update(progress or {})
-        state["reading_progress"] = merged_prog
-        self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            state["books"] = deepcopy(books)
+            merged_prog = deepcopy(DEFAULT_PROGRESS)
+            merged_prog.update(state.get("reading_progress") or {})
+            merged_prog.update(progress or {})
+            state["reading_progress"] = merged_prog
+            self._save_raw_state(state)
 
     def update_reading_progress(
         self,
@@ -340,26 +389,28 @@ class LibraryStore:
         voice_type: Optional[str] = None,
         speed: Optional[float] = None,
     ) -> None:
-        state = self.load_raw_state()
-        prog = deepcopy(DEFAULT_PROGRESS)
-        prog.update(state.get("reading_progress") or {})
-        prog["active_book_id"] = book_id
-        prog["active_chapter_index"] = int(chapter_index)
-        prog["active_sentence_index"] = max(0, int(sentence_index))
-        if font_size is not None:
-            prog["font_size"] = int(font_size)
-        if voice_type is not None:
-            prog["voice_type"] = str(voice_type)
-        if speed is not None:
-            prog["speed"] = float(speed)
-        positions = prog.setdefault("chapter_positions", {})
-        positions[chapter_key(book_id, chapter_index)] = max(0, int(sentence_index))
-        state["reading_progress"] = prog
-        self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            prog = deepcopy(DEFAULT_PROGRESS)
+            prog.update(state.get("reading_progress") or {})
+            prog["active_book_id"] = book_id
+            prog["active_chapter_index"] = int(chapter_index)
+            prog["active_sentence_index"] = max(0, int(sentence_index))
+            if font_size is not None:
+                prog["font_size"] = int(font_size)
+            if voice_type is not None:
+                prog["voice_type"] = str(voice_type)
+            if speed is not None:
+                prog["speed"] = float(speed)
+            positions = prog.setdefault("chapter_positions", {})
+            positions[chapter_key(book_id, chapter_index)] = max(0, int(sentence_index))
+            state["reading_progress"] = prog
+            self._save_raw_state(state)
 
     def get_chapter_artifacts(self, book_id: str, chapter_index: int) -> Dict[str, Any]:
-        state = self.load_raw_state()
-        return deepcopy(state.get("chapter_artifacts", {}).get(chapter_key(book_id, chapter_index), {}))
+        with self._io_lock:
+            state = self._read_state_cached()
+            return deepcopy(state.get("chapter_artifacts", {}).get(chapter_key(book_id, chapter_index), {}))
 
     def save_chapter_translation(
         self,
@@ -374,6 +425,15 @@ class LibraryStore:
         if src_count <= 0 or dst_count < src_count:
             raise ValueError("כמות המשפטים המתורגמים אינה מכסה את כל משפטֵי המקור.")
 
+        with self._io_lock:
+            self._save_chapter_translation_locked(book_id, chapter_index, translation_record)
+
+    def _save_chapter_translation_locked(
+        self,
+        book_id: str,
+        chapter_index: int,
+        translation_record: Dict[str, Any],
+    ) -> None:
         state = self.load_raw_state()
         ck = chapter_key(book_id, chapter_index)
         art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
@@ -637,25 +697,26 @@ class LibraryStore:
         *,
         persist: bool = False,
     ) -> Dict[str, Any]:
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.get("chapter_artifacts", {}).get(ck, {})
-        view = self._compute_translation_progress_view(
-            art=art,
-            book_id=book_id,
-            chapter_index=chapter_index,
-            source_sentences=source_sentences,
-            config_hash=config_hash,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            source_hash=source_hash,
-        )
-        if persist and art is not None:
-            art_mut = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
-            view["updated_at"] = _now_iso()
-            art_mut["translation_progress"] = view
-            self._save_raw_state(state)
-        return view
+        with self._io_lock:
+            state = self.load_raw_state() if persist else self._read_state_cached()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.get("chapter_artifacts", {}).get(ck, {})
+            view = self._compute_translation_progress_view(
+                art=art,
+                book_id=book_id,
+                chapter_index=chapter_index,
+                source_sentences=source_sentences,
+                config_hash=config_hash,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                source_hash=source_hash,
+            )
+            if persist and art is not None:
+                art_mut = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+                view["updated_at"] = _now_iso()
+                art_mut["translation_progress"] = view
+                self._save_raw_state(state)
+            return view
 
     def _save_translation_units_internal(
         self,
@@ -671,6 +732,32 @@ class LibraryStore:
         job_status: str = "in_progress",
     ) -> Dict[str, Any]:
         """שומר אטומית קבוצה של יחידות תרגום בכתיבה אחת לדיסק מבלי לסמן פרק חלקי כמוכן ליצוא."""
+        with self._io_lock:
+            return self._save_translation_units_locked(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                source_sentences=source_sentences,
+                source_hash=source_hash,
+                config_hash=config_hash,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                unit_updates=unit_updates,
+                job_status=job_status,
+            )
+
+    def _save_translation_units_locked(
+        self,
+        *,
+        book_id: str,
+        chapter_index: int,
+        source_sentences: List[str],
+        source_hash: str,
+        config_hash: str,
+        source_lang: str,
+        target_lang: str,
+        unit_updates: List[Dict[str, Any]],
+        job_status: str = "in_progress",
+    ) -> Dict[str, Any]:
         state = self.load_raw_state()
         ck = chapter_key(book_id, chapter_index)
         art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
@@ -860,13 +947,14 @@ class LibraryStore:
         chapter_index: int,
         job_status: str,
     ) -> None:
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.get("chapter_artifacts", {}).get(ck)
-        if isinstance(art, dict) and isinstance(art.get("translation_progress"), dict):
-            art["translation_progress"]["status"] = job_status
-            art["translation_progress"]["updated_at"] = _now_iso()
-            self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.get("chapter_artifacts", {}).get(ck)
+            if isinstance(art, dict) and isinstance(art.get("translation_progress"), dict):
+                art["translation_progress"]["status"] = job_status
+                art["translation_progress"]["updated_at"] = _now_iso()
+                self._save_raw_state(state)
 
     def _compute_script_progress_view(
         self,
@@ -1060,25 +1148,26 @@ class LibraryStore:
         *,
         persist: bool = False,
     ) -> Dict[str, Any]:
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.get("chapter_artifacts", {}).get(ck, {})
-        view = self._compute_script_progress_view(
-            art=art,
-            book_id=book_id,
-            chapter_index=chapter_index,
-            batches_spec=batches_spec,
-            source_hash=source_hash,
-            translation_hash=translation_hash,
-            config_hash=config_hash,
-            mode=mode,
-        )
-        if persist and art is not None:
-            art_mut = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
-            view["updated_at"] = _now_iso()
-            art_mut["script_progress"] = view
-            self._save_raw_state(state)
-        return view
+        with self._io_lock:
+            state = self.load_raw_state() if persist else self._read_state_cached()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.get("chapter_artifacts", {}).get(ck, {})
+            view = self._compute_script_progress_view(
+                art=art,
+                book_id=book_id,
+                chapter_index=chapter_index,
+                batches_spec=batches_spec,
+                source_hash=source_hash,
+                translation_hash=translation_hash,
+                config_hash=config_hash,
+                mode=mode,
+            )
+            if persist and art is not None:
+                art_mut = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+                view["updated_at"] = _now_iso()
+                art_mut["script_progress"] = view
+                self._save_raw_state(state)
+            return view
 
     def save_script_batch_progress(
         self,
@@ -1100,6 +1189,44 @@ class LibraryStore:
         job_status: str = "in_progress",
     ) -> Dict[str, Any]:
         """שומר אטומית אצוות תסריט מאומתת לדיסק מבלי לסמן פרק חלקי כמוכן ליצוא."""
+        with self._io_lock:
+            return self._save_script_batch_progress_locked(
+                book_id=book_id,
+                chapter_index=chapter_index,
+                batches_spec=batches_spec,
+                source_hash=source_hash,
+                translation_hash=translation_hash,
+                config_hash=config_hash,
+                mode=mode,
+                batch_index=batch_index,
+                batch_status=batch_status,
+                lines=lines,
+                title=title,
+                wiki_articles=wiki_articles,
+                provider_label=provider_label,
+                error=error,
+                job_status=job_status,
+            )
+
+    def _save_script_batch_progress_locked(
+        self,
+        *,
+        book_id: str,
+        chapter_index: int,
+        batches_spec: List[Dict[str, Any]],
+        source_hash: str,
+        translation_hash: str,
+        config_hash: str,
+        mode: str,
+        batch_index: int,
+        batch_status: str,
+        lines: Optional[List[Dict[str, Any]]] = None,
+        title: str = "",
+        wiki_articles: Optional[List[Dict[str, Any]]] = None,
+        provider_label: str = "",
+        error: str = "",
+        job_status: str = "in_progress",
+    ) -> Dict[str, Any]:
         state = self.load_raw_state()
         ck = chapter_key(book_id, chapter_index)
         art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
@@ -1228,29 +1355,30 @@ class LibraryStore:
         if not lines:
             raise ValueError("אסור לשמור תסריט ריק.")
 
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
-        prev_s = art.get("script")
-        if isinstance(prev_s, dict) and prev_s.get("is_complete"):
-            if (
-                prev_s.get("source_hash") != script_record.get("source_hash")
-                or prev_s.get("translation_hash") != script_record.get("translation_hash")
-                or prev_s.get("config_hash") != script_record.get("config_hash")
-            ):
-                shist = art.setdefault("script_history", [])
-                shist.append(deepcopy(prev_s))
-                if len(shist) > 10:
-                    del shist[:-10]
+        with self._io_lock:
+            state = self.load_raw_state()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+            prev_s = art.get("script")
+            if isinstance(prev_s, dict) and prev_s.get("is_complete"):
+                if (
+                    prev_s.get("source_hash") != script_record.get("source_hash")
+                    or prev_s.get("translation_hash") != script_record.get("translation_hash")
+                    or prev_s.get("config_hash") != script_record.get("config_hash")
+                ):
+                    shist = art.setdefault("script_history", [])
+                    shist.append(deepcopy(prev_s))
+                    if len(shist) > 10:
+                        del shist[:-10]
 
-        rec = deepcopy(script_record)
-        rec["saved_at"] = _now_iso()
-        art["script"] = rec
-        if isinstance(art.get("script_progress"), dict):
-            art["script_progress"]["status"] = "completed"
-            art["script_progress"]["updated_at"] = rec["saved_at"]
-        art.pop("last_export", None)
-        self._save_raw_state(state)
+            rec = deepcopy(script_record)
+            rec["saved_at"] = _now_iso()
+            art["script"] = rec
+            if isinstance(art.get("script_progress"), dict):
+                art["script_progress"]["status"] = "completed"
+                art["script_progress"]["updated_at"] = rec["saved_at"]
+            art.pop("last_export", None)
+            self._save_raw_state(state)
 
     def save_chapter_export(
         self,
@@ -1260,13 +1388,14 @@ class LibraryStore:
     ) -> None:
         if not export_record.get("success"):
             raise ValueError("אסור לשמור רשומת יצוא שנכשלה או חלקית כהצלחה.")
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
-        rec = deepcopy(export_record)
-        rec["saved_at"] = _now_iso()
-        art["last_export"] = rec
-        self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+            rec = deepcopy(export_record)
+            rec["saved_at"] = _now_iso()
+            art["last_export"] = rec
+            self._save_raw_state(state)
 
     def invalidate_chapter_artifacts(
         self,
@@ -1274,38 +1403,40 @@ class LibraryStore:
         chapter_index: int,
         keep_translation: bool = False,
     ) -> None:
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.get("chapter_artifacts", {}).get(ck)
-        if not art:
-            return
-        if not keep_translation:
-            prev_t = art.pop("translation", None)
-            if isinstance(prev_t, dict) and prev_t.get("is_complete"):
-                art.setdefault("translation_history", []).append(deepcopy(prev_t))
-        prev_s = art.pop("script", None)
-        if isinstance(prev_s, dict) and prev_s.get("is_complete"):
-            art.setdefault("script_history", []).append(deepcopy(prev_s))
-        art.pop("last_export", None)
-        self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.get("chapter_artifacts", {}).get(ck)
+            if not art:
+                return
+            if not keep_translation:
+                prev_t = art.pop("translation", None)
+                if isinstance(prev_t, dict) and prev_t.get("is_complete"):
+                    art.setdefault("translation_history", []).append(deepcopy(prev_t))
+            prev_s = art.pop("script", None)
+            if isinstance(prev_s, dict) and prev_s.get("is_complete"):
+                art.setdefault("script_history", []).append(deepcopy(prev_s))
+            art.pop("last_export", None)
+            self._save_raw_state(state)
 
     def restore_previous_translation_version(self, book_id: str, chapter_index: int) -> Optional[Dict[str, Any]]:
         """משחזר את גרסת התרגום השלמה הקודמת שנשמרה בארכיון."""
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.get("chapter_artifacts", {}).get(ck)
-        if not isinstance(art, dict):
-            return None
-        hist = art.get("translation_history") or []
-        if not hist:
-            return None
-        prev_rec = hist.pop()
-        if isinstance(art.get("translation"), dict):
-            hist.append(art["translation"])
-        art["translation"] = deepcopy(prev_rec)
-        art["translation_history"] = hist[-10:]
-        self._save_raw_state(state)
-        return deepcopy(prev_rec)
+        with self._io_lock:
+            state = self.load_raw_state()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.get("chapter_artifacts", {}).get(ck)
+            if not isinstance(art, dict):
+                return None
+            hist = art.get("translation_history") or []
+            if not hist:
+                return None
+            prev_rec = hist.pop()
+            if isinstance(art.get("translation"), dict):
+                hist.append(art["translation"])
+            art["translation"] = deepcopy(prev_rec)
+            art["translation_history"] = hist[-10:]
+            self._save_raw_state(state)
+            return deepcopy(prev_rec)
 
     @staticmethod
     def is_translation_fresh(
@@ -1365,13 +1496,14 @@ class LibraryStore:
     ) -> None:
         if not tts_record.get("is_complete") or not tts_record.get("audio_path"):
             raise ValueError("אסור לשמור מטמון TTS חלקי או ללא נתיב קובץ.")
-        state = self.load_raw_state()
-        ck = chapter_key(book_id, chapter_index)
-        art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
-        rec = deepcopy(tts_record)
-        rec["saved_at"] = _now_iso()
-        art["tts_cache"] = rec
-        self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            ck = chapter_key(book_id, chapter_index)
+            art = state.setdefault("chapter_artifacts", {}).setdefault(ck, {})
+            rec = deepcopy(tts_record)
+            rec["saved_at"] = _now_iso()
+            art["tts_cache"] = rec
+            self._save_raw_state(state)
 
     @staticmethod
     def is_chapter_tts_fresh(
@@ -1399,14 +1531,16 @@ class LibraryStore:
         return True
 
     def save_whole_book_job(self, book_id: str, job_data: Dict[str, Any]) -> None:
-        state = self.load_raw_state()
-        jobs = state.setdefault("whole_book_jobs", {})
-        rec = deepcopy(job_data)
-        rec["updated_at"] = _now_iso()
-        jobs[book_id] = rec
-        self._save_raw_state(state)
+        with self._io_lock:
+            state = self.load_raw_state()
+            jobs = state.setdefault("whole_book_jobs", {})
+            rec = deepcopy(job_data)
+            rec["updated_at"] = _now_iso()
+            jobs[book_id] = rec
+            self._save_raw_state(state)
 
     def get_whole_book_job(self, book_id: str) -> Optional[Dict[str, Any]]:
-        state = self.load_raw_state()
-        rec = (state.get("whole_book_jobs") or {}).get(book_id)
-        return deepcopy(rec) if isinstance(rec, dict) else None
+        with self._io_lock:
+            state = self._read_state_cached()
+            rec = (state.get("whole_book_jobs") or {}).get(book_id)
+            return deepcopy(rec) if isinstance(rec, dict) else None
