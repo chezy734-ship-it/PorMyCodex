@@ -45,6 +45,34 @@ def compute_provider_fingerprint(provider_id: str, api_key: str, base_url: str) 
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+API_PACING_PRESETS: Dict[str, Dict[str, Any]] = {
+    "safe_free": {
+        "label": "🐢 איטי ובטוח במיוחד — 6.5 שנ' (מומלץ למפתח חינמי / מודלי Pro)",
+        "min_interval_sec": 6.5,
+        "max_retries_429": 5,
+    },
+    "gentle": {
+        "label": "🚶 רגוע — 4.0 שנ' (ברירת מחדל מומלצת לספרים ארוכים)",
+        "min_interval_sec": 4.0,
+        "max_retries_429": 4,
+    },
+    "balanced": {
+        "label": "⚖️ מאוזן — 2.0 שנ' (מפתח API בתשלום / Tier 1)",
+        "min_interval_sec": 2.0,
+        "max_retries_429": 4,
+    },
+    "fast": {
+        "label": "⚡ מהיר — 0.5 שנ' (מכסה גבוהה בלבד)",
+        "min_interval_sec": 0.5,
+        "max_retries_429": 3,
+    },
+    "custom": {
+        "label": "🎛️ מותאם אישית",
+        "min_interval_sec": 4.0,
+        "max_retries_429": 4,
+    },
+}
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "active_provider": "gemini",
     "providers": {
@@ -90,6 +118,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "discovered_models": [],
             "discovered_fingerprint": "",
         },
+    },
+    "api_pacing": {
+        "preset": "gentle",
+        "min_interval_sec": 4.0,
+        "adaptive_slowdown": True,
+        "max_retries_429": 4,
     },
     "translation": {
         "engine": "google_free",
@@ -186,3 +220,35 @@ def get_active_provider_config(settings: Dict[str, Any] = None) -> Dict[str, Any
     pconf = dict(providers.get(pid, providers.get("gemini", {})))
     pconf["provider_id"] = pid
     return pconf
+
+
+def get_api_pacing_config(settings: Dict[str, Any] = None) -> Dict[str, Any]:
+    """מחזיר תצורת קצב בקשות API תקינה ומוגבלת לטווחים בטוחים."""
+    cfg = settings if settings is not None else load_settings()
+    raw = dict(DEFAULT_SETTINGS["api_pacing"])
+    if isinstance(cfg, dict) and isinstance(cfg.get("api_pacing"), dict):
+        raw.update(cfg["api_pacing"])
+
+    preset = str(raw.get("preset") or "gentle").strip().lower()
+    if preset not in API_PACING_PRESETS:
+        preset = "gentle"
+
+    try:
+        min_interval = float(raw.get("min_interval_sec", API_PACING_PRESETS[preset]["min_interval_sec"]))
+    except (TypeError, ValueError):
+        min_interval = float(API_PACING_PRESETS[preset]["min_interval_sec"])
+    min_interval = max(0.0, min(60.0, min_interval))
+
+    try:
+        max_429 = int(raw.get("max_retries_429", API_PACING_PRESETS[preset]["max_retries_429"]))
+    except (TypeError, ValueError):
+        max_429 = int(API_PACING_PRESETS[preset]["max_retries_429"])
+    max_429 = max(0, min(8, max_429))
+
+    return {
+        "preset": preset,
+        "min_interval_sec": round(min_interval, 2),
+        "adaptive_slowdown": bool(raw.get("adaptive_slowdown", True)),
+        "max_retries_429": max_429,
+    }
+

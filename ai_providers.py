@@ -284,6 +284,176 @@ def _sleep_cancellable(seconds: float, cancel_event: Any, stage: str) -> None:
         time.sleep(seconds)
 
 
+def _parse_retry_after_seconds(resp: Any) -> float:
+    """
+    מחלץ זמן המתנה מומלץ מהשרת (HTTP Retry-After או גוף שגיאת Gemini 429 כגון retryDelay / 'Please retry in Xs').
+    מחזיר 0.0 אם לא צוין.
+    """
+    if resp is None:
+        return 0.0
+    # 1. כותרת HTTP Retry-After
+    headers_raw = getattr(resp, "headers", None) or {}
+    if isinstance(headers_raw, dict):
+        for hk, hv in headers_raw.items():
+            if str(hk).lower() == "retry-after" and hv is not None:
+                try:
+                    val = float(str(hv).strip())
+                    if val > 0:
+                        return val
+                except (TypeError, ValueError):
+                    pass
+
+    # 2. גוף JSON של Gemini / Google API (details[].retryDelay או message)
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        err_obj = data.get("error")
+        if isinstance(err_obj, dict):
+            details = err_obj.get("details") or []
+            if isinstance(details, list):
+                for item in details:
+                    if isinstance(item, dict) and item.get("retryDelay"):
+                        rd = str(item.get("retryDelay")).strip().lower()
+                        m = re.match(r"^(\d+(?:\.\d+)?)s?$", rd)
+                        if m:
+                            return float(m.group(1))
+            msg = str(err_obj.get("message") or "")
+            m_msg = re.search(
+                r"(?:retry\s+(?:in|after)\s+)(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)",
+                msg,
+                flags=re.IGNORECASE,
+            )
+            if m_msg:
+                return float(m_msg.group(1))
+
+    # 3. גיבוי טקסטואלי
+    raw_txt = str(getattr(resp, "text", "") or "")[:600]
+    m_raw = re.search(
+        r"(?:retry\s+(?:in|after)\s+)(\d+(?:\.\d+)?)\s*(?:s|sec|seconds?)",
+        raw_txt,
+        flags=re.IGNORECASE,
+    )
+    if m_raw:
+        return float(m_raw.group(1))
+    return 0.0
+
+
+class APIRequestPacer:
+    """
+    מנהל קצב בקשות (Rate Limiter / Adaptive Pacer) בטוח לחוטים (Thread-Safe) לפי ספק.
+    - אוכף מרווח מינימלי בין בקשות עוקבות (מונע חריגת RPM ב-Gemini ובספקי AI)
+    - מתאים אוטומטית את הקצב לאחר HTTP 429 (מגדיל השהיה + מכבד cooldown מהשרת)
+    - משחרר בהדרגה את ההאטה הנוספת לאחר הצלחות רצופות
+    - ניתן לביטול מיידי בכל רגע דרך cancel_event
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._states: Dict[str, Dict[str, Any]] = {}
+
+    def _get_or_create(self, key: str) -> Dict[str, Any]:
+        return self._states.setdefault(
+            key,
+            {
+                "next_slot_ts": 0.0,
+                "cooldown_until_ts": 0.0,
+                "extra_delay_sec": 0.0,
+                "consecutive_ok": 0,
+                "rate_limit_hits": 0,
+            },
+        )
+
+    def get_state(self, key: str) -> Dict[str, Any]:
+        with self._lock:
+            st = self._states.get(key)
+            return dict(st) if st else {
+                "next_slot_ts": 0.0,
+                "cooldown_until_ts": 0.0,
+                "extra_delay_sec": 0.0,
+                "consecutive_ok": 0,
+                "rate_limit_hits": 0,
+            }
+
+    def reset(self, key: Optional[str] = None) -> None:
+        with self._lock:
+            if key is None:
+                self._states.clear()
+            else:
+                self._states.pop(key, None)
+
+    def wait_turn(
+        self,
+        key: str,
+        min_interval_sec: float = 0.0,
+        *,
+        provider_label: str = "",
+        stage: str = "קריאת AI",
+        cancel_event: Any = None,
+        progress_cb: Optional[Callable[[str], None]] = None,
+        clock_fn: Optional[Callable[[], float]] = None,
+        sleep_fn: Optional[Callable[[float, Any, str], None]] = None,
+    ) -> float:
+        """ממתין עד לתור הבקשה הבא עבור הספק ומחזיר כמה שניות הומתן בפועל."""
+        _check_cancelled(cancel_event, stage)
+        now_fn = clock_fn or time.monotonic
+        sleeper = sleep_fn or _sleep_cancellable
+        base_interval = max(0.0, float(min_interval_sec or 0.0))
+
+        with self._lock:
+            st = self._get_or_create(key)
+            now = now_fn()
+            eff_interval = base_interval + float(st.get("extra_delay_sec", 0.0))
+            earliest = max(float(st.get("next_slot_ts", 0.0)), float(st.get("cooldown_until_ts", 0.0)))
+            wait_sec = max(0.0, earliest - now)
+            start_ts = now + wait_sec
+            st["next_slot_ts"] = start_ts + eff_interval
+
+        if wait_sec > 0.0:
+            if progress_cb and wait_sec >= 0.5:
+                lbl = provider_label or key
+                progress_cb(
+                    f"השהיית קצב API ({lbl}): ממתין {wait_sec:.1f} שנ' לפני הבקשה הבאה למניעת עומס..."
+                )
+            sleeper(wait_sec, cancel_event, stage)
+        return wait_sec
+
+    def on_rate_limited(
+        self,
+        key: str,
+        cooldown_sec: float,
+        *,
+        adaptive_slowdown: bool = True,
+        clock_fn: Optional[Callable[[], float]] = None,
+    ) -> float:
+        now_fn = clock_fn or time.monotonic
+        cd = max(0.0, float(cooldown_sec or 0.0))
+        with self._lock:
+            st = self._get_or_create(key)
+            now = now_fn()
+            st["consecutive_ok"] = 0
+            st["rate_limit_hits"] = int(st.get("rate_limit_hits", 0)) + 1
+            st["cooldown_until_ts"] = max(float(st.get("cooldown_until_ts", 0.0)), now + cd)
+            if adaptive_slowdown:
+                st["extra_delay_sec"] = min(12.0, round(float(st.get("extra_delay_sec", 0.0)) + 1.5, 2))
+            return float(st.get("extra_delay_sec", 0.0))
+
+    def on_success(self, key: str) -> None:
+        with self._lock:
+            st = self._states.get(key)
+            if not st:
+                return
+            st["consecutive_ok"] = int(st.get("consecutive_ok", 0)) + 1
+            if st["consecutive_ok"] >= 3 and float(st.get("extra_delay_sec", 0.0)) > 0.0:
+                st["extra_delay_sec"] = max(0.0, round(float(st["extra_delay_sec"]) - 0.5, 2))
+                st["consecutive_ok"] = 0
+
+
+GLOBAL_API_PACER = APIRequestPacer()
+
+
 PROVIDER_CATALOG: Dict[str, Dict[str, Any]] = {
     "gemini": {
         "label": "Google Gemini",
@@ -340,7 +510,10 @@ def _rank_gemini_model(mid: str) -> tuple:
     if m:
         maj = int(m.group(1))
         min_v = int(m.group(2) or 0)
-        tier = 0 if "flash" in low and "lite" not in low else (1 if "pro" in low else (2 if "lite" in low else 3))
+        is_flash_tier = ("flash" in low and "lite" not in low) or ("hydrogen" in low)
+        is_pro_tier = ("pro" in low) or ("neon" in low) or ("carbon" in low)
+        is_lite_tier = "lite" in low
+        tier = 0 if is_flash_tier else (1 if is_pro_tier else (2 if is_lite_tier else 3))
         experimental = 1 if any(t in low for t in ("exp", "preview", "001", "latest")) else 0
         return (0, -maj, -min_v, tier, experimental, low)
     return (1, 0, 0, 9, 0, low)
@@ -417,7 +590,8 @@ def _build_http_error(
     if code == 429:
         msg = (
             f"חריגה ממכסת הבקשות/קצב בשלב '{stage}' מול {provider_name} (HTTP 429){detail_suffix}.\n"
-            "המתן מספר שניות ונסה שוב, או הקטן עומס בקשות בחשבון."
+            "טיפ: ניתן להגדיל את ההשהיה בין בקשות בהגדרות AI -> 'קצב בקשות ל-API' (למשל 'איטי ובטוח'), "
+            "או לבחור מודל Flash עם מכסת בקשות גבוהה יותר."
         )
         return AICallError(msg, stage=stage, category="quota", retryable=True, status_code=code)
 
@@ -468,25 +642,56 @@ def execute_http_with_retry(
     request_fn: Optional[Callable[..., Any]] = None,
     clock_fn: Optional[Callable[[], float]] = None,
     expect_json: bool = False,
+    pacer: Optional[APIRequestPacer] = None,
+    pacing_key: str = "",
+    min_interval_sec: float = 0.0,
+    adaptive_slowdown: bool = True,
+    max_retries_429: Optional[int] = None,
+    sleep_fn: Optional[Callable[[float, Any, str], None]] = None,
 ) -> Any:
     """
     מבצע בקשת HTTP עם הפרדת (connect_timeout, read_timeout), תקציב זמן כולל (total_deadline),
-    מספר מוגבל של ניסיונות חוזרים לכשלים זמניים בלבד, וביטול מיידי גם באמצע Retry/Backoff.
+    מנגנון קצב והשהיה בין בקשות (APIRequestPacer), ניסיונות חוזרים מוגבלים לכשלים זמניים בלבד,
+    כיבוד מלא של Retry-After / Gemini retryDelay ב-HTTP 429, וביטול מיידי גם באמצע המתנה/Backoff.
     מזהה תגובות חסימה (418 / HTML / NetFree) ומונע ניסיונות חוזרים עיוורים.
     """
     req = _require_requests() if request_fn is None else None
     caller = request_fn if request_fn is not None else req.request
     now_fn = clock_fn or time.monotonic
+    sleeper = sleep_fn or _sleep_cancellable
 
     connect_t = max(1.0, float(connect_timeout))
     read_t = max(1.0, float(read_timeout))
-    deadline_ts = now_fn() + max(2.0, float(total_deadline))
     retries_allowed = max(0, int(max_retries))
+    retries_429_allowed = (
+        max(retries_allowed, max(0, int(max_retries_429)))
+        if max_retries_429 is not None
+        else retries_allowed
+    )
+    max_attempts = max(retries_allowed, retries_429_allowed) + 1
     transient_http_codes = {408, 429, 500, 502, 503, 504}
+    eff_pacing_key = (pacing_key or provider_name or "default").strip().lower()
+    eff_min_interval = max(0.0, float(min_interval_sec or 0.0))
 
+    # המתנת תור ראשונית לפני התחלת תקציב הזמן של הבקשה (כדי שהשהיית קצב לא תקצר Read/Total Deadline)
+    if pacer is not None:
+        st_before = pacer.get_state(eff_pacing_key)
+        if eff_min_interval > 0.0 or float(st_before.get("extra_delay_sec", 0.0)) > 0.0 or float(st_before.get("cooldown_until_ts", 0.0)) > now_fn():
+            pacer.wait_turn(
+                eff_pacing_key,
+                min_interval_sec=eff_min_interval,
+                provider_label=provider_name,
+                stage=stage,
+                cancel_event=cancel_event,
+                progress_cb=progress_cb,
+                clock_fn=now_fn,
+                sleep_fn=sleeper,
+            )
+
+    deadline_ts = now_fn() + max(2.0, float(total_deadline))
     last_error: Optional[AICallError] = None
 
-    for attempt in range(retries_allowed + 1):
+    for attempt in range(max_attempts):
         _check_cancelled(cancel_event, stage)
         remaining = deadline_ts - now_fn()
         if remaining <= 0.25:
@@ -518,6 +723,8 @@ def execute_http_with_retry(
                             selected_model=selected_model,
                             secrets=secrets,
                         )
+                if pacer is not None:
+                    pacer.on_success(eff_pacing_key)
                 return resp
 
             code = int(getattr(resp, "status_code", 0) or 0)
@@ -528,20 +735,29 @@ def execute_http_with_retry(
                 selected_model=selected_model,
                 secrets=secrets,
             )
-            if err.category == "blocked" or code not in transient_http_codes or attempt >= retries_allowed:
+            allowed_for_code = retries_429_allowed if code == 429 else retries_allowed
+            if err.category == "blocked" or code not in transient_http_codes or attempt >= allowed_for_code:
                 raise err
 
             last_error = err
-            retry_after_val = 0.0
-            try:
-                ra_hdr = getattr(resp, "headers", {}).get("Retry-After")
-                if ra_hdr:
-                    retry_after_val = max(0.0, float(ra_hdr))
-            except Exception:
-                retry_after_val = 0.0
+            retry_after_val = _parse_retry_after_seconds(resp)
 
-            delay = max(backoff_base * (2 ** attempt), retry_after_val)
-            delay = min(delay, 12.0)
+            if code == 429:
+                base_429 = max(backoff_base * (2 ** attempt), 4.0 * (attempt + 1))
+                delay = min(max(base_429, retry_after_val), 65.0)
+                if pacer is not None:
+                    pacer.on_rate_limited(
+                        eff_pacing_key,
+                        delay,
+                        adaptive_slowdown=adaptive_slowdown,
+                        clock_fn=now_fn,
+                    )
+                # ב-429 מרחיבים במידת הצורך את תקציב הזמן כדי לא לקטוע המתנת Retry-After חוקית
+                min_needed_deadline = now_fn() + delay + max(10.0, read_t)
+                if min_needed_deadline > deadline_ts:
+                    deadline_ts = min_needed_deadline
+            else:
+                delay = min(max(backoff_base * (2 ** attempt), retry_after_val), 12.0)
 
         except AICancelledError:
             raise
@@ -605,10 +821,16 @@ def execute_http_with_retry(
             break
         wait_sec = min(delay, max(0.0, remaining_after - 1.0))
         if progress_cb:
-            progress_cb(
-                f"שלב '{stage}': השרת התעכב, מנסה שוב ({attempt + 2}/{retries_allowed + 1}) בעוד {wait_sec:.1f} שנ'..."
-            )
-        _sleep_cancellable(wait_sec, cancel_event, stage)
+            if last_error is not None and last_error.status_code == 429:
+                progress_cb(
+                    f"הגבלת קצב (HTTP 429) בשלב '{stage}' מול {provider_name}: "
+                    f"ממתין {wait_sec:.1f} שנ' לפני ניסיון חוזר ({attempt + 2}/{retries_429_allowed + 1})..."
+                )
+            else:
+                progress_cb(
+                    f"שלב '{stage}': השרת התעכב, מנסה שוב ({attempt + 2}/{retries_allowed + 1}) בעוד {wait_sec:.1f} שנ'..."
+                )
+        sleeper(wait_sec, cancel_event, stage)
 
     if last_error is not None:
         raise AICallError(
@@ -1026,9 +1248,15 @@ def chat_completion(
     stage: str = "קריאת AI",
     request_fn: Optional[Callable[..., Any]] = None,
     clock_fn: Optional[Callable[[], float]] = None,
+    min_interval_sec: Optional[float] = None,
+    pacer: Optional[APIRequestPacer] = None,
+    adaptive_slowdown: Optional[bool] = None,
+    max_retries_429: Optional[int] = None,
+    sleep_fn: Optional[Callable[[float, Any, str], None]] = None,
 ) -> str:
     """
     קריאה אחידה ומבוקרת לספק AI עם:
+    - מנגנון קצב והשהיה בין בקשות (APIRequestPacer) למניעת חריגות קצב (HTTP 429)
     - connect/read timeout מופרדים + deadline כולל + retry/backoff רק לכשלים זמניים
     - ביטול מיידי גם בזמן המתנה
     - ללא החלפת מודל שקטה!
@@ -1062,14 +1290,44 @@ def chat_completion(
             read_timeout = float(timeout)
             connect_timeout = min(connect_timeout, read_timeout)
 
+    # טעינת מדיניות קצב בקשות ברירת מחדל לקריאות רשת אמיתיות (ללא האטה של מוקים בבדיקות אלא אם הוגדר במפורש)
+    eff_min_interval = 0.0
+    eff_adaptive = True if adaptive_slowdown is None else bool(adaptive_slowdown)
+    eff_max_429 = max_retries_429
+    eff_pacer = pacer
+
+    if min_interval_sec is not None:
+        eff_min_interval = max(0.0, float(min_interval_sec))
+        if eff_pacer is None and eff_min_interval > 0.0:
+            eff_pacer = GLOBAL_API_PACER
+    elif request_fn is None:
+        try:
+            from settings_manager import get_api_pacing_config
+            pcfg = get_api_pacing_config()
+            eff_min_interval = float(pcfg.get("min_interval_sec", 4.0))
+            if adaptive_slowdown is None:
+                eff_adaptive = bool(pcfg.get("adaptive_slowdown", True))
+            if eff_max_429 is None:
+                eff_max_429 = int(pcfg.get("max_retries_429", 4))
+        except Exception:
+            eff_min_interval = 4.0
+            if eff_max_429 is None:
+                eff_max_429 = 4
+        if eff_pacer is None:
+            eff_pacer = GLOBAL_API_PACER
+
+    pacing_key = f"{provider_id}:{selected_model}"
     url_base = (base_url or meta["default_base_url"]).strip().rstrip("/")
     secrets = [key] if key else []
 
     if provider_id == "gemini":
+        # דור Gemini 4 אינו תומך בפרמטר temperature ב-generationConfig
+        is_gemini_4 = selected_model.lower().startswith("gemini-4")
         gen_cfg: Dict[str, Any] = {
-            "temperature": temperature,
             "maxOutputTokens": max_tokens,
         }
+        if not is_gemini_4:
+            gen_cfg["temperature"] = temperature
         if json_mode:
             gen_cfg["responseMimeType"] = "application/json"
 
@@ -1097,6 +1355,12 @@ def chat_completion(
             request_fn=request_fn,
             clock_fn=clock_fn,
             expect_json=True,
+            pacer=eff_pacer,
+            pacing_key=pacing_key,
+            min_interval_sec=eff_min_interval,
+            adaptive_slowdown=eff_adaptive,
+            max_retries_429=eff_max_429,
+            sleep_fn=sleep_fn,
         )
         data = resp.json()
         candidates = data.get("candidates", [])
@@ -1139,6 +1403,12 @@ def chat_completion(
             request_fn=request_fn,
             clock_fn=clock_fn,
             expect_json=True,
+            pacer=eff_pacer,
+            pacing_key=pacing_key,
+            min_interval_sec=eff_min_interval,
+            adaptive_slowdown=eff_adaptive,
+            max_retries_429=eff_max_429,
+            sleep_fn=sleep_fn,
         )
         data = resp.json()
         blocks = data.get("content", [])
@@ -1181,6 +1451,12 @@ def chat_completion(
             request_fn=request_fn,
             clock_fn=clock_fn,
             expect_json=True,
+            pacer=eff_pacer,
+            pacing_key=pacing_key,
+            min_interval_sec=eff_min_interval,
+            adaptive_slowdown=eff_adaptive,
+            max_retries_429=eff_max_429,
+            sleep_fn=sleep_fn,
         )
         data = resp.json()
         choices = data.get("choices", [])

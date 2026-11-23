@@ -10,7 +10,7 @@
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from settings_manager import load_settings, get_active_provider_config
+from settings_manager import load_settings, get_active_provider_config, get_api_pacing_config
 from ai_providers import (
     AICallError,
     AICancelledError,
@@ -72,6 +72,7 @@ def vocalize_and_expand_hebrew(
 
     cfg = settings or load_settings()
     pconf = get_active_provider_config(cfg)
+    pacing = get_api_pacing_config(cfg)
     pid = pconf["provider_id"]
     key = (api_key or pconf.get("api_key", "")).strip()
     model = pconf.get("model", "")
@@ -130,6 +131,10 @@ def vocalize_and_expand_hebrew(
             "progress_cb": progress_cb,
             "stage": f"ניקוד ופתיחת קיצורים (חלק {idx}/{len(chunks)})",
         }
+        if chat_fn is None:
+            kwargs["min_interval_sec"] = pacing["min_interval_sec"]
+            kwargs["adaptive_slowdown"] = pacing["adaptive_slowdown"]
+            kwargs["max_retries_429"] = pacing["max_retries_429"]
         try:
             raw = caller(**kwargs)
         except TypeError:
@@ -217,6 +222,7 @@ def ask_companion(
         f'טקסט:\n"""\n{text[:4500]}\n"""'
     )
 
+    pacing = get_api_pacing_config(cfg)
     reply = chat_completion(
         provider_id=pid,
         api_key=key,
@@ -233,6 +239,9 @@ def ask_companion(
         cancel_event=cancel_event,
         progress_cb=progress_cb,
         stage=f"עוזר ספרותי AI ({mode})",
+        min_interval_sec=pacing["min_interval_sec"],
+        adaptive_slowdown=pacing["adaptive_slowdown"],
+        max_retries_429=pacing["max_retries_429"],
     )
     if not reply:
         raise AICallError(

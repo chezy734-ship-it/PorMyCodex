@@ -667,6 +667,137 @@ print(json.dumps({{"calls": len(trans_calls), "scripts": len(res2["scripts"])}})
         self.assertEqual(repair_trans_calls, ["Second BROKEN chapter."])
         self.assertTrue(os.path.exists(out_wav))
 
+    def test_07_api_request_pacing_429_retry_delay_adaptive_slowdown_and_cancellation(self):
+        from ai_providers import APIRequestPacer, AICancelledError, _parse_retry_after_seconds, _rank_gemini_model
+
+        # 1. חילוץ זמן המתנה מ-Gemini 429 JSON (details.retryDelay וגם message וגם Retry-After header)
+        r_details = _FakeHTTPResp(
+            429,
+            {
+                "error": {
+                    "code": 429,
+                    "message": "Resource has been exhausted.",
+                    "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "22s"}],
+                }
+            },
+            {"Content-Type": "application/json"},
+        )
+        self.assertAlmostEqual(_parse_retry_after_seconds(r_details), 22.0)
+
+        r_msg = _FakeHTTPResp(
+            429,
+            {"error": {"code": 429, "message": "Quota exceeded. Please retry in 18.5s."}},
+            {"Content-Type": "application/json"},
+        )
+        self.assertAlmostEqual(_parse_retry_after_seconds(r_msg), 18.5)
+
+        r_hdr = _FakeHTTPResp(429, {}, {"Retry-After": "15"})
+        self.assertAlmostEqual(_parse_retry_after_seconds(r_hdr), 15.0)
+
+        # 2. אכיפת מרווח מינימלי בין קריאות עוקבות + כיבוד 429 retryDelay > 12s + האטה אדפטיבית והרפיה הדרגתית
+        pacer = APIRequestPacer()
+        fake_now = [100.0]
+        sleeps = []
+        progress_msgs = []
+
+        def fake_clock():
+            return fake_now[0]
+
+        def fake_sleep(sec, cancel_event, stage):
+            if cancel_event is not None and cancel_event.is_set():
+                raise AICancelledError(stage=stage)
+            sleeps.append(round(sec, 2))
+            fake_now[0] += sec
+
+        captured_payloads = []
+        call_num = [0]
+
+        def fake_req(method, url, **kwargs):
+            call_num[0] += 1
+            captured_payloads.append(kwargs.get("json") or {})
+            if call_num[0] == 2:
+                # הקריאה השנייה מקבלת 429 עם retryDelay של 20 שניות -> חייב להמתין 20 שנ' (לא 12!) ולהצליח בניסיון הבא
+                return _FakeHTTPResp(
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "message": "Quota exceeded. Please retry in 20s.",
+                            "details": [{"retryDelay": "20s"}],
+                        }
+                    },
+                    {"Content-Type": "application/json"},
+                )
+            return _FakeHTTPResp(
+                200,
+                {"candidates": [{"content": {"parts": [{"text": f"ok_{call_num[0]}"}]}}]},
+                {"Content-Type": "application/json"},
+            )
+
+        out1 = chat_completion(
+            provider_id="gemini",
+            api_key="AIzaTestPacing",
+            model="gemini-4-hydrogen",
+            system_prompt="sys",
+            user_prompt="call 1",
+            request_fn=fake_req,
+            clock_fn=fake_clock,
+            sleep_fn=fake_sleep,
+            pacer=pacer,
+            min_interval_sec=4.0,
+            adaptive_slowdown=True,
+            max_retries_429=4,
+            progress_cb=progress_msgs.append,
+        )
+        self.assertEqual(out1, "ok_1")
+        # דור Gemini 4 אינו שולח temperature ב-generationConfig
+        self.assertNotIn("temperature", captured_payloads[0].get("generationConfig", {}))
+        self.assertEqual(sleeps, [])  # קריאה ראשונה ללא המתנה
+
+        # קריאה שנייה: תמתין 4.0 שנ' לפי הקצב -> תקבל 429 עם retryDelay=20s -> תמתין 20.0 שנ' -> תצליח!
+        out2 = chat_completion(
+            provider_id="gemini",
+            api_key="AIzaTestPacing",
+            model="gemini-4-hydrogen",
+            system_prompt="sys",
+            user_prompt="call 2",
+            request_fn=fake_req,
+            clock_fn=fake_clock,
+            sleep_fn=fake_sleep,
+            pacer=pacer,
+            min_interval_sec=4.0,
+            adaptive_slowdown=True,
+            max_retries_429=4,
+            progress_cb=progress_msgs.append,
+        )
+        self.assertEqual(out2, "ok_3")
+        self.assertIn(4.0, sleeps)
+        self.assertIn(20.0, sleeps)
+        st = pacer.get_state("gemini:gemini-4-hydrogen")
+        self.assertGreater(st["extra_delay_sec"], 0.0)
+        self.assertTrue(any("HTTP 429" in m for m in progress_msgs))
+        self.assertTrue(any("השהיית קצב API" in m for m in progress_msgs))
+
+        # 3. ביטול באמצע המתנת קצב (pacing) זורק AICancelledError מיד
+        cancel_ev = threading.Event()
+        cancel_ev.set()
+        with self.assertRaises(AICancelledError):
+            pacer.wait_turn(
+                "gemini:gemini-4-hydrogen",
+                min_interval_sec=10.0,
+                cancel_event=cancel_ev,
+                clock_fn=fake_clock,
+            )
+
+        # 4. דירוג מודלי Gemini שם את gemini-4-hydrogen (Flash) מעל gemini-4-neon (Pro) ומעל דור 2.5
+        ranked = sorted(
+            ["gemini-2.5-pro", "gemini-4-neon", "gemini-2.5-flash", "gemini-4-hydrogen"],
+            key=_rank_gemini_model,
+        )
+        self.assertEqual(ranked[0], "gemini-4-hydrogen")
+        self.assertEqual(ranked[1], "gemini-4-neon")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

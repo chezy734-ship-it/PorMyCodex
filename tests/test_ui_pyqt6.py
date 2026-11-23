@@ -359,7 +359,40 @@ class TestPyQt6ModelDiscoveryAndWholeBookUI(unittest.TestCase):
             mock_rec_cls.assert_called_once()
         win.close()
 
+    def test_05_settings_dialog_api_pacing_presets_and_persistence(self):
+        from settings_manager import get_api_pacing_config, load_settings
+
+        settings = deepcopy(DEFAULT_SETTINGS)
+        dlg = SettingsDialog(
+            None,
+            settings,
+            discovery_fn=lambda *a, **k: {"models": ["gemini-2.5-flash"], "pages_fetched": 1},
+        )
+        # ברירת המחדל היא פרופיל 'רגוע' (4.0 שניות) עם האטה אוטומטית פעילה
+        self.assertEqual(dlg.combo_pacing_preset.currentData(), "gentle")
+        self.assertAlmostEqual(dlg.spin_min_interval.value(), 4.0, places=1)
+        self.assertTrue(dlg.chk_adaptive_slowdown.isChecked())
+
+        # מעבר לפרופיל 'איטי ובטוח במיוחד' מעדכן אוטומטית את ההשהיה ל-6.5 שניות
+        idx_safe = dlg.combo_pacing_preset.findData("safe_free")
+        self.assertGreaterEqual(idx_safe, 0)
+        dlg.combo_pacing_preset.setCurrentIndex(idx_safe)
+        self.assertAlmostEqual(dlg.spin_min_interval.value(), 6.5, places=1)
+
+        # שינוי ידני של ההשהיה מעביר אוטומטית ל-'custom' ונשמר לדיסק
+        dlg.spin_min_interval.setValue(8.5)
+        self.assertEqual(dlg.combo_pacing_preset.currentData(), "custom")
+        dlg._on_save()
+
+        reloaded = load_settings()
+        pcfg = get_api_pacing_config(reloaded)
+        self.assertEqual(pcfg["preset"], "custom")
+        self.assertAlmostEqual(pcfg["min_interval_sec"], 8.5, places=1)
+        self.assertTrue(pcfg["adaptive_slowdown"])
+        dlg.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 

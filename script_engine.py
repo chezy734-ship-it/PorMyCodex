@@ -7,7 +7,7 @@
 """
 
 from typing import List, Dict, Any, Optional, Callable, Tuple
-from settings_manager import load_settings, get_active_provider_config
+from settings_manager import load_settings, get_active_provider_config, get_api_pacing_config
 from ai_providers import (
     AICallError,
     AICancelledError,
@@ -122,10 +122,18 @@ def generate_narration_script(
 
     cfg = settings or load_settings()
     pconf = get_active_provider_config(cfg)
+    pacing = get_api_pacing_config(cfg)
     pid = pconf["provider_id"]
     model = pconf.get("model", "")
     api_key = pconf.get("api_key", "")
     caller = chat_fn or chat_completion
+    pacing_kwargs: Dict[str, Any] = {}
+    if chat_fn is None:
+        pacing_kwargs = {
+            "min_interval_sec": pacing["min_interval_sec"],
+            "adaptive_slowdown": pacing["adaptive_slowdown"],
+            "max_retries_429": pacing["max_retries_429"],
+        }
 
     if chat_fn is None and not api_key and pid != "custom":
         raise ValueError(
@@ -269,6 +277,7 @@ def generate_narration_script(
                 cancel_event=cancel_event,
                 progress_cb=progress_cb,
                 stage=f"יצירת תסריט AI (חלק {batch_num}/{total_batches})",
+                **pacing_kwargs,
             )
             _check_cancelled(cancel_event)
             parsed = extract_json_object(raw_response)

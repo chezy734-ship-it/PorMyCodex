@@ -14,7 +14,7 @@ import json
 import re
 from typing import Dict, Any, List, Tuple, Optional, Callable
 
-from settings_manager import load_settings, get_active_provider_config
+from settings_manager import load_settings, get_active_provider_config, get_api_pacing_config
 from ai_providers import (
     PROVIDER_CATALOG,
     AICallError,
@@ -496,11 +496,19 @@ def translate_with_ai(
 ) -> Tuple[str, str]:
     cfg = settings or load_settings()
     pconf = get_active_provider_config(cfg)
+    pacing = get_api_pacing_config(cfg)
     pid = pconf["provider_id"]
     model = pconf.get("model", "")
     src_name = LANG_NAMES_EN.get(source_lang, source_lang)
     tgt_name = LANG_NAMES_EN.get(target_lang, target_lang)
     caller = chat_fn or chat_completion
+    pacing_kwargs: Dict[str, Any] = {}
+    if request_fn is None:
+        pacing_kwargs = {
+            "min_interval_sec": pacing["min_interval_sec"],
+            "adaptive_slowdown": pacing["adaptive_slowdown"],
+            "max_retries_429": pacing["max_retries_429"],
+        }
 
     system_prompt = (
         f"You are a faithful literary translator translating from {src_name} into natural, grammatically accurate {tgt_name}. "
@@ -530,6 +538,7 @@ def translate_with_ai(
                 progress_cb=progress_cb,
                 stage="תרגום AI",
                 request_fn=request_fn,
+                **pacing_kwargs,
             )
             cleaned_out = (out or "").strip()
             if not cleaned_out:
@@ -559,11 +568,19 @@ def _translate_sentence_batch_ai(
 ) -> Dict[int, str]:
     cfg = settings or load_settings()
     pconf = get_active_provider_config(cfg)
+    pacing = get_api_pacing_config(cfg)
     pid = pconf["provider_id"]
     model = pconf.get("model", "")
     src_name = LANG_NAMES_EN.get(source_lang, source_lang)
     tgt_name = LANG_NAMES_EN.get(target_lang, target_lang)
     caller = chat_fn or chat_completion
+    pacing_kwargs: Dict[str, Any] = {}
+    if request_fn is None:
+        pacing_kwargs = {
+            "min_interval_sec": pacing["min_interval_sec"],
+            "adaptive_slowdown": pacing["adaptive_slowdown"],
+            "max_retries_429": pacing["max_retries_429"],
+        }
 
     sys_prompt = (
         f"Translate EVERY numbered item below from {src_name} into {tgt_name}. "
@@ -589,6 +606,7 @@ def _translate_sentence_batch_ai(
         progress_cb=progress_cb,
         stage="תרגום AI",
         request_fn=request_fn,
+        **pacing_kwargs,
     )
     parsed = extract_json_object(raw)
     mapping: Dict[int, str] = {}

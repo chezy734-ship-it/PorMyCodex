@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -39,7 +40,9 @@ from ai_providers import (
     get_provider_label,
 )
 from settings_manager import (
+    API_PACING_PRESETS,
     compute_provider_fingerprint,
+    get_api_pacing_config,
     load_settings,
     save_settings,
 )
@@ -225,11 +228,45 @@ class SettingsDialog(QDialog):
 
         ai_layout.addWidget(grp_provider)
 
-        grp_info = QGroupBox("אבטחה ובחירת מודל")
+        grp_pacing = QGroupBox("⏱️ קצב בקשות ל-API (מניעת עומס וחסימות HTTP 429)")
+        form_pace = QFormLayout(grp_pacing)
+        form_pace.setSpacing(8)
+
+        pace_cfg = get_api_pacing_config(self.settings)
+        self._syncing_pacing = False
+
+        self.combo_pacing_preset = QComboBox()
+        for pk, pmeta in API_PACING_PRESETS.items():
+            self.combo_pacing_preset.addItem(pmeta["label"], pk)
+        p_idx = self.combo_pacing_preset.findData(pace_cfg["preset"])
+        if p_idx >= 0:
+            self.combo_pacing_preset.setCurrentIndex(p_idx)
+        self.combo_pacing_preset.currentIndexChanged.connect(self._on_pacing_preset_changed)
+        form_pace.addRow("פרופיל קצב:", self.combo_pacing_preset)
+
+        self.spin_min_interval = QDoubleSpinBox()
+        self.spin_min_interval.setRange(0.0, 60.0)
+        self.spin_min_interval.setSingleStep(0.5)
+        self.spin_min_interval.setDecimals(1)
+        self.spin_min_interval.setSuffix(" שניות")
+        self.spin_min_interval.setValue(float(pace_cfg["min_interval_sec"]))
+        self.spin_min_interval.valueChanged.connect(self._on_min_interval_changed)
+        form_pace.addRow("השהיה מינימלית בין בקשות:", self.spin_min_interval)
+
+        self.chk_adaptive_slowdown = QCheckBox(
+            "האטה אוטומטית בעת שגיאת עומס/מכסה (HTTP 429) והמתנה לפי הנחיית השרת"
+        )
+        self.chk_adaptive_slowdown.setChecked(bool(pace_cfg["adaptive_slowdown"]))
+        form_pace.addRow("הגנת עומס:", self.chk_adaptive_slowdown)
+
+        ai_layout.addWidget(grp_pacing)
+
+        grp_info = QGroupBox("אבטחה, בחירת מודל והמלצת קצב")
         info_lay = QVBoxLayout(grp_info)
         lbl_sec = QLabel(
-            "• הזנת המפתח מוסתרת ונשמרת מקומית אצלך במחשב בלבד (לעולם אינה נכללת בלוגים או בהודעות שגיאה).\n"
-            "• לאחר הדבקת מפתח או מעבר חברה, הרשימה הנפתחת מתמלאת ישירות מה-API הרשמי של הספק (ללא רשימות מומצאות)."
+            "• הזנת המפתח מוסתרת ונשמרת מקומית בלבד (לעולם אינה נכללת בלוגים או בהודעות שגיאה).\n"
+            "• לתרגום ותסריטים ארוכים מומלץ מודל Flash (למשל gemini-2.5-flash / gemini-4-hydrogen) בקצב 'רגוע' (4 שנ').\n"
+            "• למודלי Pro או מפתח Free Tier (לתשומת לב: מנוי Google AI Pro נפרד מחיוב Gemini API) מומלץ קצב 'איטי ובטוח' (6.5 שנ')."
         )
         lbl_sec.setWordWrap(True)
         lbl_sec.setStyleSheet("color: #cbd5e1; font-size: 12px;")
@@ -576,9 +613,42 @@ class SettingsDialog(QDialog):
         self._cleanup_threads()
         super().closeEvent(event)
 
+    def _on_pacing_preset_changed(self, _index: int):
+        if self._syncing_pacing:
+            return
+        preset = self.combo_pacing_preset.currentData() or "gentle"
+        if preset != "custom" and preset in API_PACING_PRESETS:
+            self._syncing_pacing = True
+            try:
+                self.spin_min_interval.setValue(float(API_PACING_PRESETS[preset]["min_interval_sec"]))
+            finally:
+                self._syncing_pacing = False
+
+    def _on_min_interval_changed(self, val: float):
+        if self._syncing_pacing:
+            return
+        cur_preset = self.combo_pacing_preset.currentData() or "gentle"
+        expected = API_PACING_PRESETS.get(cur_preset, {}).get("min_interval_sec")
+        if cur_preset != "custom" and expected is not None and abs(float(val) - float(expected)) > 0.05:
+            self._syncing_pacing = True
+            try:
+                c_idx = self.combo_pacing_preset.findData("custom")
+                if c_idx >= 0:
+                    self.combo_pacing_preset.setCurrentIndex(c_idx)
+            finally:
+                self._syncing_pacing = False
+
     def _on_save(self):
         self._save_current_provider_to_dict()
         self.settings["active_provider"] = self.combo_provider.currentData()
+        preset = self.combo_pacing_preset.currentData() or "gentle"
+        max_429 = int(API_PACING_PRESETS.get(preset, API_PACING_PRESETS["gentle"]).get("max_retries_429", 4))
+        self.settings["api_pacing"] = {
+            "preset": preset,
+            "min_interval_sec": round(float(self.spin_min_interval.value()), 2),
+            "adaptive_slowdown": self.chk_adaptive_slowdown.isChecked(),
+            "max_retries_429": max_429,
+        }
         self.settings["translation"]["engine"] = self.combo_trans_engine.currentData()
         self.settings["translation"]["libretranslate_url"] = self.txt_libre_url.text().strip()
         self.settings["translation"]["libretranslate_api_key"] = self.txt_libre_key.text().strip()
