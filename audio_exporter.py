@@ -443,6 +443,12 @@ def export_to_wav_offline(
             for i, pw in enumerate(part_paths, 1):
                 if not os.path.exists(pw) or os.path.getsize(pw) <= 44:
                     raise RuntimeError(f"מנוע SAPI5 נכשל ביצירת חלק {i} מתוך {total}.")
+                with wave.open(pw, "rb") as w_chk:
+                    if w_chk.getnframes() <= 0:
+                        raise RuntimeError(
+                            f"מנוע Windows SAPI5 יצר שמע ריק בחלק {i}/{total} — "
+                            "כנראה שאין קול עברי מותקן ב-Windows SAPI5. בחר בקולות Edge-TTS (אברי/הילה)."
+                        )
 
         if len(part_paths) != total:
             raise RuntimeError("ייצוא ה-WAV נכשל: חסרים מקטעי שמע.")
@@ -455,6 +461,60 @@ def export_to_wav_offline(
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _convert_mp3_to_wav_ffmpeg(
+    mp3_path: str,
+    wav_output_path: str,
+    *,
+    cancel_event: Any = None,
+) -> str:
+    """ממיר קובץ MP3 לקובץ WAV תקני (PCM 16-bit 24kHz mono) באמצעות FFmpeg באופן אטומי."""
+    _check_cancelled(cancel_event)
+    ffmpeg_exe = find_ffmpeg_executable()
+    if not ffmpeg_exe:
+        raise RuntimeError("נדרש FFmpeg להמרת שמע Edge-TTS לפורמט WAV.")
+
+    abs_target = os.path.abspath(wav_output_path)
+    parent = os.path.dirname(abs_target)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_wav = tempfile.mkstemp(dir=parent, prefix=f".tmp_{os.path.basename(abs_target)}_", suffix=".wav")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                mp3_path,
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
+                tmp_wav,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _check_cancelled(cancel_event)
+        if proc.returncode != 0 or not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) <= 44:
+            err_tail = (proc.stderr or proc.stdout or "")[-400:]
+            raise RuntimeError(f"FFmpeg נכשל בהמרת MP3 ל-WAV (קוד {proc.returncode}): {err_tail}")
+        with open(tmp_wav, "rb+") as f_sync:
+            f_sync.flush()
+            os.fsync(f_sync.fileno())
+        os.replace(tmp_wav, abs_target)
+        return abs_target
+    finally:
+        if os.path.exists(tmp_wav):
+            try:
+                os.remove(tmp_wav)
+            except Exception:
+                pass
 
 
 def export_audiobook_file(
@@ -472,13 +532,41 @@ def export_audiobook_file(
 ) -> str:
     """
     מייצא קובץ שמע יחיד (.mp3 או .wav) באופן אטומי לפרק בודד.
+    עבור WAV עם קולות Edge-TTS (כאשר FFmpeg זמין ואין wav_synth_fn מוזרק),
+    מסנתז בקולות הנוירליים בעברית וממיר ל-WAV תקני — עובד גם במחשבי Windows ללא קול SAPI5 עברי!
     """
     _check_cancelled(cancel_event)
 
     ext = os.path.splitext(output_path)[1].lower()
-    if ext == ".wav" or (default_voice == "sapi5" and ext != ".mp3"):
+    want_wav = ext == ".wav" or (default_voice == "sapi5" and ext != ".mp3")
+    if want_wav:
         if ext != ".wav":
             output_path = f"{output_path}.wav"
+        if (
+            wav_synth_fn is None
+            and str(default_voice or "").startswith("edge")
+            and find_ffmpeg_executable() is not None
+        ):
+            tmp_dir = tempfile.mkdtemp(prefix="pormycodex_edge_wav_")
+            try:
+                tmp_mp3 = os.path.join(tmp_dir, "edge_chapter.mp3")
+                export_to_mp3(
+                    sentences,
+                    tmp_mp3,
+                    default_voice=default_voice,
+                    speed=speed,
+                    voice_overrides=voice_overrides,
+                    progress_cb=progress_cb,
+                    cancel_event=cancel_event,
+                    mp3_synth_fn=mp3_synth_fn,
+                    mp3_merge_fn=mp3_merge_fn,
+                )
+                if progress_cb:
+                    progress_cb("ממיר שמע Edge-TTS לפורמט WAV תקני...")
+                return _convert_mp3_to_wav_ffmpeg(tmp_mp3, output_path, cancel_event=cancel_event)
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
         return export_to_wav_offline(
             sentences,
             output_path,

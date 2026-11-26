@@ -1354,7 +1354,8 @@ class ExportPipelineDialog(QDialog):
             audio_fmt = raw_fmt
 
         voice = self.combo_voice.currentData()
-        if audio_fmt == "wav" and str(voice).startswith("edge"):
+        from audio_exporter import find_ffmpeg_executable
+        if audio_fmt == "wav" and str(voice).startswith("edge") and find_ffmpeg_executable() is None:
             voice = "sapi5"
 
         target_chapters = None

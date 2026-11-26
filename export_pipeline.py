@@ -1575,7 +1575,7 @@ def run_whole_book_export_pipeline(
     eff_tts = dict(tts_opts or {})
     if package_mode == "unified_wav":
         eff_tts["output_format"] = "wav"
-        if (eff_tts.get("default_voice") or "").startswith("edge"):
+        if (eff_tts.get("default_voice") or "").startswith("edge") and wav_synth_fn is not None:
             eff_tts["default_voice"] = "sapi5"
     elif package_mode == "unified_mp3":
         eff_tts["output_format"] = "mp3"
