@@ -1378,6 +1378,23 @@ class LibraryStore:
                 art["script_progress"]["status"] = "completed"
                 art["script_progress"]["updated_at"] = rec["saved_at"]
             art.pop("last_export", None)
+
+            # סנכרון התקדמות פרק בודד אל משימת הספר השלם (אם קיימת)
+            job = (state.get("whole_book_jobs") or {}).get(book_id)
+            if isinstance(job, dict):
+                if isinstance(job.get("failed_chapters"), dict):
+                    job["failed_chapters"].pop(str(int(chapter_index)), None)
+                comp_s = job.get("completed_scripts")
+                if not isinstance(comp_s, list):
+                    comp_s = []
+                if int(chapter_index) not in comp_s:
+                    comp_s.append(int(chapter_index))
+                    comp_s.sort()
+                job["completed_scripts"] = comp_s
+                needs = job.get("needs_attention_chapters")
+                if isinstance(needs, list) and int(chapter_index) in needs:
+                    job["needs_attention_chapters"] = [x for x in needs if x != int(chapter_index)]
+
             self._save_raw_state(state)
 
     def save_chapter_export(

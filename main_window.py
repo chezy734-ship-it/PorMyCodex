@@ -781,18 +781,42 @@ class MainWindow(QMainWindow):
         if 0 <= book_idx < len(self.books):
             self.book_list.setCurrentRow(book_idx)
 
+    def _format_chapter_list_label(self, book_id: str, idx: int, ch: Dict[str, Any], artifacts_map: Optional[Dict[str, Any]] = None) -> str:
+        base = f"{idx + 1}. {ch.get('title', f'פרק {idx + 1}')}"
+        arts = artifacts_map if artifacts_map is not None else (self.store._read_state_cached().get("chapter_artifacts") or {})
+        art = arts.get(f"{book_id}::{idx}") or {}
+        if isinstance(art.get("script"), dict) and art["script"].get("is_complete"):
+            return f"🎬 {base}"
+        if isinstance(art.get("translation"), dict) and art["translation"].get("is_complete"):
+            return f"🌐 {base}"
+        return base
+
+    def _refresh_chapter_list_badges(self):
+        book = self._get_current_book()
+        if not book:
+            return
+        book_id = book.get("id", "")
+        chapters = book.get("chapters") or []
+        arts = self.store._read_state_cached().get("chapter_artifacts") or {}
+        for idx, ch in enumerate(chapters):
+            item = self.chapter_list.item(idx)
+            if item is not None:
+                item.setText(self._format_chapter_list_label(book_id, idx, ch, arts))
+
     def on_book_selected(self, row: int):
         if row < 0 or row >= len(self.books):
             return
         self.current_book_index = row
         self.current_chapter_index = 0
         book = self.books[row]
+        book_id = book.get("id", "")
         chapters = book.get("chapters") or []
+        arts = self.store._read_state_cached().get("chapter_artifacts") or {}
         self._selecting_book = True
         try:
             self.chapter_list.clear()
             for idx, ch in enumerate(chapters):
-                self.chapter_list.addItem(f"{idx+1}. {ch.get('title', f'פרק {idx+1}')}")
+                self.chapter_list.addItem(self._format_chapter_list_label(book_id, idx, ch, arts))
             if chapters:
                 self.chapter_list.setCurrentRow(0)
             else:
@@ -839,7 +863,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # אם קיימים תוצרים עדכניים ושאינם ישנים לפרק זה (תסריט / תרגום), מסמנים זאת למשתמש
+        # אם קיימים תוצרים שמורים לפרק זה (תסריט / תרגום), טוענים ומציגים אותם מיד בקורא
         try:
             status = assess_chapter_pipeline(
                 book_id=book.get("id", ""),
@@ -848,8 +872,23 @@ class MainWindow(QMainWindow):
                 settings=self.settings,
                 store=self.store,
             )
-            if status["script_ready"] and status["script_record"]:
-                s_rec = status["script_record"]
+            s_rec = status["script_record"] if (status["script_ready"] and status["script_record"]) else None
+            used_saved_different_cfg = False
+            if s_rec is None:
+                # גם אם הפרק הבודד נוצר קודם עם הגדרת ויקיפדיה/סגנון/מודל שונה — משחזרים אותו לקריאה
+                # כל עוד טקסט המקור לא השתנה!
+                raw_art = self.store.get_chapter_artifacts(book.get("id", ""), row)
+                cand_s = raw_art.get("script")
+                if (
+                    isinstance(cand_s, dict)
+                    and cand_s.get("is_complete")
+                    and cand_s.get("source_hash") == status["source_hash"]
+                    and cand_s.get("lines")
+                ):
+                    s_rec = cand_s
+                    used_saved_different_cfg = True
+
+            if s_rec is not None:
                 lines = [ln for ln in (s_rec.get("lines") or []) if isinstance(ln, dict)]
                 if lines:
                     self.current_script_data = s_rec
@@ -862,6 +901,11 @@ class MainWindow(QMainWindow):
                     self.active_sentence_index = min(self.active_sentence_index, max(0, len(self.sentences) - 1))
                     self.btn_restore_original.setVisible(True)
                     self.btn_export_script.setVisible(True)
+                    if used_saved_different_cfg:
+                        self.statusBar.showMessage(
+                            f"נטען תסריט שמור לפרק {row + 1} ({s_rec.get('provider_label', '')}).",
+                            4500,
+                        )
             elif status["translation_ready"] and status["translation_record"]:
                 t_rec = status["translation_record"]
                 self.sentences = list(t_rec.get("translated_sentences") or split_into_sentences(t_rec.get("translated_text", "")))
@@ -1449,6 +1493,30 @@ class MainWindow(QMainWindow):
             self.combo_scope.setCurrentIndex(idx)
         self.open_script_studio(forced_scope="book")
 
+    def _persist_script_preferences(self, opts: Dict[str, Any]):
+        if not isinstance(opts, dict):
+            return
+        s_cfg = self.settings.setdefault("script", {})
+        new_mode = (opts.get("mode") or s_cfg.get("mode") or "educational").strip()
+        new_inst = (opts.get("custom_instruction") if "custom_instruction" in opts else opts.get("instruction", s_cfg.get("custom_instruction", ""))) or ""
+        new_inst = str(new_inst).strip()
+        new_wiki = bool(opts["use_wikipedia"]) if "use_wikipedia" in opts else bool(s_cfg.get("use_wikipedia", False))
+        new_terms = str(opts["wiki_terms"]).strip() if "wiki_terms" in opts else str(s_cfg.get("wiki_terms", "")).strip()
+        if (
+            s_cfg.get("mode") != new_mode
+            or s_cfg.get("custom_instruction") != new_inst
+            or bool(s_cfg.get("use_wikipedia", False)) != new_wiki
+            or s_cfg.get("wiki_terms") != new_terms
+        ):
+            s_cfg["mode"] = new_mode
+            s_cfg["custom_instruction"] = new_inst
+            s_cfg["use_wikipedia"] = new_wiki
+            s_cfg["wiki_terms"] = new_terms
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
+
     def open_script_studio(self, forced_scope: Optional[str] = None):
         if not isinstance(forced_scope, str):
             forced_scope = None
@@ -1470,6 +1538,7 @@ class MainWindow(QMainWindow):
         if not dlg.exec():
             return
         opts = dlg.get_options()
+        self._persist_script_preferences(opts)
         scope = opts.get("scope", default_scope)
 
         if scope == "book":
@@ -1969,7 +2038,8 @@ class MainWindow(QMainWindow):
             f"התסריט המלא נוצר ונשמר ({len(lines)} שורות)! לחץ ▶ להקראה רב-קולית.",
             6000,
         )
-        self._refresh_resume_banner()
+        self._refresh_chapter_list_badges()
+        self._refresh_resume_banner(force=True)
 
     def export_current_script(self):
         if not self.current_script_data:

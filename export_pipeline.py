@@ -91,6 +91,7 @@ def assess_chapter_pipeline(
     cfg = settings or load_settings()
     st = store or LibraryStore()
     trans_cfg = cfg.get("translation", {})
+    script_cfg = cfg.get("script", {})
     t_opts = translation_opts or {}
     s_opts = script_opts or {}
     a_opts = tts_opts or {}
@@ -99,10 +100,18 @@ def assess_chapter_pipeline(
     source_lang = (t_opts.get("source_lang") or trans_cfg.get("source_lang") or "auto").strip()
     target_lang = (t_opts.get("target_lang") or trans_cfg.get("target_lang") or "he").strip()
 
-    mode = (s_opts.get("mode") or "educational").strip()
-    custom_instruction = (s_opts.get("custom_instruction") or s_opts.get("instruction") or "").strip()
-    use_wikipedia = bool(s_opts.get("use_wikipedia", False))
-    wiki_terms = (s_opts.get("wiki_terms") or "").strip()
+    mode = (s_opts.get("mode") or script_cfg.get("mode") or "educational").strip()
+    if "custom_instruction" in s_opts or "instruction" in s_opts:
+        custom_instruction = (s_opts.get("custom_instruction") or s_opts.get("instruction") or "").strip()
+    else:
+        custom_instruction = (script_cfg.get("custom_instruction") or "").strip()
+    use_wikipedia = bool(
+        s_opts["use_wikipedia"] if "use_wikipedia" in s_opts else script_cfg.get("use_wikipedia", False)
+    )
+    if "wiki_terms" in s_opts:
+        wiki_terms = (s_opts.get("wiki_terms") or "").strip()
+    else:
+        wiki_terms = (script_cfg.get("wiki_terms") or "").strip()
 
     output_format = (a_opts.get("output_format") or "mp3").lower().lstrip(".")
     default_voice = (a_opts.get("default_voice") or "edge_avri").strip()
@@ -933,6 +942,32 @@ def run_tts_and_export_strict(
         "line_count": len(script_lines),
     }
     st.save_chapter_export(book_id, chapter_index, export_record)
+
+    # שמירה גם ב-tts_cache של הפרק כך שייצוא של ספר שלם בהמשך ידלג על סינתזה חוזרת של פרק זה
+    try:
+        ch_ext = os.path.splitext(saved_path)[1].lower().lstrip(".") or tp_tts["output_format"]
+        cache_path = get_chapter_audio_cache_path(book_id, chapter_index, ch_ext)
+        if os.path.abspath(saved_path) != os.path.abspath(cache_path):
+            from library_store import atomic_write_bytes
+            with open(saved_path, "rb") as src_f:
+                atomic_write_bytes(cache_path, src_f.read())
+        st.save_chapter_tts_cache(
+            book_id,
+            chapter_index,
+            {
+                "is_complete": True,
+                "audio_path": cache_path,
+                "format": ch_ext,
+                "source_hash": status["source_hash"],
+                "translation_hash": status["translation_record"]["translated_hash"],
+                "script_config_hash": status["script_config_hash"],
+                "tts_config_hash": status["tts_config_hash"],
+                "line_count": len(script_lines),
+            },
+        )
+    except Exception:
+        pass
+
     return export_record
 
 

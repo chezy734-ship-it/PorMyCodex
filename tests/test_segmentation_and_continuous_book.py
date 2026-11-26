@@ -331,6 +331,58 @@ class TestContinuousPlaybackAndSegmentationUI(unittest.TestCase):
         sdlg.close()
         win.close()
 
+    def test_02_single_chapter_script_with_wiki_persists_across_chapter_switch_and_restart(self):
+        from export_pipeline import ensure_script_for_chapter, ensure_translation_for_chapter
+        from main_window import MainWindow
+
+        book = {
+            "id": "single_ch_persist",
+            "title": "ספר בדיקת פרק בודד",
+            "chapters": [
+                {"title": "פרק 1", "text": "משפט ראשון בפרק ראשון."},
+                {"title": "פרק 2", "text": "משפט ראשון בפרק שני."},
+            ],
+        }
+        win = MainWindow()
+        win.books = [book]
+        win.load_book_to_ui(0)
+        win.chapter_list.setCurrentRow(1)
+
+        opts = {"mode": "educational", "instruction": "", "use_wikipedia": True, "wiki_terms": ""}
+        win._persist_script_preferences(opts)
+
+        ensure_translation_for_chapter(
+            book_id=book["id"],
+            chapter_index=1,
+            source_text=book["chapters"][1]["text"],
+            settings=win.settings,
+            translation_opts={"bypass_same_language": True},
+            store=win.store,
+        )
+        s_rec = ensure_script_for_chapter(
+            book_id=book["id"],
+            chapter_index=1,
+            source_text=book["chapters"][1]["text"],
+            book_title=book["title"],
+            settings=win.settings,
+            script_opts=opts,
+            store=win.store,
+            chat_fn=lambda **kw: json.dumps({
+                "title": "תסריט שמור",
+                "lines": [{"unitId": "u1", "speakerRole": "teacher", "style": "רגוע", "text": "שורת תסריט שמורה לפרק 2"}],
+            }, ensure_ascii=False),
+            wiki_fetcher=lambda **kw: {"articles": [], "context_text": ""},
+        )
+        win._on_script_generated(s_rec)
+        self.assertIn("🎬", win.chapter_list.item(1).text())
+
+        # מעבר לפרק 0 וחזרה לפרק 1 חייב לשחזר את התסריט השמור של פרק 1!
+        win.chapter_list.setCurrentRow(0)
+        win.chapter_list.setCurrentRow(1)
+        self.assertIsNotNone(win.current_script_data)
+        self.assertEqual(win.sentences, ["שורת תסריט שמורה לפרק 2"])
+        win.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

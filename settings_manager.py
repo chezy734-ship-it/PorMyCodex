@@ -143,6 +143,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "student_voice": "edge_hila",
         "narrator_voice": "edge_avri",
     },
+    "script": {
+        "mode": "educational",
+        "custom_instruction": "",
+        "use_wikipedia": False,
+        "wiki_terms": "",
+    },
 }
 
 ENV_KEY_MAP = {

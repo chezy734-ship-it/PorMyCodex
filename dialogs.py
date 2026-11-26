@@ -865,11 +865,15 @@ class ScriptStudioDialog(QDialog):
 
         layout.addWidget(grp_scope)
 
+        s_cfg = self.settings.get("script", {})
         grp_mode = QGroupBox("סגנון התסריט")
         mode_lay = QVBoxLayout(grp_mode)
         self.radio_edu = QRadioButton("🎓 תסריט לימודי — דיאלוג מורה ותלמיד (שאלות סקרנות, ביאור מדויק, הקראה בשני קולות)")
-        self.radio_edu.setChecked(True)
         self.radio_dramatic = QRadioButton("🎭 תסריט דרמטי — קריינות ספרותית אקספרסיבית עם סגנון הגשה והדגשות")
+        if s_cfg.get("mode") == "dramatic":
+            self.radio_dramatic.setChecked(True)
+        else:
+            self.radio_edu.setChecked(True)
         mode_lay.addWidget(self.radio_edu)
         mode_lay.addWidget(self.radio_dramatic)
         layout.addWidget(grp_mode)
@@ -877,11 +881,13 @@ class ScriptStudioDialog(QDialog):
         grp_wiki = QGroupBox("📚 הרחבת ידע מוויקיפדיה (Knowledge Grounding)")
         wiki_lay = QVBoxLayout(grp_wiki)
         self.chk_wikipedia = QCheckBox("🌐 חפש מושגים בוויקיפדיה והעשר את התסריט של המודל במידע אנציקלופדי")
+        use_w_default = bool(s_cfg.get("use_wikipedia", False))
+        self.chk_wikipedia.setChecked(use_w_default)
         wiki_lay.addWidget(self.chk_wikipedia)
 
-        self.txt_wiki_terms = QLineEdit()
+        self.txt_wiki_terms = QLineEdit(str(s_cfg.get("wiki_terms") or ""))
         self.txt_wiki_terms.setPlaceholderText("מושגים ספציפיים לחיפוש מופרדים בפסיק (השאר ריק לזיהוי אוטומטי)")
-        self.txt_wiki_terms.setEnabled(False)
+        self.txt_wiki_terms.setEnabled(use_w_default)
         self.chk_wikipedia.toggled.connect(self.txt_wiki_terms.setEnabled)
         wiki_lay.addWidget(self.txt_wiki_terms)
         layout.addWidget(grp_wiki)
@@ -891,6 +897,8 @@ class ScriptStudioDialog(QDialog):
         self.txt_instruction = QTextEdit()
         self.txt_instruction.setMaximumHeight(75)
         self.txt_instruction.setPlaceholderText("לדוגמה: הרחב על המושגים ההלכתיים, או הוסף סיכום קצר בסוף הדיאלוג...")
+        if s_cfg.get("custom_instruction"):
+            self.txt_instruction.setPlainText(str(s_cfg.get("custom_instruction")))
         layout.addWidget(self.txt_instruction)
 
         btn_row = QHBoxLayout()
@@ -1132,12 +1140,16 @@ class ExportPipelineDialog(QDialog):
         layout.addWidget(grp_trans)
 
         # שלב 2: הגדרות תסריט
+        s_cfg = self.settings.get("script", {})
         grp_script = QGroupBox("שלב 2 — תסריט AI מלא ועדכני")
         form_s = QVBoxLayout(grp_script)
         mode_row = QHBoxLayout()
         self.radio_edu = QRadioButton("🎓 לימודי (מורה ותלמיד)")
-        self.radio_edu.setChecked(True)
         self.radio_dramatic = QRadioButton("🎭 דרמטי (קריינות)")
+        if s_cfg.get("mode") == "dramatic":
+            self.radio_dramatic.setChecked(True)
+        else:
+            self.radio_edu.setChecked(True)
         self.radio_edu.toggled.connect(self._refresh_readiness)
         mode_row.addWidget(self.radio_edu)
         mode_row.addWidget(self.radio_dramatic)
@@ -1148,17 +1160,19 @@ class ExportPipelineDialog(QDialog):
         self._readiness_timer.setInterval(180)
         self._readiness_timer.timeout.connect(self._refresh_readiness)
 
-        self.txt_instruction = QLineEdit()
+        self.txt_instruction = QLineEdit(str(s_cfg.get("custom_instruction") or ""))
         self.txt_instruction.setPlaceholderText("הנחיה נוספת לתסריט (אופציונלי)")
         self.txt_instruction.textChanged.connect(self._schedule_refresh_readiness)
         form_s.addWidget(self.txt_instruction)
 
         wiki_row = QHBoxLayout()
         self.chk_wiki = QCheckBox("🌐 העשר מוויקיפדיה")
+        use_w_exp = bool(s_cfg.get("use_wikipedia", False))
+        self.chk_wiki.setChecked(use_w_exp)
         self.chk_wiki.toggled.connect(self._refresh_readiness)
-        self.txt_wiki_terms = QLineEdit()
+        self.txt_wiki_terms = QLineEdit(str(s_cfg.get("wiki_terms") or ""))
         self.txt_wiki_terms.setPlaceholderText("מושגים מופרדים בפסיק (ריק = אוטומטי)")
-        self.txt_wiki_terms.setEnabled(False)
+        self.txt_wiki_terms.setEnabled(use_w_exp)
         self.chk_wiki.toggled.connect(self.txt_wiki_terms.setEnabled)
         self.txt_wiki_terms.textChanged.connect(self._schedule_refresh_readiness)
         wiki_row.addWidget(self.chk_wiki)
