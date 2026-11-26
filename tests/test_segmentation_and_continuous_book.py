@@ -279,6 +279,64 @@ class TestSmartSegmentationAndLargeBookPipeline(unittest.TestCase):
         self.assertTrue(t_rec["is_complete"])
         self.assertEqual(t_rec["engine"], "identity")
 
+    def test_06_parallel_edge_tts_preserves_exact_order_and_retries(self):
+        import asyncio
+        import types
+        from audio_exporter import export_to_mp3
+
+        seen_attempts = {}
+
+        class _FakeCommunicate:
+            def __init__(self, text, voice, rate="+0%"):
+                self.text = text
+                self.voice = voice
+
+            async def save(self, out_path):
+                # דימוי שזמני הסיום שונים (הפוכים) + כשל זמני ראשון בחלק 2
+                idx_num = int(self.text.split("_")[1])
+                seen_attempts[idx_num] = seen_attempts.get(idx_num, 0) + 1
+                if idx_num == 2 and seen_attempts[idx_num] == 1:
+                    raise RuntimeError("transient glitch")
+                await asyncio.sleep(0.03 * (5 - idx_num))
+                with open(out_path, "wb") as f:
+                    f.write(f"SEG_{idx_num}_{self.voice}|".encode("utf-8"))
+
+        fake_edge = types.SimpleNamespace(Communicate=_FakeCommunicate)
+        merged_order = []
+
+        def _capture_merge(part_paths, out_path):
+            contents = []
+            for p in part_paths:
+                with open(p, "rb") as f:
+                    contents.append(f.read().decode("utf-8"))
+            merged_order.extend(contents)
+            with open(out_path, "wb") as out_f:
+                out_f.write("".join(contents).encode("utf-8"))
+            return out_path
+
+        out_mp3 = os.path.join(self.base_tmp, "parallel_ordered.mp3")
+        sents = ["line_1", "line_2", "line_3", "line_4"]
+        overrides = ["edge_avri", "edge_hila", "edge_avri", "edge_hila"]
+        with mock.patch.dict(sys.modules, {"edge_tts": fake_edge}):
+            export_to_mp3(
+                sents,
+                out_mp3,
+                default_voice="edge_avri",
+                voice_overrides=overrides,
+                mp3_merge_fn=_capture_merge,
+            )
+
+        self.assertEqual(seen_attempts[2], 2)
+        self.assertEqual(
+            merged_order,
+            [
+                "SEG_1_he-IL-AvriNeural|",
+                "SEG_2_he-IL-HilaNeural|",
+                "SEG_3_he-IL-AvriNeural|",
+                "SEG_4_he-IL-HilaNeural|",
+            ],
+        )
+
 
 @unittest.skipUnless(HAS_PYQT6, "PyQt6 not installed")
 class TestContinuousPlaybackAndSegmentationUI(unittest.TestCase):

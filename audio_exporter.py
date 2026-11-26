@@ -326,33 +326,44 @@ def export_to_mp3(
         else:
             import edge_tts
 
+            part_paths = [os.path.join(temp_dir, f"seg_{i:04d}.mp3") for i in range(1, total + 1)]
+
             async def synthesize_all() -> None:
-                for i, (v_id, text_chunk) in enumerate(segments, 1):
-                    _check_cancelled(cancel_event)
-                    if progress_cb:
-                        progress_cb(f"מייצר אודיו MP3: חלק {i} מתוך {total}...")
+                sem = asyncio.Semaphore(6)
+                completed_count = 0
+
+                async def _synth_one(idx_1: int, v_id: str, text_chunk: str, out_file: str) -> None:
+                    nonlocal completed_count
                     voice_name = _voice_id_to_edge_name(v_id)
-                    part_file = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
-                    last_err: Optional[Exception] = None
-                    for attempt in range(3):
-                        _check_cancelled(cancel_event)
-                        try:
-                            communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
-                            await communicate.save(part_file)
+                    async with sem:
+                        last_err: Optional[Exception] = None
+                        for attempt in range(3):
                             _check_cancelled(cancel_event)
-                            if os.path.exists(part_file) and os.path.getsize(part_file) > 0:
-                                last_err = None
-                                break
-                            last_err = RuntimeError(f"התקבל מקטע MP3 ריק בחלק {i} מתוך {total}.")
-                        except ExportCancelledError:
-                            raise
-                        except Exception as exc:
-                            last_err = exc
-                            if attempt < 2:
-                                await asyncio.sleep(0.5 * (attempt + 1))
-                    if last_err is not None:
-                        raise RuntimeError(f"כשל Edge-TTS בחלק {i}/{total}: {last_err}") from last_err
-                    part_paths.append(part_file)
+                            try:
+                                communicate = edge_tts.Communicate(text_chunk, voice_name, rate=rate_str)
+                                await communicate.save(out_file)
+                                _check_cancelled(cancel_event)
+                                if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+                                    last_err = None
+                                    break
+                                last_err = RuntimeError(f"התקבל מקטע MP3 ריק בחלק {idx_1} מתוך {total}.")
+                            except ExportCancelledError:
+                                raise
+                            except Exception as exc:
+                                last_err = exc
+                                if attempt < 2:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                        if last_err is not None:
+                            raise RuntimeError(f"כשל Edge-TTS בחלק {idx_1}/{total}: {last_err}") from last_err
+                        completed_count += 1
+                        if progress_cb:
+                            progress_cb(f"מייצר אודיו MP3: הושלמו {completed_count} מתוך {total} מקטעים...")
+
+                tasks = [
+                    _synth_one(i, v_id, text_chunk, part_paths[i - 1])
+                    for i, (v_id, text_chunk) in enumerate(segments, 1)
+                ]
+                await asyncio.gather(*tasks)
 
             asyncio.run(synthesize_all())
 
